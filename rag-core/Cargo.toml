@@ -1,0 +1,16 @@
+[package]
+name = "rag-core"
+description = "Domain and application layers for the rag keyword-search CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

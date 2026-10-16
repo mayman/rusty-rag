@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["rag-core", "rag-infra", "rag-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+
+# rag-cli is the presentation layer and may print and exit, so it does not opt in.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

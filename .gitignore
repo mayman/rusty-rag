@@ -1,0 +1,16 @@
+# Build output
+/target
+
+# Local rag state and databases (test fixtures under tests/ stay visible)
+.rag/
+*.db
+*.db-wal
+*.db-shm
+!**/tests/**/*.db
+
+# Editors, secrets, logs, debug symbols
+.vscode/
+.idea/
+.env*
+*.log
+*.pdb

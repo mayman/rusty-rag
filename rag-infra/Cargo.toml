@@ -1,0 +1,12 @@
+[package]
+name = "rag-infra"
+description = "Infrastructure adapters for rag (SQLite, git, filesystem, lock, clock)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
