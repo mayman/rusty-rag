@@ -1,4 +1,4 @@
-//! Request and response DTOs. Responses are exactly what the CLI prints as JSON
+﻿//! Request and response DTOs. Responses are exactly what the CLI prints as JSON
 //! (schema v1, see `docs/plan/03-output-schema.md`); field order is the order in
 //! the schema. Domain types never derive `Serialize`: these structs are the
 //! mapping target.
@@ -142,6 +142,36 @@ pub struct ListResponse {
     pub sources: Vec<SourceSummary>,
 }
 
+/// Most lines one `rag show` response carries.
+pub const SHOW_MAX_LINES: usize = 200;
+/// Most characters of file text one `rag show` response carries.
+pub const SHOW_MAX_CHARS: usize = 8000;
+/// Lines shown on each side of the line named by `--around`.
+pub const SHOW_AROUND_RADIUS: usize = 20;
+
+/// Output of the show use case: a slice of a file at the indexed commit, or the
+/// text of one stored chunk.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShowResponse {
+    pub schema_version: u32,
+    pub repo: String,
+    pub commit: String,
+    pub indexed_at: String,
+    pub path: String,
+    pub language: String,
+    /// First and last line shown, 1-based; `[0, 0]` for an empty file.
+    pub lines: [usize; 2],
+    /// Lines in the whole file. Absent when showing a chunk, which is not the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
+    /// The text was cut by the line or character cap (`SHOW_MAX_LINES`,
+    /// `SHOW_MAX_CHARS`): `lines` says where it ends.
+    pub truncated: bool,
+    /// The chunk id, when showing a chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<String>,
+    pub text: String,
+}
 /// The `error` object of a failed command.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ErrorBody {

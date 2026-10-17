@@ -12,14 +12,35 @@ pub struct PathGlob {
     pattern: String,
 }
 
-/// The pattern was empty.
+/// Longest accepted pattern, in characters.
+pub const MAX_GLOB_CHARS: usize = 256;
+/// Most wildcards (`*`, `**`, `**/`) accepted in one pattern.
+pub const MAX_GLOB_WILDCARDS: usize = 8;
+
+/// Why a pattern was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmptyGlob;
+pub enum InvalidGlob {
+    Empty,
+    /// More than `MAX_GLOB_CHARS` characters.
+    TooLong,
+    /// More than `MAX_GLOB_WILDCARDS` wildcards.
+    TooComplex,
+}
 
 impl PathGlob {
-    pub fn parse(pattern: &str) -> Result<Self, EmptyGlob> {
+    pub fn parse(pattern: &str) -> Result<Self, InvalidGlob> {
         if pattern.is_empty() {
-            return Err(EmptyGlob);
+            return Err(InvalidGlob::Empty);
+        }
+        if pattern.chars().count() > MAX_GLOB_CHARS {
+            return Err(InvalidGlob::TooLong);
+        }
+        let wildcards = tokenize(pattern)
+            .iter()
+            .filter(|token| matches!(token, Token::Star | Token::GlobStar | Token::GlobStarSlash))
+            .count();
+        if wildcards > MAX_GLOB_WILDCARDS {
+            return Err(InvalidGlob::TooComplex);
         }
         Ok(Self {
             pattern: pattern.replace('\\', "/"),
@@ -83,32 +104,52 @@ fn tokenize(pattern: &str) -> Vec<Token> {
     tokens
 }
 
+/// Whether `tokens` match all of `text`. Tracks the set of text positions reachable
+/// after each token, so the cost is tokens x characters whatever the pattern.
 fn matches_from(tokens: &[Token], text: &[char]) -> bool {
-    let Some((token, rest)) = tokens.split_first() else {
-        return text.is_empty();
-    };
-    match token {
-        Token::Literal(c) => text.first() == Some(c) && matches_from(rest, &text[1..]),
-        Token::AnyOne => text.first().is_some_and(|c| *c != '/') && matches_from(rest, &text[1..]),
-        Token::Star => {
-            let run = text.iter().take_while(|c| **c != '/').count();
-            (0..=run).any(|n| matches_from(rest, &text[n..]))
+    let n = text.len();
+    let mut reach = vec![false; n + 1];
+    reach[0] = true;
+    for token in tokens {
+        let mut next = vec![false; n + 1];
+        match token {
+            Token::Literal(c) => {
+                for i in 0..n {
+                    next[i + 1] = reach[i] && text[i] == *c;
+                }
+            }
+            Token::AnyOne => {
+                for i in 0..n {
+                    next[i + 1] = reach[i] && text[i] != '/';
+                }
+            }
+            Token::Star => {
+                for j in 0..=n {
+                    next[j] = reach[j] || (j > 0 && next[j - 1] && text[j - 1] != '/');
+                }
+            }
+            Token::GlobStar => {
+                for j in 0..=n {
+                    next[j] = reach[j] || (j > 0 && next[j - 1]);
+                }
+            }
+            Token::GlobStarSlash => {
+                let mut seen = false;
+                for j in 0..=n {
+                    if j > 0 {
+                        seen |= reach[j - 1];
+                    }
+                    next[j] = reach[j] || (j > 0 && text[j - 1] == '/' && seen);
+                }
+            }
         }
-        Token::GlobStar => (0..=text.len()).any(|n| matches_from(rest, &text[n..])),
-        Token::GlobStarSlash => {
-            matches_from(rest, text)
-                || text
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| **c == '/')
-                    .any(|(i, _)| matches_from(rest, &text[i + 1..]))
-        }
+        reach = next;
     }
+    reach[n]
 }
-
 #[cfg(test)]
 mod tests {
-    use super::{EmptyGlob, PathGlob};
+    use super::{InvalidGlob, PathGlob, MAX_GLOB_CHARS, MAX_GLOB_WILDCARDS};
     use crate::domain::repo_path::RepoPath;
 
     fn matches(pattern: &str, path: &str) -> bool {
@@ -119,7 +160,33 @@ mod tests {
 
     #[test]
     fn empty_pattern_is_rejected() {
-        assert_eq!(PathGlob::parse(""), Err(EmptyGlob));
+        assert_eq!(PathGlob::parse(""), Err(InvalidGlob::Empty));
+    }
+
+    #[test]
+    fn a_pattern_with_too_many_wildcards_is_rejected() {
+        let pattern = "*a".repeat(MAX_GLOB_WILDCARDS + 1);
+        assert_eq!(PathGlob::parse(&pattern), Err(InvalidGlob::TooComplex));
+        let allowed = "*a".repeat(MAX_GLOB_WILDCARDS);
+        assert!(PathGlob::parse(&allowed).is_ok());
+    }
+
+    #[test]
+    fn a_pattern_longer_than_the_cap_is_rejected() {
+        let pattern = "a".repeat(MAX_GLOB_CHARS + 1);
+        assert_eq!(PathGlob::parse(&pattern), Err(InvalidGlob::TooLong));
+        assert!(PathGlob::parse(&"a".repeat(MAX_GLOB_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn a_backtracking_bomb_is_answered_in_linear_time() {
+        // Eight stars between literals over a long path: exponential for a naive
+        // recursive matcher, instant for one that tracks reachable positions.
+        let pattern = "*a".repeat(MAX_GLOB_WILDCARDS) + "b";
+        let path = "a".repeat(900) + ".rs";
+        assert!(!matches(&pattern, &path));
+        let hit = "a".repeat(900) + "b";
+        assert!(matches(&pattern, &hit));
     }
 
     #[test]
