@@ -100,12 +100,16 @@ impl GitLocation {
         if rest.contains(char::is_whitespace) {
             return Err(GitLocationError::Malformed);
         }
-        let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-        let path = &tail[..tail.find(['?', '#']).unwrap_or(tail.len())];
-        let (userinfo, host) = match authority.rfind('@') {
-            Some(at) => (Some(&authority[..at]), &authority[at + 1..]),
-            None => (None, authority),
+        let (userinfo, after_userinfo) = match userinfo_end(rest) {
+            Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
+            None => (None, rest),
         };
+        let (host, tail) = after_userinfo.split_at(
+            after_userinfo
+                .find(['/', '?', '#'])
+                .unwrap_or(after_userinfo.len()),
+        );
+        let path = &tail[..tail.find(['?', '#']).unwrap_or(tail.len())];
         if host.is_empty() {
             return Err(GitLocationError::Malformed);
         }
@@ -187,19 +191,46 @@ pub fn scrub_credentials(text: &str) -> String {
         out.push_str(before);
         let url_end = after.find(is_url_delimiter).unwrap_or(after.len());
         let (url, remainder) = after.split_at(url_end);
-        let (authority_and_path, _dropped_query) =
-            url.split_at(url.find(['?', '#']).unwrap_or(url.len()));
-        let (authority, path) = authority_and_path.split_at(
-            authority_and_path
-                .find('/')
-                .unwrap_or(authority_and_path.len()),
-        );
-        out.push_str(authority.rsplit('@').next().unwrap_or(authority));
-        out.push_str(path);
+        let without_userinfo = userinfo_end(url).map_or(url, |at| &url[at + 1..]);
+        let kept = &without_userinfo[..without_userinfo
+            .find(['?', '#'])
+            .unwrap_or(without_userinfo.len())];
+        out.push_str(kept);
         rest = remainder;
     }
     out.push_str(rest);
     scrub_scp_passwords(&out)
+}
+
+/// Where the userinfo of the text after `scheme://` ends: the index of its `@`.
+///
+/// A password may hold unencoded `/`, `?` and `#`, so the authority cannot be cut at
+/// the first of them. The userinfo runs to the LAST `@` when what precedes it is
+/// plainly credentials:
+/// - it holds none of `/`, `?`, `#` (`user:pw`, `token`, `u:p@ss`), or
+/// - it starts `name:secret` where the secret is not a port number
+///   (`u:pa/ss`, `u:pa#ss`), or
+/// - the first delimiter is a `#`, or a `?` not followed by `name=` (`tok#en`),
+///   and no `/` comes before the `@`.
+///
+/// An `@` after the path (`/@user/x`, `/o/r@v2`, `:8080/o/r@v2`, `?email=a@b`) is
+/// not userinfo. When in doubt the text is treated as credentials: a redacted URL
+/// is better than a leaked password.
+fn userinfo_end(after_scheme: &str) -> Option<usize> {
+    let at = after_scheme.rfind('@')?;
+    let candidate = &after_scheme[..at];
+    let Some(delimiter) = candidate.find(['/', '?', '#']) else {
+        return Some(at);
+    };
+    let head = &candidate[..delimiter];
+    if let Some((_, secret)) = head.split_once(':') {
+        let is_port = !secret.is_empty() && secret.bytes().all(|b| b.is_ascii_digit());
+        return (!is_port).then_some(at);
+    }
+    let rest = &candidate[delimiter..];
+    let before_path = !rest.contains('/');
+    let looks_like_query = rest.starts_with('?') && rest.contains('=');
+    (before_path && !looks_like_query).then_some(at)
 }
 
 fn is_url_delimiter(c: char) -> bool {
@@ -210,10 +241,18 @@ fn is_url_delimiter(c: char) -> bool {
 /// URL, and addresses without a colon before the `@` (`git@host:path`), are kept.
 fn scrub_scp_passwords(text: &str) -> String {
     fn push_word(word: &str, out: &mut String) {
-        let credentials_end = word.find('@').filter(|at| {
-            let before = &word[..*at];
-            !word.contains("://") && before.contains(':') && !before.contains('/')
-        });
+        let credentials_end = word
+            .find('@')
+            .filter(|at| {
+                let before = &word[..*at];
+                !word.contains("://") && before.contains(':') && !before.contains('/')
+            })
+            .map(|first_at| {
+                // `u:p@ss@host:path`: the userinfo ends at the last `@` before the
+                // colon that precedes the path, not at the first one.
+                let host_colon = word.rfind(':').unwrap_or(0);
+                word[..host_colon].rfind('@').unwrap_or(first_at)
+            });
         match credentials_end {
             Some(at) => out.push_str(&word[at + 1..]),
             None => out.push_str(word),
@@ -574,5 +613,71 @@ mod tests {
     #[test]
     fn scrubbing_handles_a_url_that_ends_the_message() {
         assert_eq!(scrub_credentials("https://u:p@h.com"), "https://h.com");
+    }
+
+    #[test]
+    fn scrubbing_removes_passwords_that_contain_url_delimiters() {
+        for (given, scrubbed) in [
+            ("https://u:pa#ss@host/x", "https://host/x"),
+            ("https://u:pa?ss@host/x", "https://host/x"),
+            ("https://u:pa/ss@host/x", "https://host/x"),
+            ("https://u:p#a?s/s@host.com/o/r", "https://host.com/o/r"),
+            ("https://u:p@ss@host/x", "https://host/x"),
+            ("https://tok#en@host/x", "https://host/x"),
+            ("https://tok?en@host/x", "https://host/x"),
+            ("ssh://git:pa/ss@host:22/o/r", "ssh://host:22/o/r"),
+            ("ssh://git@host/o/r", "ssh://host/o/r"),
+            (
+                "fatal: 'https://u:pa#ss@host/x' failed",
+                "fatal: 'https://host/x' failed",
+            ),
+        ] {
+            let result = scrub_credentials(given);
+            assert_eq!(result, scrubbed, "{given}");
+        }
+    }
+
+    #[test]
+    fn scrubbing_does_not_mangle_at_signs_that_are_not_credentials() {
+        for (given, scrubbed) in [
+            ("https://h.com/@user/repo", "https://h.com/@user/repo"),
+            ("https://h.com/o/r@v2.git", "https://h.com/o/r@v2.git"),
+            ("https://h.com:8080/o/r@v2", "https://h.com:8080/o/r@v2"),
+            ("https://h.com:8080/a:b/x@y", "https://h.com:8080/a:b/x@y"),
+            ("https://h.com/o?email=a@b.com", "https://h.com/o"),
+            ("https://h.com/o#a@b", "https://h.com/o"),
+        ] {
+            assert_eq!(scrub_credentials(given), scrubbed, "{given}");
+        }
+    }
+
+    #[test]
+    fn scrubbing_removes_the_whole_password_of_scp_like_addresses() {
+        for (given, scrubbed) in [
+            ("user:pw@host.com:o/r", "host.com:o/r"),
+            ("u:p@ss@host.com:o/r", "host.com:o/r"),
+            ("u:pa:ss@host.com:o/r", "host.com:o/r"),
+            ("git@h.com:o/r@v2.git", "git@h.com:o/r@v2.git"),
+            ("git@h.com:o/r", "git@h.com:o/r"),
+        ] {
+            assert_eq!(scrub_credentials(given), scrubbed, "{given}");
+        }
+    }
+
+    #[test]
+    fn userinfo_with_url_delimiters_never_survives_parse() {
+        for (given, stored) in [
+            ("https://u:pa/ss@github.com/o/r", "https://github.com/o/r"),
+            ("https://u:pa#ss@github.com/o/r", "https://github.com/o/r"),
+            ("https://u:pa?ss@github.com/o/r", "https://github.com/o/r"),
+            ("ssh://git:pa/ss@github.com/o/r", "ssh://git@github.com/o/r"),
+            ("https://github.com/@user/r", "https://github.com/@user/r"),
+            (
+                "https://github.com:8443/o/r@v2",
+                "https://github.com:8443/o/r@v2",
+            ),
+        ] {
+            assert_eq!(location(given).as_str(), stored, "{given}");
+        }
     }
 }

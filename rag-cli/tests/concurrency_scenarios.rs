@@ -376,9 +376,14 @@ impl Running {
 
     /// kill -9 (TerminateProcess on Windows). The pipes are left to their threads:
     /// a git child the process orphaned may keep them open for a moment.
-    fn kill(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    ///
+    /// True when the process really was killed in flight: it had not exited just
+    /// before the kill, the kill was delivered, and it did not end with success.
+    fn kill(mut self) -> bool {
+        let running = self.child.try_wait().unwrap().is_none();
+        let delivered = running && self.child.kill().is_ok();
+        let status = self.child.wait().unwrap();
+        delivered && !status.success()
     }
 
     /// Waits for the end: exit code, stdout as one JSON value, all of stderr.
@@ -794,18 +799,56 @@ fn two_update_all_at_once_do_not_fail_and_leave_a_consistent_searchable_state() 
 
 const STATUSES: [&str; 4] = ["cloning", "indexing", "ready", "failed"];
 
+/// How long after a phase line the process is killed, in turn: right at the line, a
+/// little later, and later still, so that the kills land in different places inside
+/// and after the phase.
+const KILL_DELAYS_MS: [u64; 3] = [0, 40, 160];
+
+/// Starts `args`, waits for the `phase` line, waits `delay`, and kills it. True when
+/// the process was killed in flight. False when it finished first, which is accepted
+/// only when it finished successfully: an `add` or `update` repeated over the state a
+/// previous kill left may legitimately find nothing left to do.
+fn kill_in_phase(rag: &Rag, args: &[&str], phase: &str, delay: Duration) -> bool {
+    let process = rag.spawn(args);
+    if !process.wait_for_line(phase) {
+        let (code, body, stderr) = process.finish(args);
+        assert_eq!(code, 0, "{args:?} ended without {phase}: {body}\n{stderr}");
+        return false;
+    }
+    std::thread::sleep(delay);
+    process.kill()
+}
+
+/// Kills `args` once per delay of `KILL_DELAYS_MS`, checking after each kill that the
+/// registry is readable, and returns how many kills landed in flight. The phases
+/// before the commit must be hit at least once; a kill at the commit phase may come
+/// after the process is done, which is a legitimate outcome that is only reported.
+fn kill_repeatedly(rag: &Rag, args: &[&str], phase: &str) -> usize {
+    let mut in_flight = 0;
+    for delay in KILL_DELAYS_MS {
+        if kill_in_phase(rag, args, phase, Duration::from_millis(delay)) {
+            in_flight += 1;
+        }
+        for status in rag.statuses() {
+            assert!(STATUSES.contains(&status.as_str()), "status {status}");
+        }
+    }
+    note!(
+        "{args:?} at {phase}: {in_flight} of {} kills landed in flight",
+        KILL_DELAYS_MS.len()
+    );
+    if phase != "commit:" {
+        assert!(in_flight >= 1, "no kill landed in flight at {phase}");
+    }
+    in_flight
+}
+
 fn killed_add_can_be_added_again(phase: &str) {
     let rag = Rag::new();
     let upstream = Upstream::stamped(FILES, 1);
     let args = ["add", upstream.location()];
-    let process = rag.spawn(&args);
-    assert!(process.wait_for_line(phase), "{phase} was printed");
-    process.kill();
+    kill_repeatedly(&rag, &args, phase);
 
-    // The registry is readable and sane.
-    for status in rag.statuses() {
-        assert!(STATUSES.contains(&status.as_str()), "status {status}");
-    }
     // The lock died with the process: nothing waits and nothing is refused.
     let added = rag.json(&["add", upstream.location(), "--no-wait"], 0);
     assert_eq!(added["status"], "ready", "{added}");
@@ -822,7 +865,6 @@ fn killed_add_can_be_added_again(phase: &str) {
         .collect();
     assert!(leftovers.is_empty(), "tmp/ leftovers: {leftovers:?}");
 }
-
 #[test]
 fn an_add_killed_at_the_fetch_phase_can_be_added_again() {
     let _s = scenario("8 kill add at fetch");
@@ -856,10 +898,7 @@ fn killed_update_keeps_serving_the_old_index(phase: &str) {
     let second = upstream.head_short();
     let commits = vec![(1, first), (2, second)];
 
-    let process = rag.spawn(&["update"]);
-    assert!(process.wait_for_line(phase), "{phase} was printed");
-    process.kill();
-
+    kill_repeatedly(&rag, &["update"], phase);
     // Old or new, never a mix, and always searchable. (A kill at the commit phase may
     // land after the commit; both are legitimate.)
     let found = rag.call(&["search", "stampfn", "-k", "20"]);
@@ -920,15 +959,36 @@ fn the_lock_of_a_killed_process_is_released_by_the_operating_system() {
     let rag = Rag::new();
     let upstream = Upstream::stamped(FILES, 1);
     let name = rag.name_of(&rag.add(&upstream));
-    upstream.restamp(FILES, 2);
 
-    let process = rag.spawn(&["update", &name]);
-    assert!(process.wait_for_line("read:"), "the update holds the lock");
-    // While it runs, the lock is taken.
-    let busy = rag.json(&["update", &name, "--no-wait"], 6);
-    assert_eq!(busy["error"]["code"], "index_locked");
-    process.kill();
-
+    // The holder may finish before the contender asks (then the contender legitimately
+    // gets the lock). Try again with fresh work until a contender is seen refused
+    // while the holder is alive: only then is the held lock proven.
+    let mut killed_while_holding = false;
+    for generation in 2..7 {
+        upstream.restamp(FILES, generation);
+        let mut holder = rag.spawn(&["update", &name]);
+        assert!(holder.wait_for_line("read:"), "the update holds the lock");
+        let (code, body) = rag.call(&["update", &name, "--no-wait"]);
+        match code {
+            6 => {
+                assert_eq!(body["error"]["code"], "index_locked");
+                killed_while_holding = holder.kill();
+                if killed_while_holding {
+                    break;
+                }
+            }
+            0 => {
+                assert!(holder.has_exited(), "got the lock while the update held it");
+                let (code, body, stderr) = holder.finish(&["update", &name]);
+                assert_eq!(code, 0, "{body}\n{stderr}");
+            }
+            other => panic!("--no-wait exited {other}: {body}"),
+        }
+    }
+    assert!(
+        killed_while_holding,
+        "no attempt saw the lock held by a running update that was then killed"
+    );
     let started = Instant::now();
     for args in [
         &["update", &name, "--no-wait"][..],

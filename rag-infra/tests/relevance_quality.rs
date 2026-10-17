@@ -14,7 +14,6 @@
 mod corpus;
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
 
 use corpus::{Corpus, Skipped, NOW};
 use rag_core::application::dto::{SearchRequest, SearchResponse};
@@ -642,16 +641,14 @@ fn paging_continues_the_same_ranking_without_gaps_or_repeats() {
 }
 
 #[test]
-fn a_common_word_only_query_returns_promptly() {
+fn a_common_word_only_query_returns_one_capped_page_of_hits() {
+    // Speed over a large index is guarded by `relevance_latency.rs`; this corpus is
+    // too small for a timing to mean anything.
     let corpus = corpus::build();
-    let started = Instant::now();
     let response = search_ok(&corpus, "the");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "a one-word common query took {elapsed:?}"
-    );
-    assert!(response.results.len() <= 5);
+    assert!(!response.results.is_empty(), "the word is in the corpus");
+    assert!(response.results.len() <= 5, "{}", response.results.len());
+    assert!(response.total_matches >= response.results.len());
 }
 
 #[test]

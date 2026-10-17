@@ -1,10 +1,12 @@
 //! Latency guard: a larger index (about 22,000 chunks in a real SQLite store) and a
 //! common-word AND query run 20 times through the `Search` use case.
 //!
-//! The suite asserts only that the 20 runs complete with results. The timings are
-//! measured and summarised (min, median, p95, max), but there is no timing assertion:
-//! the test profile is too noisy for one. The summary is part of the assertion
-//! message, so it appears whenever the guard fails.
+//! The bounds are deliberately loose, for the unoptimised test profile on a loaded
+//! machine: the median of the 20 runs must stay under 2 s and the p95 under 5 s.
+//! They exist to catch a change that makes the query scan every chunk (an order of
+//! magnitude or more), not a few percent. The summary (min, median, p95, max) is
+//! part of every assertion message. (The query plan is checked structurally in the
+//! `sqlite::search` unit tests.)
 
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,8 @@ const FILES: usize = 2_000;
 const LINES_PER_FILE: usize = 600;
 const MIN_CHUNKS: usize = 20_000;
 const RUNS: usize = 20;
+const MEDIAN_BOUND: Duration = Duration::from_secs(2);
+const P95_BOUND: Duration = Duration::from_secs(5);
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// A source file with no blank lines, so the chunker cuts it into full windows.
@@ -88,8 +92,14 @@ fn summary(timings: &[Duration]) -> String {
     )
 }
 
+fn percentile(timings: &[Duration], percent: usize) -> Duration {
+    let mut sorted = timings.to_vec();
+    sorted.sort();
+    sorted[((percent * sorted.len()).div_ceil(100)).max(1) - 1]
+}
+
 #[test]
-fn twenty_common_word_queries_complete_over_twenty_thousand_chunks() {
+fn twenty_common_word_queries_over_twenty_thousand_chunks_meet_the_latency_bounds() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (store, id) = large_index(dir.path());
     let chunks = store.chunk_count(&id).expect("chunk count");
@@ -114,4 +124,11 @@ fn twenty_common_word_queries_complete_over_twenty_thousand_chunks() {
         summary(&timings)
     );
     assert_eq!(timings.len(), RUNS, "{report}");
+    let median = percentile(&timings, 50);
+    let p95 = percentile(&timings, 95);
+    assert!(
+        median < MEDIAN_BOUND,
+        "median over {MEDIAN_BOUND:?}: {report}"
+    );
+    assert!(p95 < P95_BOUND, "p95 over {P95_BOUND:?}: {report}");
 }

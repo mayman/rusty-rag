@@ -10,12 +10,8 @@
 use crate::domain::language::{DocumentKind, Language};
 use crate::domain::repo_path::RepoPath;
 
-/// Bumped whenever the multipliers or the path rules change. Query-time only: it is
-/// deliberately not one of the `IndexVersions`, so no index goes stale.
-pub const RANKING_VERSION: u32 = 1;
-
 /// Multiplier for documentation: a prose file under a documentation directory, or a
-/// top-level README or other top-level prose. Slight, so that a clearly better code
+/// top-level README-like file (`TOP_LEVEL_DOCUMENTATION_STEMS`). Slight, so that a clearly better code
 /// match still wins.
 pub const DOCUMENTATION_BOOST: f64 = 1.15;
 
@@ -31,23 +27,57 @@ const TEST_DIRECTORIES: &[&str] = &[
     "tests",
     "testsuite",
     "__tests__",
-    "spec",
-    "specs",
     "fixtures",
     "testdata",
     "benches",
 ];
 
 /// Directory names (any depth, compared in lowercase) that mark documentation.
-const DOCUMENTATION_DIRECTORIES: &[&str] = &["docs", "doc", "documentation", "book", "guide"];
+const DOCUMENTATION_DIRECTORIES: &[&str] = &[
+    "docs",
+    "doc",
+    "documentation",
+    "book",
+    "guide",
+    "guides",
+    "manual",
+    "wiki",
+];
 
-/// Top-level prose that is a history log, not documentation: it repeats every term
-/// ever touched, so it is never boosted.
-const HISTORY_FILE_STEMS: &[&str] = &["changelog", "changes", "history", "news", "releases"];
+/// Directory names that mark tests only for code files: `spec/` holds RSpec and
+/// Jest tests, but `specs/design.md` is a prose specification.
+const SPEC_DIRECTORIES: &[&str] = &["spec", "specs"];
 
-/// Prose extensions that count as documentation. `Language` knows markdown and
-/// plain text; reStructuredText and AsciiDoc are unknown to it (they are `text`).
-const PROSE_EXTENSIONS: &[&str] = &["md", "markdown", "mdx", "rst", "adoc", "asciidoc", "txt"];
+/// Extensions of source code, for the directories that are test directories only
+/// for code.
+const CODE_EXTENSIONS: &[&str] = &[
+    "rb", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "rs", "go", "java", "kt", "kts", "scala",
+    "php", "cs", "ex", "exs", "swift", "c", "cc", "cpp", "h", "hpp", "lua", "clj", "hs", "ml",
+    "dart", "sh",
+];
+
+/// Top-level files (any prose extension) that are documentation, matched on the part
+/// of the name before the first dot (`README.zh-CN.md` is `readme`). Other top-level
+/// prose and text files (`CMakeLists.txt`, `requirements.txt`) are not.
+const TOP_LEVEL_DOCUMENTATION_STEMS: &[&str] = &[
+    "readme",
+    "guide",
+    "usage",
+    "install",
+    "installation",
+    "faq",
+    "tutorial",
+    "overview",
+    "architecture",
+    "design",
+];
+
+/// Prose extensions that count as documentation. `Language` knows markdown; the
+/// others are unknown to it. Plain `txt` is deliberately not here: it is
+/// documentation only for README-like names (`PLAIN_TEXT_EXTENSION`).
+const PROSE_EXTENSIONS: &[&str] = &["md", "markdown", "mdx", "rst", "adoc", "asciidoc"];
+
+const PLAIN_TEXT_EXTENSION: &str = "txt";
 
 /// The multiplier for a chunk at `path`: `TEST_PENALTY` for tests and fixtures
 /// (which wins over documentation, so `tests/docs/x.md` is a test),
@@ -78,6 +108,11 @@ fn is_test_path(path: &RepoPath) -> bool {
     let Some((stem, extension)) = name.rsplit_once('.') else {
         return false;
     };
+    if CODE_EXTENSIONS.contains(&extension)
+        && directories(path).any(|d| SPEC_DIRECTORIES.contains(&d.as_str()))
+    {
+        return true;
+    }
     match extension {
         "py" => stem.starts_with("test_") || stem.ends_with("_test"),
         "go" | "rs" => stem.ends_with("_test"),
@@ -91,8 +126,11 @@ fn is_documentation(path: &RepoPath) -> bool {
     let Some((stem, extension)) = name.rsplit_once('.') else {
         return false;
     };
+    let readme_like =
+        TOP_LEVEL_DOCUMENTATION_STEMS.contains(&stem.split('.').next().unwrap_or(stem));
     let prose = PROSE_EXTENSIONS.contains(&extension)
-        || Language::from_path(path).document_kind() == DocumentKind::Markdown;
+        || Language::from_path(path).document_kind() == DocumentKind::Markdown
+        || (extension == PLAIN_TEXT_EXTENSION && readme_like);
     if !prose {
         return false;
     }
@@ -100,7 +138,7 @@ fn is_documentation(path: &RepoPath) -> bool {
         return true;
     }
     let top_level = !path.as_str().contains('/');
-    top_level && !HISTORY_FILE_STEMS.contains(&stem)
+    top_level && readme_like
 }
 
 #[cfg(test)]
@@ -119,11 +157,20 @@ mod tests {
             "docs/guide/install.md",
             "docs/index.rst",
             "guide/intro.adoc",
-            "Documentation/notes.txt",
+            "Documentation/notes.md",
+            "docs/README.txt",
+            "docs/manual/setup.rst",
+            "guides/start.md",
+            "wiki/Home.md",
+            "manual/ch1.adoc",
             "website/book/ch01.md",
             "README.md",
-            "CONTRIBUTING.md",
+            "README.zh-CN.md",
             "readme.rst",
+            "README.txt",
+            "INSTALL.md",
+            "Architecture.adoc",
+            "FAQ.md",
         ] {
             assert_eq!(prior(path), DOCUMENTATION_BOOST, "{path}");
         }
@@ -150,6 +197,10 @@ mod tests {
             "src/app.spec.js",
             "src/App.test.tsx",
             "Docs/Tests/Mod.rs",
+            "spec/models/user_spec.rb",
+            "specs/helpers.js",
+            "spec/support/shared.py",
+            "app/spec/rails_helper.rb",
         ] {
             assert_eq!(prior(path), TEST_PENALTY, "{path}");
         }
@@ -169,6 +220,14 @@ mod tests {
             "src/latest/mod.rs",
             "src/contest.py",
             "examples/basic.rs",
+            "CMakeLists.txt",
+            "requirements.txt",
+            "robots.txt",
+            "docs/requirements.txt",
+            "docs/robots.txt",
+            "CONTRIBUTING.md",
+            "SECURITY.md",
+            "spec/support/helper.json",
             "CHANGELOG.md",
             "HISTORY.rst",
             "src/notes.md",
@@ -182,6 +241,23 @@ mod tests {
         ] {
             assert_eq!(prior(path), NEUTRAL, "{path}");
         }
+    }
+
+    #[test]
+    fn prose_inside_a_spec_directory_is_not_a_test() {
+        assert_eq!(prior("spec/README.md"), NEUTRAL);
+        assert_eq!(prior("specs/design.md"), NEUTRAL);
+        assert_eq!(prior("docs/specs/api.md"), DOCUMENTATION_BOOST);
+        assert_eq!(prior("spec/notes.txt"), NEUTRAL);
+    }
+
+    #[test]
+    fn the_multipliers_are_not_neutral_so_the_prior_cannot_be_silently_removed() {
+        const { assert!(DOCUMENTATION_BOOST >= 1.05) };
+        const { assert!(TEST_PENALTY <= 0.9) };
+        const { assert!(TEST_PENALTY > 0.0) };
+        assert_ne!(DOCUMENTATION_BOOST, NEUTRAL);
+        assert_ne!(TEST_PENALTY, NEUTRAL);
     }
 
     const _: () = assert!(TEST_PENALTY < NEUTRAL && NEUTRAL < DOCUMENTATION_BOOST);
