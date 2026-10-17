@@ -1,0 +1,256 @@
+# Release pipeline for the `rag` CLI.
+#
+# - Push of a tag `v*` (for example v0.1.0 or v0.2.0-rc.1): builds every target and
+#   publishes a GitHub Release with the archives and SHA256SUMS.
+# - workflow_dispatch: builds every target and uploads the archives as workflow
+#   artifacts only (dry run, no release).
+#
+# Action pins: the actions below are official GitHub actions at their current major
+# version. The maintainer may pin each one to a full commit SHA (see docs/RELEASING.md).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Least privilege by default. Only the release job gets write access.
+permissions:
+  contents: read
+
+# One run per ref at a time. Dry runs on a branch may cancel an older dry run;
+# release runs (tags) are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: Verify version and formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4 # maintainer may pin to a full commit SHA
+        with:
+          persist-credentials: false
+
+      - name: Resolve pinned toolchain
+        run: rustup show
+
+      - name: Read workspace version
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "rag-cli") | .version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::Could not read the rag-cli version from cargo metadata." >&2
+            exit 1
+          fi
+          echo "Workspace version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches workspace version
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected="v${VERSION}"
+          if [ "$TAG" != "$expected" ]; then
+            echo "::error::Tag '$TAG' does not match the workspace version. The [workspace.package] version in the root Cargo.toml is '$VERSION', so the tag must be '$expected'. Bump the version, or push the matching tag." >&2
+            exit 1
+          fi
+          echo "Tag $TAG matches workspace version $VERSION."
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe_suffix: ".exe"
+            native: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            exe_suffix: ""
+            native: true
+          # Cross-compiled on the arm64 macOS runner; not executed here.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            exe_suffix: ""
+            native: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+            exe_suffix: ""
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            exe_suffix: ""
+            native: true
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE_EXT: ${{ matrix.archive }}
+      EXE_SUFFIX: ${{ matrix.exe_suffix }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4 # maintainer may pin to a full commit SHA
+        with:
+          persist-credentials: false
+
+      - name: Resolve pinned toolchain and add target
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup target add "$TARGET"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4 # maintainer may pin to a full commit SHA
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked -p rag-cli --target "$TARGET"
+
+      - name: Smoke test (native targets only)
+        if: matrix.native
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/rag${EXE_SUFFIX}"
+          test -f "$bin"
+          # Git Bash cannot pass a /tmp path to a native binary, so build the scratch
+          # path from RUNNER_TEMP with forward slashes (valid on every OS).
+          scratch="${RUNNER_TEMP//\\//}/rag-smoke-${TARGET}"
+          rm -rf "$scratch"
+          mkdir -p "$scratch/home"
+          export RUSTY_RAG_HOME="$scratch/home"
+
+          version_out="$("$bin" --version)"
+          echo "$version_out"
+          case "$version_out" in
+            *" $VERSION"*) ;;
+            *)
+              echo "::error::rag --version printed '$version_out', expected version $VERSION." >&2
+              exit 1
+              ;;
+          esac
+
+          "$bin" list > "$scratch/list.json"
+          cat "$scratch/list.json"
+          node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))" "$scratch/list.json"
+
+      - name: Package archive and checksum
+        run: |
+          set -euo pipefail
+          name="rag-${VERSION}-${TARGET}"
+          dist="$PWD/dist"
+          stage="$dist/stage/$name"
+          rm -rf "$dist"
+          mkdir -p "$stage"
+          cp "target/${TARGET}/release/rag${EXE_SUFFIX}" "$stage/"
+          cp README.md "$stage/"
+          if [ -f LICENSE ]; then cp LICENSE "$stage/"; fi
+
+          if [ "$ARCHIVE_EXT" = "zip" ]; then
+            # PowerShell's Compress-Archive is present on every Windows runner; zip(1) is not guaranteed.
+            stage_win="$(cygpath -w "$stage")"
+            zip_win="$(cygpath -w "$dist/$name.zip")"
+            powershell.exe -NoProfile -NonInteractive -Command "Compress-Archive -Path '${stage_win}\\*' -DestinationPath '${zip_win}' -Force"
+          else
+            tar -czf "$dist/$name.tar.gz" -C "$stage" .
+          fi
+
+          archive="$name.$ARCHIVE_EXT"
+          cd "$dist"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4 # maintainer may pin to a full commit SHA
+        with:
+          name: rag-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4 # maintainer may pin to a full commit SHA
+        with:
+          pattern: rag-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify artifacts and write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          for checksum in rag-*.sha256; do
+            sha256sum -c "$checksum"
+          done
+          sha256sum rag-*.zip rag-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release, or upload to the existing one
+        run: |
+          set -euo pipefail
+          cd dist
+          assets=(rag-*.zip rag-*.tar.gz SHA256SUMS)
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets with --clobber."
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes "${prerelease[@]}"
+          fi
