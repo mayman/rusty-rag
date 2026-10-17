@@ -140,7 +140,9 @@ mod tests {
             files_unchanged: 5,
             chunks_written: 14,
             skipped: BTreeMap::from([("binary", 2)]),
+            skipped_secret_paths: Vec::new(),
             skipped_unsafe_paths: 0,
+            phases: Vec::new(),
         }
     }
 
@@ -252,6 +254,7 @@ mod tests {
             repo: "github.com/o/r".to_owned(),
             name: "r".to_owned(),
             checkout_removed: true,
+            checkout_error: None,
         };
         assert_eq!(
             render_remove_human(&removed),

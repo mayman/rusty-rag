@@ -46,11 +46,12 @@ pub fn render_show_human(response: &ShowResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::{render_show_human, render_show_json};
-    use rag_core::application::dto::{ShowResponse, SCHEMA_VERSION};
+    use rag_core::application::dto::{ShowResponse, SCHEMA_VERSION, UNTRUSTED_CONTENT};
 
     fn file_slice() -> ShowResponse {
         ShowResponse {
             schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
             repo: "github.com/o/r".to_owned(),
             commit: "abababa".to_owned(),
             indexed_at: "2023-11-14T22:13:20Z".to_owned(),
@@ -69,7 +70,7 @@ mod tests {
         assert_eq!(
             render_show_json(&file_slice()),
             concat!(
-                r#"{"schema_version":1,"repo":"github.com/o/r","commit":"abababa","#,
+                r#"{"schema_version":1,"content":"untrusted","repo":"github.com/o/r","commit":"abababa","#,
                 r#""indexed_at":"2023-11-14T22:13:20Z","path":"src/a.rs","language":"rust","#,
                 r#""lines":[9,11],"total_lines":40,"truncated":false,"#,
                 r#""text":"fn a() {\n    b()\n}"}"#

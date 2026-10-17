@@ -12,7 +12,8 @@
 //!   adapter implements both over the same database), so a source row and its index
 //!   change together in `ChunkStore::commit_index`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use crate::application::error::{GitError, StorageError};
 use crate::domain::chunk::{Chunk, IndexFields};
@@ -144,6 +145,26 @@ pub trait ChunkStore: Send + Sync {
 
     /// Number of stored chunks. Zero for an unknown source.
     fn chunk_count(&self, source: &SourceId) -> Result<usize, StorageError>;
+
+    /// Number of stored chunks of the files at `paths` (each path counted once;
+    /// paths that are not stored, and unknown sources, count zero). Lets the
+    /// indexing pipeline see how many chunks a change replaces without loading every
+    /// chunk of the source.
+    ///
+    /// The provided body reads `chunks` and filters; adapters should override it with
+    /// a query that does not load chunk text.
+    fn chunk_count_for_paths(
+        &self,
+        source: &SourceId,
+        paths: &[RepoPath],
+    ) -> Result<usize, StorageError> {
+        let wanted: BTreeSet<&RepoPath> = paths.iter().collect();
+        Ok(self
+            .chunks(source)?
+            .iter()
+            .filter(|chunk| wanted.contains(&chunk.path))
+            .count())
+    }
 
     /// The stored chunk with this id, exactly as committed, or `None` when no such
     /// chunk is stored (never indexed, replaced or removed with its file, or its
@@ -328,4 +349,21 @@ impl std::fmt::Debug for LockGuard {
 pub trait OperationLock: Send + Sync {
     /// Takes the lock of `source`. Contention gives `StorageError::Busy`.
     fn acquire(&self, source: &SourceId) -> Result<LockGuard, StorageError>;
+
+    /// Takes the lock of `source` for the named `operation` (`add`, `update`), waiting
+    /// up to `max_wait` for a holder to let go. `Duration::ZERO` means no wait. When
+    /// the wait runs out the error is `StorageError::LockedBy` naming the operation
+    /// the holder is running when the adapter can tell, else `StorageError::Busy`.
+    ///
+    /// The provided body ignores both arguments and calls `acquire`: an adapter that
+    /// cannot wait still honours the contract (it just never waits).
+    fn acquire_waiting(
+        &self,
+        source: &SourceId,
+        operation: &str,
+        max_wait: Duration,
+    ) -> Result<LockGuard, StorageError> {
+        let _ = (operation, max_wait);
+        self.acquire(source)
+    }
 }

@@ -63,7 +63,8 @@ impl ChunkStore for SqliteStore {
             tx.execute(
                 "UPDATE sources SET name = ?2, name_key = ?3, location = ?4, git_ref = ?5, \
                  status = ?6, indexed_commit = ?7, indexed_at = ?8, tokenizer_version = ?9, \
-                 chunker_version = ?10, policy_version = ?11 WHERE source_id = ?1",
+                 chunker_version = ?10, policy_version = ?11, last_error_code = NULL, \
+                 last_error_message = NULL, last_error_at = NULL WHERE source_id = ?1",
                 (
                     source.id().as_str(),
                     source.name(),
@@ -136,6 +137,27 @@ impl ChunkStore for SqliteStore {
                 )
                 .map_err(storage_error)?;
             usize::try_from(count).map_err(|_| failed("negative chunk count"))
+        })
+    }
+
+    fn chunk_count_for_paths(
+        &self,
+        source: &SourceId,
+        paths: &[RepoPath],
+    ) -> Result<usize, StorageError> {
+        let wanted: BTreeSet<&str> = paths.iter().map(RepoPath::as_str).collect();
+        self.read(|connection| {
+            let mut statement = connection
+                .prepare_cached("SELECT COUNT(*) FROM chunks WHERE source_id = ?1 AND path = ?2")
+                .map_err(storage_error)?;
+            let mut total = 0usize;
+            for path in wanted {
+                let count: i64 = statement
+                    .query_row((source.as_str(), path), |row| row.get(0))
+                    .map_err(storage_error)?;
+                total += usize::try_from(count).map_err(|_| failed("negative chunk count"))?;
+            }
+            Ok(total)
         })
     }
 

@@ -4,20 +4,26 @@
 //! - `execute`: `<repo> <path> [--lines S-E] [--around N]`. The path is resolved
 //!   through the manifest (the indexed files, never `ls_tree`) and read as a blob at
 //!   the indexed commit, so it serves exactly what was indexed even while an update
-//!   runs. The bytes pass `IndexPolicy::check_content` again, and the output is
-//!   capped in lines and characters (`truncated` says so).
+//!   runs. The path is looked up with the git rules (`RepoPath::lookup`: `aux.rs` is
+//!   a file), must pass the name rules of `IndexPolicy::check_path`, and its bytes
+//!   pass `IndexPolicy::check_content` again. Both ways in refuse an index built by
+//!   other rules (`ReindexRequired`). The text is sanitised
+//!   (`untrusted_text::sanitize_untrusted`) and capped in lines and characters
+//!   (`truncated` says so).
 
 use crate::application::dto::{
     ShowResponse, SCHEMA_VERSION, SHOW_AROUND_RADIUS, SHOW_MAX_CHARS, SHOW_MAX_LINES,
+    UNTRUSTED_CONTENT,
 };
-use crate::application::error::{AppError, Scrubbed};
+use crate::application::error::{AppError, Scrubbed, StorageError};
+use crate::application::indexer::resolve_source;
 use crate::application::ports::{ChunkStore, GitClient, SourceRepository};
-use crate::application::search::{find_sources, unknown_source};
 use crate::domain::chunk_id::ChunkId;
 use crate::domain::index_policy::IndexPolicy;
 use crate::domain::language::Language;
 use crate::domain::repo_path::RepoPath;
 use crate::domain::source::{IndexedRevision, Source};
+use crate::domain::untrusted_text::sanitize_untrusted;
 
 /// Input of `ShowFile::execute`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,10 +59,11 @@ impl<'a> ShowFile<'a> {
 
     /// A slice of an indexed file, read at the indexed commit.
     pub fn execute(&self, request: &ShowFileRequest) -> Result<ShowResponse, AppError> {
-        let source = self.source(&request.repo)?;
+        let source = resolve_source(self.sources, &request.repo)?;
         let revision = revision_of(&source)?;
-        let path = RepoPath::parse(&request.path)
+        let path = RepoPath::lookup(&request.path)
             .map_err(|error| AppError::Usage(Scrubbed::from(error.to_string())))?;
+        refuse_by_name(&path)?;
         let Some(blob) = self.chunks.manifest(source.id())?.get(&path).cloned() else {
             return Err(AppError::NotFound(Scrubbed::from(format!(
                 "{path} is not indexed in {}; it may be new, skipped by the index rules, or removed",
@@ -81,6 +88,7 @@ impl<'a> ShowFile<'a> {
         let clipped = clip(&lines[first.saturating_sub(1)..last], first.max(1));
         Ok(ShowResponse {
             schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
             repo: source.id().slug().to_owned(),
             commit: revision.commit.short().to_owned(),
             indexed_at: revision.at.to_rfc3339(),
@@ -90,7 +98,7 @@ impl<'a> ShowFile<'a> {
             total_lines: Some(lines.len()),
             truncated: clipped.truncated,
             chunk: None,
-            text: clipped.text,
+            text: sanitize_untrusted(&clipped.text),
         })
     }
 
@@ -109,10 +117,12 @@ impl<'a> ShowFile<'a> {
         let chunk = self.chunks.chunk(&id)?.ok_or_else(gone)?;
         let source = self.sources.get(&chunk.source)?.ok_or_else(gone)?;
         let revision = revision_of(&source)?;
+        refuse_by_name(&chunk.path)?;
         let lines: Vec<&str> = chunk.text.lines().collect();
         let clipped = clip(&lines, chunk.lines.start());
         Ok(ShowResponse {
             schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
             repo: chunk.source.slug().to_owned(),
             commit: revision.commit.short().to_owned(),
             indexed_at: revision.at.to_rfc3339(),
@@ -122,27 +132,33 @@ impl<'a> ShowFile<'a> {
             total_lines: None,
             truncated: clipped.truncated,
             chunk: Some(chunk.id.as_str().to_owned()),
-            text: clipped.text,
+            text: sanitize_untrusted(&clipped.text),
         })
-    }
-
-    fn source(&self, wanted: &str) -> Result<Source, AppError> {
-        let mut found = find_sources(self.sources, wanted)?;
-        match found.len() {
-            0 => Err(unknown_source(wanted)),
-            1 => Ok(found.remove(0)),
-            _ => Err(AppError::Usage(Scrubbed::from(format!(
-                "{wanted:?} names several sources; use the source name from `rag list`"
-            )))),
-        }
     }
 }
 
+/// The indexed revision of `source`, which must have been made by the current rules:
+/// an index built by other rules is not shown until `rag reindex` has rebuilt it.
 fn revision_of(source: &Source) -> Result<&IndexedRevision, AppError> {
-    source.indexed().ok_or_else(|| {
+    let revision = source.indexed().ok_or_else(|| {
         AppError::NotFound(Scrubbed::from(format!(
             "{} has no indexed commit yet",
             source.name()
+        )))
+    })?;
+    if !revision.versions.is_current() {
+        return Err(StorageError::ReindexRequired.into());
+    }
+    Ok(revision)
+}
+
+/// Refuses a path the name rules of the index policy keep out of the index (secret
+/// names, vendored directories, ...), whatever the store holds.
+fn refuse_by_name(path: &RepoPath) -> Result<(), AppError> {
+    IndexPolicy::check_path(path).map_err(|reason| {
+        AppError::NotFound(Scrubbed::from(format!(
+            "{path} is not indexed and is not shown: {}",
+            reason.as_str()
         )))
     })
 }
@@ -234,10 +250,11 @@ mod tests {
         ChunkStore, GitClient, IndexChanges, IndexedFile, SourceRepository, MAX_BLOB_BYTES,
     };
     use crate::application::search::fixtures::INDEXED_AT;
-    use crate::application::testkit::{FakeGitClient, InMemoryStore};
+    use crate::application::testkit::{FakeGitClient, InMemoryStore, StampStoredVersions};
     use crate::domain::chunker::Chunker;
     use crate::domain::git_location::GitLocation;
     use crate::domain::git_ref::GitRef;
+    use crate::domain::index_versions::IndexVersions;
     use crate::domain::indexed_at::IndexedAt;
     use crate::domain::oid::CommitId;
     use crate::domain::repo_path::RepoPath;
@@ -488,12 +505,104 @@ mod tests {
         for path in [
             "../a.rs",
             "/etc/passwd",
-            "C:\\x",
-            "a.rs:stream",
             ".git/config",
+            "a//b",
+            "a\u{202e}b",
         ] {
             let error = world.show(&request("docs", path)).unwrap_err();
             assert_eq!(error.code(), ErrorCode::Usage, "{path}");
+        }
+    }
+
+    #[test]
+    fn windows_only_path_rules_do_not_apply_to_a_lookup() {
+        // Nothing is checked out, so `a.rs:stream` and `C:\\x` are just paths that are
+        // not in the manifest: not found, not a usage error.
+        let world = World::new(&[("a.rs", "x")]);
+        for path in ["C:\\x", "a.rs:stream", "con", "a."] {
+            let error = world.show(&request("docs", path)).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::NotFound, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_file_named_like_a_windows_device_can_be_shown() {
+        let world = World::new(&[("aux.rs", "fn aux() {}"), ("src/NUL.txt", "nothing")]);
+        let shown = world.show(&request("docs", "aux.rs")).unwrap();
+        assert_eq!(shown.text, "fn aux() {}");
+        assert_eq!(
+            world.show(&request("docs", "src\\NUL.txt")).unwrap().text,
+            "nothing"
+        );
+    }
+
+    #[test]
+    fn show_responses_mark_their_content_untrusted() {
+        let world = World::new(&[("a.rs", "fn a() {}")]);
+        assert_eq!(
+            world.show(&request("docs", "a.rs")).unwrap().content,
+            "untrusted"
+        );
+        let id = first_chunk_id(&world, "a.rs");
+        let shown = world.show_chunk(&id).unwrap();
+        assert_eq!(shown.content, "untrusted");
+        assert!(serde_json::to_string(&shown)
+            .unwrap()
+            .contains(r#""content":"untrusted""#));
+    }
+
+    #[test]
+    fn shown_text_is_neutralised_in_core() {
+        let text = "ok\n\u{1b}[2J wipe \u{202e}gnp \u{e0041} \u{9b}31m\ttab\n";
+        let world = World::new(&[("a.txt", text)]);
+        let shown = world.show(&request("docs", "a.txt")).unwrap();
+        assert_eq!(shown.text, "ok\n?[2J wipe ?gnp ? ?31m\ttab");
+        let by_chunk = world.show_chunk(&first_chunk_id(&world, "a.txt")).unwrap();
+        assert!(crate::domain::untrusted_text::is_clean(&by_chunk.text));
+    }
+
+    #[test]
+    fn files_the_name_rules_refuse_are_never_shown_even_if_a_store_holds_them() {
+        // A store written by a build with other rules, or by hand, may hold them.
+        let world = World::new(&[
+            (".env", "SECRET=hunter2\n"),
+            ("keys/server.pem", "pem"),
+            ("node_modules/x/y.js", "module.exports = 1;"),
+            ("src/ok.rs", "fn ok() {}"),
+        ]);
+        for path in [".env", "keys/server.pem", "node_modules/x/y.js"] {
+            let error = world.show(&request("docs", path)).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::NotFound, "{path}");
+            assert!(!error.to_string().contains("hunter2"), "{error}");
+            let id = first_chunk_id_or_none(&world, path);
+            if let Some(id) = id {
+                assert_eq!(
+                    world.show_chunk(&id).unwrap_err().code(),
+                    ErrorCode::NotFound,
+                    "{path} by chunk"
+                );
+            }
+        }
+        assert!(world.show(&request("docs", "src/ok.rs")).is_ok());
+    }
+
+    #[test]
+    fn a_stale_index_cannot_be_shown_until_reindexed() {
+        let world = World::new(&[("a.rs", "fn a() {}")]);
+        let id = first_chunk_id(&world, "a.rs");
+        world.store.stamp_stored_versions(
+            &world.id,
+            IndexVersions {
+                chunker: 0,
+                ..IndexVersions::current()
+            },
+        );
+        for error in [
+            world.show(&request("docs", "a.rs")).unwrap_err(),
+            world.show_chunk(&id).unwrap_err(),
+        ] {
+            assert_eq!(error.code(), ErrorCode::ReindexRequired, "{error}");
+            assert_eq!(error.code().exit_code(), 7);
         }
     }
 
@@ -543,17 +652,18 @@ mod tests {
     }
 
     fn first_chunk_id(world: &World, path: &str) -> String {
-        let path = RepoPath::parse(path).unwrap();
+        first_chunk_id_or_none(world, path).expect("a chunk of that path")
+    }
+
+    fn first_chunk_id_or_none(world: &World, path: &str) -> Option<String> {
+        let path = RepoPath::from_git(path).unwrap();
         world
             .store
             .chunks(&world.id)
             .unwrap()
             .into_iter()
             .find(|chunk| chunk.path == path)
-            .unwrap()
-            .id
-            .as_str()
-            .to_owned()
+            .map(|chunk| chunk.id.as_str().to_owned())
     }
 
     #[test]

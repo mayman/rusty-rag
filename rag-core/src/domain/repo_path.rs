@@ -67,6 +67,14 @@ impl RepoPath {
         Self::validated(text.to_owned(), Rules::Git)
     }
 
+    /// A path typed by a user to look up a file that is already indexed (`rag show
+    /// <repo> <path>`): `\` is normalised to `/` like `parse`, but the rules are those
+    /// of `from_git`, because the path is compared with paths git reported and
+    /// nothing is created on disk. `aux.rs` and `dir/nul.txt` are findable here.
+    pub fn lookup(text: &str) -> Result<Self, RepoPathError> {
+        Self::validated(text.replace('\\', "/"), Rules::Git)
+    }
+
     fn validated(path: String, rules: Rules) -> Result<Self, RepoPathError> {
         if path.is_empty() {
             return Err(RepoPathError::Empty);
@@ -143,7 +151,7 @@ fn check_component(component: &str, rules: Rules) -> Result<(), RepoPathError> {
 /// format character (general category Cf: bidi controls, zero-width characters,
 /// the byte order mark, soft hyphen, tag characters, ...), the line and paragraph
 /// separators (Zl, Zp), and the default-ignorable joiners and fillers.
-fn is_hidden_character(c: char) -> bool {
+pub fn is_hidden_character(c: char) -> bool {
     matches!(
         c,
         // Cf
@@ -402,6 +410,48 @@ mod tests {
         );
         assert_eq!(
             RepoPath::from_git(&"a".repeat(1025)),
+            Err(RepoPathError::TooLong)
+        );
+    }
+
+    #[test]
+    fn lookup_normalises_backslashes_like_user_input() {
+        assert_eq!(
+            RepoPath::lookup("src\\a\\b.rs").unwrap().as_str(),
+            "src/a/b.rs"
+        );
+    }
+
+    #[test]
+    fn lookup_finds_files_that_windows_could_not_create() {
+        for text in ["aux.rs", "src/CON", "dir/nul.txt", "a.", "x:y", "dir /f"] {
+            assert!(RepoPath::lookup(text).is_ok(), "{text}");
+            assert_eq!(
+                RepoPath::lookup(text).unwrap(),
+                RepoPath::from_git(text).unwrap(),
+                "{text}: the same path git would report"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_keeps_the_safety_rules() {
+        for text in [
+            "",
+            "/etc/passwd",
+            "//server/share",
+            "../x",
+            "a/../b",
+            "a//b",
+            ".git/config",
+            "a\u{0}b",
+            "a\u{202e}b",
+            "a\u{e0041}b",
+        ] {
+            assert!(RepoPath::lookup(text).is_err(), "{text:?}");
+        }
+        assert_eq!(
+            RepoPath::lookup(&"a".repeat(1025)),
             Err(RepoPathError::TooLong)
         );
     }

@@ -64,10 +64,17 @@ impl SourceRepository for SqliteStore {
                 ));
             }
             let git_ref = source.git_ref().map(|r| r.as_str().to_owned());
+            let last_error = source.last_error();
+            let error_columns = (
+                last_error.map(|e| e.code.clone()),
+                last_error.map(|e| e.message.clone()),
+                last_error.map(|e| e.at.epoch_seconds()),
+            );
             if stored.is_some() {
                 tx.execute(
                     "UPDATE sources SET name = ?2, name_key = ?3, location = ?4, \
-                     git_ref = ?5, status = ?6 WHERE source_id = ?1",
+                     git_ref = ?5, status = ?6, last_error_code = ?7, \
+                     last_error_message = ?8, last_error_at = ?9 WHERE source_id = ?1",
                     (
                         source.id().as_str(),
                         source.name(),
@@ -75,12 +82,16 @@ impl SourceRepository for SqliteStore {
                         source.location().as_str(),
                         git_ref,
                         source.status().as_str(),
+                        error_columns.0,
+                        error_columns.1,
+                        error_columns.2,
                     ),
                 )
             } else {
                 tx.execute(
-                    "INSERT INTO sources (source_id, name, name_key, location, git_ref, status) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO sources (source_id, name, name_key, location, git_ref, status, \
+                     last_error_code, last_error_message, last_error_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     (
                         source.id().as_str(),
                         source.name(),
@@ -88,6 +99,9 @@ impl SourceRepository for SqliteStore {
                         source.location().as_str(),
                         git_ref,
                         source.status().as_str(),
+                        error_columns.0,
+                        error_columns.1,
+                        error_columns.2,
                     ),
                 )
             }

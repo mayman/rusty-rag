@@ -4,35 +4,66 @@
 //! flows themselves never lock, so one use case can call another's flow while it
 //! holds the lock (add of a registered location is a refresh).
 //!
-//! Failure policy: when a flow fails after the source row was touched, the source is
-//! marked `Failed` and saved. The stored index and its revision are never changed by
-//! a failure (`commit_index` is the only writer and is all-or-nothing), so a failed
-//! update keeps serving the old index. A `Conflict` is not marked: the other writer
-//! owns the source's status.
+//! Failure policy: when a flow fails after the source row was touched, the failure is
+//! recorded on the source (`Source::record_failure`: status `Failed`, plus the error
+//! code, message, and time, which `rag list` shows) and saved. The stored index and
+//! its revision are never changed by a failure (`commit_index` is the only writer and
+//! is all-or-nothing), so a failed update keeps serving the old index. A `Busy` or
+//! `Conflict` is not recorded and nothing is saved: another writer owns the source
+//! (its status and its next write), and saving behind its back would only wait for
+//! that writer's lock again. A refresh of an already indexed source writes nothing
+//! before its work: the status stays what it was until the commit, so a crash leaves
+//! no stale `Indexing`.
+//!
+//! A tracked branch that vanished from the remote (`NotFound` on fetch) is looked up
+//! again once: when the remote names another default branch, the source follows it.
+
+use std::time::Duration;
 
 use crate::application::dto::ErrorBody;
-use crate::application::error::{AppError, GitError, StorageError};
+use crate::application::error::{AppError, ErrorCode, GitError, Scrubbed, StorageError};
 use crate::application::index_pipeline::{IndexPipeline, IndexReport, IndexScope};
-use crate::application::ports::{ChunkStore, Clock, GitClient, ReindexedChunk, SourceRepository};
+use crate::application::ports::{
+    ChunkStore, Clock, GitClient, ReindexedChunk, SourceRepository, TreeListing,
+};
+use crate::application::progress::{Phase, Progress, Timings, NO_PROGRESS};
+use crate::application::search::{find_sources, unknown_source};
+use crate::domain::git_ref::GitRef;
 use crate::domain::index_versions::IndexVersions;
 use crate::domain::oid::CommitId;
 use crate::domain::source::Source;
+use crate::domain::source_id::SourceId;
+
+/// How long a same-source `add` or `update` waits for the operation lock before it
+/// gives up with `index_locked`. `--no-wait` makes it zero.
+pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(20);
 
 /// Shown when update or reindex runs with no registered source.
 pub const NO_SOURCES_MESSAGE: &str =
     "no sources are registered; run `rag add <url|path>` to index a repository";
 
-/// The source whose name or slug is `key`.
+/// The one source whose name, slug, or full id is `key`. Names compare
+/// case-insensitively; a slug is matched exactly first and case-insensitively only
+/// when that finds nothing (slugs are not case-folded, `github.com/O/R` and
+/// `github.com/o/r` can be two sources). Several matches are a usage error that
+/// lists the candidates; the name or the full id from `rag list` settles it.
 pub fn resolve_source(sources: &dyn SourceRepository, key: &str) -> Result<Source, AppError> {
     let key = key.trim();
-    if let Some(source) = sources.find_by_name(key)? {
-        return Ok(source);
+    let mut found = find_sources(sources, key)?;
+    match found.len() {
+        0 => Err(unknown_source(key)),
+        1 => Ok(found.remove(0)),
+        _ => {
+            let candidates: Vec<String> = found
+                .iter()
+                .map(|source| format!("{:?} ({})", source.name(), source.id()))
+                .collect();
+            Err(AppError::Usage(Scrubbed::from(format!(
+                "{key:?} names several sources: {}; use the name or the full id",
+                candidates.join(", ")
+            ))))
+        }
     }
-    sources
-        .list()?
-        .into_iter()
-        .find(|source| source.id().slug() == key || source.id().as_str() == key)
-        .ok_or_else(|| AppError::NotFound(format!("no source named {key:?}").into()))
 }
 
 /// The JSON error object for a failure that was recorded instead of returned.
@@ -40,6 +71,32 @@ pub fn error_body(error: &AppError) -> ErrorBody {
     let mut body = ErrorBody::from(error.code());
     body.message = error.to_string();
     body
+}
+
+/// Whether a failure only says "someone else is working on this": the operation lock
+/// is held, the index changed under the writer, or git's own lock is taken. These are
+/// retried later, never recorded as the source's failure.
+pub fn is_contention(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Storage(StorageError::Busy | StorageError::LockedBy(_) | StorageError::Conflict)
+            | AppError::Git(GitError::Busy)
+    )
+}
+
+/// The exit code of a command over several sources: 0 when no source really failed
+/// (sources skipped as busy or removed do not count), the shared code when every
+/// failure has the same error code, else 1.
+pub fn exit_code_of_failures<'e>(failures: impl IntoIterator<Item = &'e ErrorBody>) -> u8 {
+    let mut codes = failures.into_iter().map(|body| body.code.as_str());
+    let Some(first) = codes.next() else {
+        return 0;
+    };
+    if codes.all(|code| code == first) {
+        ErrorCode::parse(first).map_or(1, |code| code.exit_code())
+    } else {
+        1
+    }
 }
 
 /// A source after its first index.
@@ -101,6 +158,7 @@ pub struct Indexer<'a> {
     store: &'a dyn ChunkStore,
     git: &'a dyn GitClient,
     clock: &'a dyn Clock,
+    progress: &'a dyn Progress,
 }
 
 impl<'a> Indexer<'a> {
@@ -115,11 +173,18 @@ impl<'a> Indexer<'a> {
             store,
             git,
             clock,
+            progress: &NO_PROGRESS,
         }
     }
 
+    /// Reports the phases of every flow to `progress`.
+    pub fn with_progress(mut self, progress: &'a dyn Progress) -> Self {
+        self.progress = progress;
+        self
+    }
+
     fn pipeline(&self) -> IndexPipeline<'a> {
-        IndexPipeline::new(self.git, self.store, self.clock)
+        IndexPipeline::new(self.git, self.store, self.clock).with_progress(self.progress)
     }
 
     /// Runs `work`; if it fails, records the failure on the source (see the module
@@ -131,8 +196,8 @@ impl<'a> Indexer<'a> {
     ) -> Result<T, AppError> {
         let outcome = work(source);
         if let Err(error) = &outcome {
-            if !matches!(error, AppError::Storage(StorageError::Conflict)) {
-                source.mark_failed();
+            if !is_contention(error) {
+                source.record_failure(error.code().as_str(), &error.to_string(), self.clock.now());
                 // The original error is the one worth reporting.
                 let _ = self.sources.save(source);
             }
@@ -140,25 +205,103 @@ impl<'a> Indexer<'a> {
         outcome
     }
 
+    /// Lists the files of `commit`.
+    fn list(
+        &self,
+        timings: &mut Timings,
+        id: &SourceId,
+        commit: &CommitId,
+    ) -> Result<TreeListing, GitError> {
+        timings.run(self.progress, Phase::List, "listing files", || {
+            let listing = self.git.ls_tree(id, commit)?;
+            self.progress
+                .detail(Phase::List, &format!("{} files", listing.entries.len()));
+            Ok(listing)
+        })
+    }
+
+    /// Gets the newest commit of the tracked branch with `fetch`. When the branch is
+    /// gone from the remote and `recover` is set (the branch came from an earlier
+    /// run, not from this one's own lookup), the remote's default branch is looked up
+    /// once; if it is another branch the source follows it and `fetch` runs again.
+    fn fetch_tracked(
+        &self,
+        timings: &mut Timings,
+        source: &mut Source,
+        recover: bool,
+        fetch: impl Fn(&Source, &GitRef) -> Result<CommitId, GitError>,
+    ) -> Result<CommitId, AppError> {
+        let tracked = source
+            .git_ref()
+            .cloned()
+            .ok_or_else(|| StorageError::Failed("the source tracks no branch".into()))?;
+        let attempt = timings.run(
+            self.progress,
+            Phase::Fetch,
+            &format!("fetching {tracked}"),
+            || fetch(source, &tracked),
+        );
+        match attempt {
+            Err(GitError::NotFound(_)) if recover => {
+                let detected = timings.run(
+                    self.progress,
+                    Phase::Resolve,
+                    &format!("{tracked} is gone from the remote; looking up its default branch"),
+                    || self.git.default_branch(source.location()),
+                );
+                match detected {
+                    Ok(new_ref) if new_ref != tracked => {
+                        source.track(&new_ref);
+                        let retried = timings.run(
+                            self.progress,
+                            Phase::Fetch,
+                            &format!("fetching {new_ref}"),
+                            || fetch(source, &new_ref),
+                        );
+                        Ok(retried?)
+                    }
+                    _ => Err(GitError::NotFound(
+                        format!(
+                            "the tracked branch {tracked} no longer exists on the remote; \
+                             ask the user to run `rag remove` and `rag add` for this repository again"
+                        )
+                        .into(),
+                    )
+                    .into()),
+                }
+            }
+            other => Ok(other?),
+        }
+    }
+
     /// Registers `source` (a new one, or one that never finished indexing), clones
     /// its branch, and indexes everything the policy accepts.
     pub fn first_index(&self, mut source: Source) -> Result<Indexed, AppError> {
         self.sources.save(&source)?;
-        let report = self.guarded(&mut source, |source| {
-            let git_ref = match source.git_ref() {
-                Some(git_ref) => git_ref.clone(),
-                None => self.git.default_branch(source.location())?,
-            };
-            source.track(&git_ref);
-            let commit = self
-                .git
-                .clone_shallow(source.id(), source.location(), &git_ref)?;
+        let mut timings = Timings::new();
+        let mut report = self.guarded(&mut source, |source| {
+            // A branch stored by an earlier, failed attempt may have vanished since.
+            let recover = source.git_ref().is_some();
+            if !recover {
+                let git_ref = timings.run(
+                    self.progress,
+                    Phase::Resolve,
+                    "resolving the default branch",
+                    || self.git.default_branch(source.location()),
+                )?;
+                source.track(&git_ref);
+            }
+            let commit = self.fetch_tracked(&mut timings, source, recover, |source, git_ref| {
+                self.git
+                    .clone_shallow(source.id(), source.location(), git_ref)
+            })?;
             source.mark_indexing();
             self.sources.save(source)?;
-            let listing = self.git.ls_tree(source.id(), &commit)?;
+            let listing = self.list(&mut timings, source.id(), &commit)?;
             self.pipeline()
-                .run(source, &commit, &listing, IndexScope::Changes)
+                .run(source, &commit, &listing, IndexScope::Changes, &mut timings)
         })?;
+        report.phases = timings.into_vec();
         Ok(Indexed { source, report })
     }
 
@@ -173,24 +316,34 @@ impl<'a> Indexer<'a> {
         if !revision.versions.is_current() {
             return Err(StorageError::ReindexRequired.into());
         }
-        let git_ref = source.git_ref().cloned().ok_or_else(|| {
-            AppError::Storage(StorageError::Failed("the source tracks no branch".into()))
-        })?;
-        let (unchanged, report) = self.guarded(&mut source, |source| {
-            source.mark_indexing();
-            self.sources.save(source)?;
-            let latest = self.git.fetch_update(source.id(), &git_ref)?;
+        if source.git_ref().is_none() {
+            return Err(AppError::Storage(StorageError::Failed(
+                "the source tracks no branch".into(),
+            )));
+        }
+        let mut timings = Timings::new();
+        // Nothing is written before the work (no `Indexing` status): the source stays
+        // as it was until the commit, or until a real failure is recorded.
+        let (unchanged, mut report) = self.guarded(&mut source, |source| {
+            let latest = self.fetch_tracked(&mut timings, source, true, |source, git_ref| {
+                self.git.fetch_update(source.id(), git_ref)
+            })?;
             if latest == revision.commit {
                 source.mark_ready(latest.clone(), revision.at);
                 self.sources.save(source)?;
                 return Ok((true, IndexReport::nothing_to_do(&latest)));
             }
-            let listing = self.git.ls_tree(source.id(), &latest)?;
-            let report = self
-                .pipeline()
-                .run(source, &latest, &listing, IndexScope::Changes)?;
+            let listing = self.list(&mut timings, source.id(), &latest)?;
+            let report = self.pipeline().run(
+                source,
+                &latest,
+                &listing,
+                IndexScope::Changes,
+                &mut timings,
+            )?;
             Ok((false, report))
         })?;
+        report.phases = timings.into_vec();
         Ok(Refreshed {
             source,
             previous: revision.commit,
@@ -250,33 +403,41 @@ impl<'a> Indexer<'a> {
                     "the source has no indexed revision".into(),
                 ))
             })?;
-        let (mode, report) = self.guarded(&mut source, |source| {
+        let mut timings = Timings::new();
+        let (mode, mut report) = self.guarded(&mut source, |source| {
             let at_indexed_commit = self
-                .git
-                .ls_tree(source.id(), &indexed_commit)
+                .list(&mut timings, source.id(), &indexed_commit)
                 .map_err(AppError::from)
                 .and_then(|listing| {
-                    self.pipeline()
-                        .run(source, &indexed_commit, &listing, IndexScope::Everything)
+                    self.pipeline().run(
+                        source,
+                        &indexed_commit,
+                        &listing,
+                        IndexScope::Everything,
+                        &mut timings,
+                    )
                 });
             match at_indexed_commit {
                 Ok(report) => Ok((RebuildMode::Full, report)),
                 Err(AppError::Git(GitError::NotFound(_))) => {
-                    let git_ref = source.git_ref().cloned().ok_or_else(|| {
-                        AppError::Storage(StorageError::Failed(
-                            "the source tracks no branch".into(),
-                        ))
-                    })?;
-                    let latest = self.git.fetch_update(source.id(), &git_ref)?;
-                    let listing = self.git.ls_tree(source.id(), &latest)?;
-                    let report =
-                        self.pipeline()
-                            .run(source, &latest, &listing, IndexScope::Everything)?;
+                    let latest =
+                        self.fetch_tracked(&mut timings, source, true, |source, git_ref| {
+                            self.git.fetch_update(source.id(), git_ref)
+                        })?;
+                    let listing = self.list(&mut timings, source.id(), &latest)?;
+                    let report = self.pipeline().run(
+                        source,
+                        &latest,
+                        &listing,
+                        IndexScope::Everything,
+                        &mut timings,
+                    )?;
                     Ok((RebuildMode::Refetched, report))
                 }
                 Err(error) => Err(error),
             }
         })?;
+        report.phases = timings.into_vec();
         let chunks = self.store.chunk_count(&id)?;
         Ok(Rebuilt {
             source,
@@ -284,5 +445,104 @@ impl<'a> Indexer<'a> {
             chunks,
             report: Some(report),
         })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::resolve_source;
+    use crate::application::error::ErrorCode;
+    use crate::application::search::fixtures::index;
+    use crate::application::testkit::InMemoryStore;
+
+    fn two_servers_one_slug() -> InMemoryStore {
+        let store = InMemoryStore::new();
+        index(
+            &store,
+            "https://git.example.com/o/r",
+            "plain",
+            &[("a.rs", "x")],
+        );
+        index(
+            &store,
+            "https://git.example.com:8443/o/r",
+            "on-port",
+            &[("a.rs", "y")],
+        );
+        store
+    }
+
+    #[test]
+    fn a_source_is_found_by_name_slug_or_id() {
+        let store = InMemoryStore::new();
+        let id = index(&store, "https://github.com/o/r", "Docs", &[("a.rs", "x")]);
+        for key in ["docs", "DOCS", " Docs ", "github.com/o/r", id.as_str()] {
+            let found = resolve_source(&store, key).unwrap();
+            assert_eq!(found.id(), &id, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_is_not_found_and_points_at_list() {
+        let store = InMemoryStore::new();
+        index(&store, "https://github.com/o/r", "Docs", &[("a.rs", "x")]);
+        let error = resolve_source(&store, "nope").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        assert!(error.to_string().contains("\"nope\""), "{error}");
+        assert!(error.to_string().contains("rag list"), "{error}");
+    }
+
+    #[test]
+    fn a_slug_shared_by_two_sources_is_a_usage_error_listing_the_candidates() {
+        let store = two_servers_one_slug();
+        let error = resolve_source(&store, "git.example.com/o/r").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Usage);
+        let shown = error.to_string();
+        assert!(shown.contains("several sources"), "{shown}");
+        assert!(
+            shown.contains("plain") && shown.contains("on-port"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("git.example.com/o/r-"),
+            "the ids are listed: {shown}"
+        );
+    }
+
+    #[test]
+    fn the_name_or_the_full_id_settles_an_ambiguous_slug() {
+        let store = two_servers_one_slug();
+        let plain = resolve_source(&store, "plain").unwrap();
+        assert_eq!(plain.name(), "plain");
+        let on_port = resolve_source(&store, "ON-PORT").unwrap();
+        let by_id = resolve_source(&store, on_port.id().as_str()).unwrap();
+        assert_eq!(by_id.name(), "on-port");
+    }
+
+    #[test]
+    fn slugs_are_not_case_folded_when_an_exact_match_exists() {
+        let store = InMemoryStore::new();
+        index(&store, "https://github.com/O/R", "upper", &[("a.rs", "x")]);
+        index(&store, "https://github.com/o/r", "lower", &[("a.rs", "y")]);
+        assert_eq!(
+            resolve_source(&store, "github.com/O/R").unwrap().name(),
+            "upper"
+        );
+        assert_eq!(
+            resolve_source(&store, "github.com/o/r").unwrap().name(),
+            "lower"
+        );
+        let error = resolve_source(&store, "GITHUB.com/o/R").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Usage, "{error}");
+        assert!(error.to_string().contains("upper") && error.to_string().contains("lower"));
+    }
+
+    #[test]
+    fn a_differently_cased_slug_still_finds_the_only_source() {
+        let store = InMemoryStore::new();
+        index(&store, "https://github.com/o/r", "docs", &[("a.rs", "x")]);
+        assert_eq!(
+            resolve_source(&store, "GitHub.com/O/R").unwrap().name(),
+            "docs"
+        );
     }
 }

@@ -24,3 +24,4 @@ pub mod search_filters;
 pub mod source;
 pub mod source_id;
 pub mod tree_entry;
+pub mod untrusted_text;

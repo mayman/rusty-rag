@@ -10,7 +10,9 @@ use super::error::{failed, storage_error};
 /// Version of this layout. A database stamped with another version is refused.
 ///
 /// 2: `chunk_id` carries a UNIQUE index.
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+/// 3: `sources` keeps the last error (`last_error_code`, `last_error_message`,
+/// `last_error_at`).
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// The FTS5 `tokenize` option. `unicode61` with no extra `tokenchars` (the domain
 /// `IdentifierSplitter` already removed every separator from the indexed text),
@@ -42,7 +44,10 @@ CREATE TABLE IF NOT EXISTS sources (
     indexed_at        INTEGER,
     tokenizer_version INTEGER,
     chunker_version   INTEGER,
-    policy_version    INTEGER
+    policy_version    INTEGER,
+    last_error_code    TEXT,
+    last_error_message TEXT,
+    last_error_at      INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS sources_name_key ON sources (name_key);
 

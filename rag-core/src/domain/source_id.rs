@@ -6,7 +6,8 @@
 //! the transport is irrelevant (`https://host/o/r.git` and `git@host:o/r.git` give
 //! the same id). Only the host is lowercased: owner and name keep their case, since
 //! most hosts treat them as case-sensitive. Credentials in a URL never reach the id.
-//! A local path becomes `local/<dirname>` with a hash of the normalised path.
+//! A local path becomes `local/<dirname>-<6 hex>` (the slug carries the start of the
+//! hash of the normalised path, so two directories with one name stay distinct).
 //!
 //! Every slug segment is validated (`parse` re-checks stored ids): no empty, dot-only
 //! or `.git` segments. The checkout directory of a source is named by the hash alone
@@ -18,6 +19,9 @@ use crate::domain::git_location::GitLocation;
 
 /// Length of the hash suffix, in hex characters.
 const HASH_CHARS: usize = 12;
+
+/// Characters of the hash that end the slug of a local directory.
+const LOCAL_SLUG_HASH_CHARS: usize = 6;
 
 /// Slug plus short hash. Always valid; construct with `from_location` or `parse`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -91,9 +95,12 @@ impl SourceId {
             .find(|s| !s.is_empty())
             .ok_or(SourceIdError::MissingRepositoryPath)?;
         let name = sanitise_segment(name)?;
+        let hash = short_hash(&format!("local:{normalised}"));
+        // Two directories called `proj` must not share a slug, or `--repo` could not
+        // tell them apart: the slug carries the start of the hash.
         Ok(Self::from_parts(
-            &format!("local/{name}"),
-            &short_hash(&format!("local:{normalised}")),
+            &format!("local/{name}-{}", &hash[..LOCAL_SLUG_HASH_CHARS]),
+            &hash,
         ))
     }
 
@@ -407,16 +414,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn local_paths_become_local_slugs_by_directory_name() {
-        assert_eq!(id("/home/me/My Proj/").slug(), "local/My-Proj");
-        assert_eq!(id("C:\\Users\\me\\proj").slug(), "local/proj");
-        assert_eq!(id("file:///home/me/proj").slug(), "local/proj");
+    /// `local/<name>-<6 hex>`: the directory name plus the first six characters of
+    /// the id hash.
+    fn local_slug_parts(slug: &str) -> (&str, &str) {
+        let rest = slug.strip_prefix("local/").expect("a local slug");
+        rest.rsplit_once('-').expect("name-hash")
     }
 
     #[test]
-    fn different_local_paths_with_one_name_differ() {
-        assert_ne!(id("/a/proj"), id("/b/proj"));
+    fn local_paths_become_local_slugs_by_directory_name_and_a_short_hash() {
+        for (location, name) in [
+            ("/home/me/My Proj/", "My-Proj"),
+            ("C:\\Users\\me\\proj", "proj"),
+            ("file:///home/me/proj", "proj"),
+        ] {
+            let id = id(location);
+            let (found, hash) = local_slug_parts(id.slug());
+            assert_eq!(found, name, "{location}");
+            assert_eq!(hash.len(), 6, "{location}: {}", id.slug());
+            assert!(
+                id.checkout_dir_name().starts_with(hash),
+                "the slug hash is the start of the id hash"
+            );
+        }
+    }
+
+    #[test]
+    fn local_directories_with_one_name_get_different_slugs() {
+        let (a, b) = (id("/a/proj"), id("/b/proj"));
+        assert_ne!(a, b);
+        assert_ne!(
+            a.slug(),
+            b.slug(),
+            "two proj directories stay distinguishable"
+        );
+    }
+
+    #[test]
+    fn a_local_id_round_trips_through_parse() {
+        let original = id("/home/me/proj");
+        assert_eq!(SourceId::parse(original.as_str()), Ok(original));
+    }
+
+    #[test]
+    fn remote_slugs_stay_free_of_the_hash() {
+        assert_eq!(id("https://github.com/o/r").slug(), "github.com/o/r");
     }
 
     #[test]

@@ -1,12 +1,18 @@
-//! Update: fetch and re-index what changed.
+﻿//! Update: fetch and re-index what changed.
+
+use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::application::dto::{ErrorBody, SCHEMA_VERSION};
 use crate::application::error::AppError;
 use crate::application::index_pipeline::IndexReport;
-use crate::application::indexer::{error_body, resolve_source, Indexer, NO_SOURCES_MESSAGE};
+use crate::application::indexer::{
+    error_body, exit_code_of_failures, is_contention, resolve_source, Indexer, DEFAULT_LOCK_WAIT,
+    NO_SOURCES_MESSAGE,
+};
 use crate::application::ports::{ChunkStore, Clock, GitClient, OperationLock, SourceRepository};
+use crate::application::progress::{Progress, NO_PROGRESS};
 use crate::domain::oid::CommitId;
 use crate::domain::source::Source;
 use crate::domain::source_id::SourceId;
@@ -36,7 +42,9 @@ pub struct UpdateEntry {
     pub repo: String,
     pub name: String,
     /// `updated`, `unchanged`, `indexed` (a source that never finished its first
-    /// index), or `failed`.
+    /// index), `failed`, `skipped_busy` (another process was working on the source),
+    /// or `skipped_removed` (the source was removed while the command ran). The two
+    /// skipped results are not failures.
     pub result: String,
     pub previous_commit: Option<String>,
     pub index: Option<IndexReport>,
@@ -48,10 +56,24 @@ pub struct UpdateEntry {
 pub struct UpdateResponse {
     pub schema_version: u32,
     pub sources: Vec<UpdateEntry>,
-    /// How many sources failed (only possible when updating all of them).
+    /// How many sources failed (only possible when updating all of them). Sources
+    /// skipped as busy or removed are not counted.
     pub failed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+impl UpdateResponse {
+    /// The process exit code: 0 unless a source failed; the failures' shared error
+    /// code when they all have one, else 1 (see `exit_code_of_failures`).
+    pub fn exit_code(&self) -> u8 {
+        exit_code_of_failures(
+            self.sources
+                .iter()
+                .filter(|entry| entry.result == "failed")
+                .filter_map(|entry| entry.error.as_ref()),
+        )
+    }
 }
 
 pub struct UpdateSource<'a> {
@@ -60,6 +82,8 @@ pub struct UpdateSource<'a> {
     git: &'a dyn GitClient,
     locks: &'a dyn OperationLock,
     clock: &'a dyn Clock,
+    progress: &'a dyn Progress,
+    lock_wait: Duration,
 }
 
 impl<'a> UpdateSource<'a> {
@@ -76,13 +100,30 @@ impl<'a> UpdateSource<'a> {
             git,
             locks,
             clock,
+            progress: &NO_PROGRESS,
+            lock_wait: DEFAULT_LOCK_WAIT,
         }
+    }
+
+    /// Reports the phases of the update to `progress`.
+    pub fn with_progress(mut self, progress: &'a dyn Progress) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    /// How long to wait for the operation lock of each source (default
+    /// `DEFAULT_LOCK_WAIT`); `Duration::ZERO` fails or skips at once (`--no-wait`).
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     pub fn execute(&self, request: &UpdateRequest) -> Result<UpdateResponse, AppError> {
         if let Some(name) = &request.name {
             let source = resolve_source(self.sources, name)?;
-            let entry = self.update_one(source.id())?;
+            let entry = self
+                .update_one(source.id())?
+                .ok_or_else(|| AppError::NotFound(format!("no source named {name:?}").into()))?;
             return Ok(Self::response(vec![entry], None));
         }
         let all = self.sources.list()?;
@@ -91,9 +132,17 @@ impl<'a> UpdateSource<'a> {
         }
         let entries = all
             .iter()
-            .map(|source| {
-                self.update_one(source.id())
-                    .unwrap_or_else(|error| Self::failed_entry(source, &error))
+            .map(|source| match self.update_one(source.id()) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => Self::unfinished_entry(
+                    source,
+                    "skipped_removed",
+                    &AppError::NotFound("the source was removed while the command ran".into()),
+                ),
+                Err(error) if is_contention(&error) => {
+                    Self::unfinished_entry(source, "skipped_busy", &error)
+                }
+                Err(error) => Self::unfinished_entry(source, "failed", &error),
             })
             .collect();
         Ok(Self::response(entries, None))
@@ -111,26 +160,29 @@ impl<'a> UpdateSource<'a> {
         }
     }
 
-    fn failed_entry(source: &Source, error: &AppError) -> UpdateEntry {
+    /// A source the update did not finish: `failed`, or left alone (`skipped_*`, not
+    /// a failure). `error` says why.
+    fn unfinished_entry(source: &Source, result: &str, error: &AppError) -> UpdateEntry {
         UpdateEntry {
             repo: source.id().slug().to_owned(),
             name: source.name().to_owned(),
-            result: "failed".to_owned(),
+            result: result.to_owned(),
             previous_commit: source.indexed().map(|revision| revision.commit.to_string()),
             index: None,
             error: Some(error_body(error)),
         }
     }
 
-    /// Updates one source under its operation lock.
-    fn update_one(&self, id: &SourceId) -> Result<UpdateEntry, AppError> {
-        let _lock = self.locks.acquire(id)?;
+    /// Updates one source under its operation lock. `None` when the source was
+    /// removed after it was listed.
+    fn update_one(&self, id: &SourceId) -> Result<Option<UpdateEntry>, AppError> {
+        let _lock = self.locks.acquire_waiting(id, "update", self.lock_wait)?;
         // Read the source under the lock: it may have changed since it was listed.
-        let source = self
-            .sources
-            .get(id)?
-            .ok_or_else(|| AppError::NotFound(format!("no source {id}").into()))?;
-        let indexer = Indexer::new(self.sources, self.store, self.git, self.clock);
+        let Some(source) = self.sources.get(id)? else {
+            return Ok(None);
+        };
+        let indexer = Indexer::new(self.sources, self.store, self.git, self.clock)
+            .with_progress(self.progress);
         let entry =
             |source: &Source, result: &str, previous: Option<&CommitId>, report| UpdateEntry {
                 repo: source.id().slug().to_owned(),
@@ -142,7 +194,12 @@ impl<'a> UpdateSource<'a> {
             };
         if source.indexed().is_none() {
             let indexed = indexer.first_index(source)?;
-            return Ok(entry(&indexed.source, "indexed", None, indexed.report));
+            return Ok(Some(entry(
+                &indexed.source,
+                "indexed",
+                None,
+                indexed.report,
+            )));
         }
         let refreshed = indexer.refresh(source)?;
         let result = if refreshed.unchanged {
@@ -150,12 +207,12 @@ impl<'a> UpdateSource<'a> {
         } else {
             "updated"
         };
-        Ok(entry(
+        Ok(Some(entry(
             &refreshed.source,
             result,
             Some(&refreshed.previous),
             refreshed.report,
-        ))
+        )))
     }
 }
 
@@ -163,16 +220,18 @@ impl<'a> UpdateSource<'a> {
 mod tests {
     use super::*;
     use crate::application::error::{ErrorCode, GitError, StorageError};
-    use crate::application::indexer_test_support::{GitSpy, World, REMOTE};
+    use crate::application::indexer_test_support::{GitSpy, SpiedStore, World, REMOTE};
     use crate::application::ports::{ChunkStore, IndexChanges, ReindexedChunk, SourceRepository};
     use crate::application::testkit::StampStoredVersions;
     use crate::domain::chunk::Chunk;
     use crate::domain::chunk_id::ChunkId;
     use crate::domain::index_versions::IndexVersions;
+    use crate::domain::indexed_at::IndexedAt;
     use crate::domain::manifest::Manifest;
     use crate::domain::oid::CommitId;
     use crate::domain::source::{Source, SourceStatus};
     use crate::domain::source_id::SourceId;
+    use std::time::Duration;
 
     fn paths(manifest: &Manifest) -> Vec<String> {
         manifest
@@ -521,6 +580,12 @@ mod tests {
         assert_eq!(error, AppError::Storage(StorageError::Conflict));
         assert_eq!(error.code().exit_code(), 6);
         let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert_eq!(
+            source.status(),
+            SourceStatus::Ready,
+            "a lost race is not a failure and leaves no Indexing behind"
+        );
+        assert_eq!(source.last_error(), None);
         assert_eq!(source.indexed().unwrap().commit.as_str(), "ee".repeat(20));
         assert_eq!(
             w.store.chunks(&w.id()).unwrap()[0].text,
@@ -536,6 +601,7 @@ mod tests {
         let held = w.locks.acquire(&w.id()).unwrap();
         let error = w
             .update_source()
+            .with_lock_wait(Duration::ZERO)
             .execute(&UpdateRequest::named("example.com/o/r"))
             .unwrap_err();
         assert_eq!(error.code().exit_code(), 6);
@@ -544,6 +610,372 @@ mod tests {
             .update_source()
             .execute(&UpdateRequest::named("example.com/o/r"))
             .is_ok());
+    }
+
+    fn two_sources(w: &World) -> (SourceId, SourceId) {
+        added(w, &[("a.rs", "fn a() {}\n")]);
+        let other = "https://example.com/o/other";
+        w.git.add_remote(other, "main");
+        w.git.commit(other, &[("b.rs", "fn b() {}\n")]);
+        w.add_source()
+            .execute(&crate::application::add_source::AddRequest::new(other))
+            .unwrap();
+        w.commit(&[("a.rs", "fn a2() {}\n")]);
+        w.git.commit(other, &[("b.rs", "fn b2() {}\n")]);
+        (
+            w.id(),
+            crate::application::indexer_test_support::id_of(other),
+        )
+    }
+
+    fn results(response: &UpdateResponse) -> Vec<(&str, &str)> {
+        response
+            .sources
+            .iter()
+            .map(|e| (e.repo.as_str(), e.result.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn update_all_skips_a_busy_source_and_it_is_not_a_failure() {
+        let w = World::new();
+        let (_, other) = two_sources(&w);
+        let _held = w.locks.acquire(&other).unwrap();
+
+        let response = w
+            .update_source()
+            .with_lock_wait(Duration::ZERO)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert_eq!(
+            results(&response),
+            [
+                ("example.com/o/other", "skipped_busy"),
+                ("example.com/o/r", "updated")
+            ]
+        );
+        assert_eq!(response.failed, 0);
+        assert_eq!(
+            response.exit_code(),
+            0,
+            "skipped sources do not change the exit code"
+        );
+        assert_eq!(
+            response.sources[0].error.as_ref().unwrap().code,
+            "index_locked",
+            "the body still says why"
+        );
+    }
+
+    #[test]
+    fn update_all_names_the_operation_that_made_a_source_busy() {
+        let w = World::new();
+        let (_, other) = two_sources(&w);
+        let _held = w
+            .locks
+            .acquire_waiting(&other, "add", Duration::ZERO)
+            .unwrap();
+
+        let response = w
+            .update_source()
+            .with_lock_wait(Duration::ZERO)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        let message = &response.sources[0].error.as_ref().unwrap().message;
+        assert!(message.contains("`add`"), "{message}");
+    }
+
+    #[test]
+    fn update_all_skips_a_source_removed_while_it_ran() {
+        let w = World::new();
+        let (_, other) = two_sources(&w);
+        let spied = SpiedStore::new(&w.store).hiding(&other);
+
+        let response = UpdateSource::new(&spied, &spied, &w.git, &w.locks, &w.clock)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert_eq!(
+            results(&response),
+            [
+                ("example.com/o/other", "skipped_removed"),
+                ("example.com/o/r", "updated")
+            ]
+        );
+        assert_eq!((response.failed, response.exit_code()), (0, 0));
+    }
+
+    #[test]
+    fn a_skipped_source_beside_a_real_failure_leaves_the_failure_to_decide_the_exit_code() {
+        let w = World::new();
+        let (first, other) = two_sources(&w);
+        let _held = w.locks.acquire(&other).unwrap();
+        w.git.fail_next(GitError::Timeout);
+
+        let response = w
+            .update_source()
+            .with_lock_wait(Duration::ZERO)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert_eq!(
+            results(&response),
+            [
+                ("example.com/o/other", "skipped_busy"),
+                ("example.com/o/r", "failed")
+            ]
+        );
+        assert_eq!(response.failed, 1);
+        assert_eq!(response.exit_code(), 4);
+        drop(first);
+    }
+
+    fn body(code: &str) -> ErrorBody {
+        ErrorBody {
+            code: code.to_owned(),
+            message: String::new(),
+            hint: None,
+        }
+    }
+
+    fn failed(code: &str) -> UpdateEntry {
+        UpdateEntry {
+            repo: "r".into(),
+            name: "r".into(),
+            result: "failed".into(),
+            previous_commit: None,
+            index: None,
+            error: Some(body(code)),
+        }
+    }
+
+    fn response_of(entries: Vec<UpdateEntry>) -> UpdateResponse {
+        UpdateResponse {
+            schema_version: 1,
+            failed: entries.iter().filter(|e| e.result == "failed").count(),
+            sources: entries,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn the_exit_code_is_the_shared_failure_code_or_one() {
+        assert_eq!(response_of(vec![]).exit_code(), 0);
+        assert_eq!(response_of(vec![failed("not_found")]).exit_code(), 3);
+        assert_eq!(
+            response_of(vec![failed("not_found"), failed("not_found")]).exit_code(),
+            3
+        );
+        assert_eq!(
+            response_of(vec![failed("not_found"), failed("network_or_auth")]).exit_code(),
+            1
+        );
+        assert_eq!(response_of(vec![failed("reindex_required")]).exit_code(), 7);
+        assert_eq!(response_of(vec![failed("something_new")]).exit_code(), 1);
+    }
+
+    #[test]
+    fn a_busy_commit_is_not_recorded_as_a_failure_and_saves_nothing() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.commit(&[("a.rs", "fn a2() {}\n")]);
+        let spied = SpiedStore::new(&w.store).failing_commits(StorageError::Busy);
+
+        let error = UpdateSource::new(&spied, &spied, &w.git, &w.locks, &w.clock)
+            .execute(&UpdateRequest::named("example.com/o/r"))
+            .unwrap_err();
+
+        assert_eq!(error, AppError::Storage(StorageError::Busy));
+        let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert_eq!(source.status(), SourceStatus::Ready);
+        assert_eq!(source.last_error(), None);
+        assert!(
+            spied.saved_statuses().is_empty(),
+            "no save, so no second wait for the lock"
+        );
+    }
+
+    #[test]
+    fn a_busy_git_repository_is_not_recorded_as_a_failure_either() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.commit(&[("a.rs", "fn a2() {}\n")]);
+        w.git.fail_next(GitError::Busy);
+
+        let error = w
+            .update_source()
+            .execute(&UpdateRequest::named("example.com/o/r"))
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::IndexLocked);
+        let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert_eq!(
+            (source.status(), source.last_error()),
+            (SourceStatus::Ready, None)
+        );
+    }
+
+    #[test]
+    fn updating_an_indexed_source_never_writes_the_indexing_status() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.commit(&[("a.rs", "fn a2() {}\n")]);
+        let spied = SpiedStore::new(&w.store);
+
+        UpdateSource::new(&spied, &spied, &w.git, &w.locks, &w.clock)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert!(
+            !spied.saved_statuses().contains(&SourceStatus::Indexing),
+            "{:?}",
+            spied.saved_statuses()
+        );
+    }
+
+    #[test]
+    fn a_failed_update_saves_failed_and_nothing_before_it() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.commit(&[("a.rs", "fn a2() {}\n")]);
+        w.git.fail_next(GitError::Timeout);
+        let spied = SpiedStore::new(&w.store);
+
+        UpdateSource::new(&spied, &spied, &w.git, &w.locks, &w.clock)
+            .execute(&UpdateRequest::named("example.com/o/r"))
+            .unwrap_err();
+
+        assert_eq!(spied.saved_statuses(), [SourceStatus::Failed]);
+    }
+
+    #[test]
+    fn a_failure_is_remembered_on_the_source_until_a_good_update_clears_it() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.commit(&[("a.rs", "fn a2() {}\n")]);
+        w.clock.advance(77);
+        w.git.fail_next(GitError::NetworkOrAuth("offline".into()));
+        w.update_source()
+            .execute(&UpdateRequest::named("example.com/o/r"))
+            .unwrap_err();
+
+        let failed = w.store.get(&w.id()).unwrap().unwrap();
+        let error = failed.last_error().expect("the failure is recorded");
+        assert_eq!(error.code, "network_or_auth");
+        assert!(error.message.contains("offline"), "{}", error.message);
+        assert_eq!(error.at, IndexedAt::from_epoch_seconds(1_077));
+
+        w.update_source().execute(&UpdateRequest::all()).unwrap();
+        let healed = w.store.get(&w.id()).unwrap().unwrap();
+        assert_eq!(healed.last_error(), None);
+        assert_eq!(healed.status(), SourceStatus::Ready);
+    }
+
+    #[test]
+    fn update_waits_the_default_lock_time_for_each_source() {
+        use crate::application::indexer_test_support::RecordingLock;
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        let locks = RecordingLock::new(&w.locks);
+
+        w.update_source_locked(&locks)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert_eq!(locks.waits(), [("update".to_owned(), DEFAULT_LOCK_WAIT)]);
+    }
+
+    #[test]
+    fn an_unchanged_update_also_clears_a_remembered_failure() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.git.fail_next(GitError::Timeout);
+        w.update_source()
+            .execute(&UpdateRequest::named("example.com/o/r"))
+            .unwrap_err();
+        assert!(w
+            .store
+            .get(&w.id())
+            .unwrap()
+            .unwrap()
+            .last_error()
+            .is_some());
+
+        let response = w.update_source().execute(&UpdateRequest::all()).unwrap();
+
+        assert_eq!(response.sources[0].result, "unchanged");
+        assert_eq!(w.store.get(&w.id()).unwrap().unwrap().last_error(), None);
+    }
+
+    #[test]
+    fn a_renamed_default_branch_is_followed_once() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.git.rename_default_branch(REMOTE, "trunk");
+        let second = w.commit(&[("a.rs", "fn a_on_trunk() {}\n")]);
+        let spy = GitSpy::new(&w.git);
+
+        let response = w
+            .update_source_via(&spy)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert_eq!(response.sources[0].result, "updated");
+        let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert_eq!(source.git_ref().map(|r| r.as_str()), Some("trunk"));
+        assert_eq!(source.indexed().unwrap().commit, second);
+        assert_eq!(
+            spy.calls()
+                .iter()
+                .filter(|c| **c == "default_branch")
+                .count(),
+            1,
+            "the default branch is looked up once"
+        );
+    }
+
+    #[test]
+    fn a_vanished_branch_with_no_other_default_says_what_happened() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        w.git
+            .fail_next(GitError::NotFound("couldn't find remote ref main".into()));
+
+        let error = w
+            .update_source()
+            .execute(&UpdateRequest::named("example.com/o/r"))
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        let shown = error.to_string();
+        assert!(shown.contains("tracked branch main"), "{shown}");
+        assert!(
+            shown.contains("rag remove") && shown.contains("rag add"),
+            "{shown}"
+        );
+        let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert_eq!(source.status(), SourceStatus::Failed);
+        assert!(source.is_searchable(), "the old index is still served");
+    }
+
+    #[test]
+    fn update_reports_its_phases() {
+        let w = World::new();
+        added(&w, &[("a.rs", "fn a() {}\n")]);
+        let progress = crate::application::indexer_test_support::RecordingProgress::default();
+
+        w.update_source()
+            .with_progress(&progress)
+            .execute(&UpdateRequest::all())
+            .unwrap();
+
+        assert_eq!(
+            progress.sequence(),
+            ["begin:fetch", "end:fetch"],
+            "unchanged: only the fetch"
+        );
     }
 
     #[test]
@@ -586,6 +1018,11 @@ mod tests {
         );
         let failure = response.sources[0].error.as_ref().unwrap();
         assert_eq!(failure.code, "network_or_auth");
+        assert_eq!(
+            response.exit_code(),
+            4,
+            "the one failure decides the exit code"
+        );
     }
 
     #[test]

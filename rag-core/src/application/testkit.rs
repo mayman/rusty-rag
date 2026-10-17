@@ -31,6 +31,7 @@ mod tests {
     use crate::domain::repo_path::RepoPath;
     use crate::domain::source::Source;
     use crate::domain::source_id::SourceId;
+    use std::time::Duration;
 
     const REMOTE: &str = "https://example.com/o/r";
 
@@ -116,6 +117,81 @@ mod tests {
         let other = lock.clone();
         let _held = lock.acquire(&source("a")).unwrap();
         assert_eq!(other.acquire(&source("a")).unwrap_err(), StorageError::Busy);
+    }
+
+    #[test]
+    fn a_wait_on_a_held_fake_lock_names_the_holders_operation() {
+        let lock = FakeOperationLock::new();
+        let _held = lock
+            .acquire_waiting(&source("a"), "add", Duration::ZERO)
+            .unwrap();
+        for wait in [Duration::ZERO, Duration::from_millis(20)] {
+            assert_eq!(
+                lock.acquire_waiting(&source("a"), "update", wait)
+                    .unwrap_err(),
+                StorageError::locked_by("add")
+            );
+        }
+        assert_eq!(
+            lock.acquire(&source("a")).unwrap_err(),
+            StorageError::Busy,
+            "plain acquire keeps reporting Busy"
+        );
+    }
+
+    #[test]
+    fn a_lock_that_cannot_wait_falls_back_to_acquire() {
+        struct NeverWaits(FakeOperationLock);
+        impl OperationLock for NeverWaits {
+            fn acquire(&self, source: &SourceId) -> Result<LockGuard, StorageError> {
+                self.0.acquire(source)
+            }
+        }
+        let lock = NeverWaits(FakeOperationLock::new());
+        let _held = lock.acquire(&source("a")).unwrap();
+        assert_eq!(
+            lock.acquire_waiting(&source("a"), "update", Duration::from_secs(60))
+                .unwrap_err(),
+            StorageError::Busy,
+            "the provided body never waits"
+        );
+    }
+
+    #[test]
+    fn counting_chunks_of_paths_uses_the_stored_files_only() {
+        let store = InMemoryStore::new();
+        let s = source("one");
+        let mut indexed = Source::register(s.clone(), "one", location());
+        store.save(&indexed).unwrap();
+        indexed.mark_ready(
+            CommitId::parse(&"11".repeat(20)).unwrap(),
+            IndexedAt::from_epoch_seconds(5),
+        );
+        let text = "# A\nalpha\n# B\nbeta";
+        let file_path = path("a.md");
+        let chunks = crate::domain::chunker::Chunker::chunk(&s, &file_path, text);
+        let expected = chunks.len();
+        let file = IndexedFile {
+            path: file_path.clone(),
+            blob: BlobOid::parse(&"22".repeat(20)).unwrap(),
+            size: text.len() as u64,
+            chunks,
+        };
+        store
+            .commit_index(
+                &indexed,
+                None,
+                &IndexChanges {
+                    upserts: vec![file],
+                    removals: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.chunk_count_for_paths(&s, &[file_path]).unwrap(),
+            expected
+        );
+        assert_eq!(store.chunk_count_for_paths(&s, &[path("b.md")]).unwrap(), 0);
     }
 
     // --- InMemoryStore failure injection ---------------------------------------
@@ -241,6 +317,21 @@ mod tests {
             "blob changed with content"
         );
         assert_eq!(new.entries.len(), 2);
+    }
+
+    #[test]
+    fn fake_git_follows_a_renamed_default_branch_only_for_new_fetches() {
+        let (git, s) = git_with_remote();
+        git.commit(REMOTE, &[("a.rs", "one")]);
+        git.clone_shallow(&s, &location(), &main_ref()).unwrap();
+        git.rename_default_branch(REMOTE, "trunk");
+        let trunk = GitRef::parse("trunk").unwrap();
+        assert_eq!(git.default_branch(&location()).unwrap(), trunk);
+        assert!(matches!(
+            git.fetch_update(&s, &main_ref()),
+            Err(GitError::NotFound(_))
+        ));
+        assert!(git.fetch_update(&s, &trunk).is_ok());
     }
 
     #[test]

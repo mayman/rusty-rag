@@ -8,6 +8,7 @@ pub mod index_pipeline;
 pub mod indexer;
 pub mod list_sources;
 pub mod ports;
+pub mod progress;
 pub mod reindex;
 pub mod remove_source;
 pub mod retrieval;

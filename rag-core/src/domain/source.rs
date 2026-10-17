@@ -62,6 +62,16 @@ pub struct IndexedRevision {
     pub versions: IndexVersions,
 }
 
+/// The failure that last stopped an operation on a source: the stable error code,
+/// the (already scrubbed) message, and when it happened. Cleared when the source is
+/// indexed successfully again, so `rag list` can say why a source is `failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastError {
+    pub code: String,
+    pub message: String,
+    pub at: IndexedAt,
+}
+
 /// Rehydration found a `Ready` source without an indexed revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadyWithoutRevision;
@@ -89,6 +99,7 @@ pub struct Source {
     git_ref: Option<GitRef>,
     status: SourceStatus,
     indexed: Option<IndexedRevision>,
+    last_error: Option<LastError>,
 }
 
 impl Source {
@@ -101,6 +112,7 @@ impl Source {
             git_ref: None,
             status: SourceStatus::Cloning,
             indexed: None,
+            last_error: None,
         }
     }
 
@@ -123,7 +135,14 @@ impl Source {
             git_ref,
             status,
             indexed,
+            last_error: None,
         })
+    }
+
+    /// Puts back the stored last error of a restored source.
+    pub fn with_last_error(mut self, last_error: Option<LastError>) -> Self {
+        self.last_error = last_error;
+        self
     }
 
     pub fn id(&self) -> &SourceId {
@@ -158,6 +177,11 @@ impl Source {
         self.indexed.as_ref()
     }
 
+    /// Why the source last failed; `None` after a successful index.
+    pub fn last_error(&self) -> Option<&LastError> {
+        self.last_error.as_ref()
+    }
+
     /// Searchable means "has an indexed revision and is not being removed". An
     /// update in progress or a failed update still serves the old index; a
     /// `Removing` source never appears in results.
@@ -181,12 +205,24 @@ impl Source {
             versions: IndexVersions::current(),
         });
         self.status = SourceStatus::Ready;
+        self.last_error = None;
     }
 
     /// Marks the source `Failed`. A previous indexed revision is kept, and so is
     /// the index it describes.
     pub fn mark_failed(&mut self) {
         self.status = SourceStatus::Failed;
+    }
+
+    /// Marks the source `Failed` and keeps why, replacing any earlier error. The
+    /// indexed revision is kept as with `mark_failed`.
+    pub fn record_failure(&mut self, code: &str, message: &str, at: IndexedAt) {
+        self.status = SourceStatus::Failed;
+        self.last_error = Some(LastError {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            at,
+        });
     }
 
     /// Marks the source as being removed: it is no longer searchable. The revision
@@ -198,7 +234,7 @@ impl Source {
 
 #[cfg(test)]
 mod tests {
-    use super::{name_key, IndexedRevision, ReadyWithoutRevision, Source, SourceStatus};
+    use super::{name_key, IndexedRevision, LastError, ReadyWithoutRevision, Source, SourceStatus};
     use crate::domain::git_location::GitLocation;
     use crate::domain::git_ref::GitRef;
     use crate::domain::index_versions::IndexVersions;
@@ -324,6 +360,67 @@ mod tests {
                 "{status:?}"
             );
         }
+    }
+
+    fn error_at(second: i64) -> LastError {
+        LastError {
+            code: "network_or_auth".to_owned(),
+            message: "git: operation timed out".to_owned(),
+            at: IndexedAt::from_epoch_seconds(second),
+        }
+    }
+
+    #[test]
+    fn a_new_source_has_no_last_error() {
+        assert_eq!(fresh().last_error(), None);
+    }
+
+    #[test]
+    fn recording_a_failure_marks_the_source_failed_and_keeps_the_error() {
+        let mut source = fresh();
+        source.mark_ready(commit(), at());
+        source.record_failure("network_or_auth", "git: operation timed out", at());
+        assert_eq!(source.status(), SourceStatus::Failed);
+        assert_eq!(source.last_error(), Some(&error_at(10)));
+        assert!(source.indexed().is_some(), "the old index is still served");
+    }
+
+    #[test]
+    fn the_last_error_survives_status_changes_until_the_source_is_ready_again() {
+        let mut source = fresh();
+        source.record_failure("error", "boom", at());
+        source.mark_indexing();
+        assert!(source.last_error().is_some());
+        source.mark_ready(commit(), at());
+        assert_eq!(source.last_error(), None, "a good index clears the error");
+    }
+
+    #[test]
+    fn a_later_failure_replaces_the_earlier_error() {
+        let mut source = fresh();
+        source.record_failure("error", "first", IndexedAt::from_epoch_seconds(1));
+        source.record_failure("not_found", "second", IndexedAt::from_epoch_seconds(2));
+        let error = source.last_error().unwrap();
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            ("not_found", "second")
+        );
+        assert_eq!(error.at, IndexedAt::from_epoch_seconds(2));
+    }
+
+    #[test]
+    fn a_stored_error_can_be_put_back_on_a_restored_source() {
+        let source = Source::restore(
+            id(),
+            "r".into(),
+            location(),
+            None,
+            SourceStatus::Failed,
+            None,
+        )
+        .unwrap()
+        .with_last_error(Some(error_at(10)));
+        assert_eq!(source.last_error(), Some(&error_at(10)));
     }
 
     #[test]

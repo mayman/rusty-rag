@@ -5,7 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use super::contracts::StampStoredVersions;
 use crate::application::error::{GitError, StorageError};
@@ -164,7 +165,8 @@ impl SourceRepository for InMemoryStore {
             source.status(),
             stored_revision,
         )
-        .map_err(|e| failed(e.to_string()))?;
+        .map_err(|e| failed(e.to_string()))?
+        .with_last_error(source.last_error().cloned());
         state.sources.insert(source.id().clone(), kept);
         Ok(())
     }
@@ -297,6 +299,21 @@ impl ChunkStore for InMemoryStore {
             .map_or(0, |files| files.values().map(|f| f.chunks.len()).sum()))
     }
 
+    fn chunk_count_for_paths(
+        &self,
+        source: &SourceId,
+        paths: &[RepoPath],
+    ) -> Result<usize, StorageError> {
+        let wanted: BTreeSet<&RepoPath> = paths.iter().collect();
+        Ok(locked(&self.state).files.get(source).map_or(0, |files| {
+            files
+                .iter()
+                .filter(|(path, _)| wanted.contains(path))
+                .map(|(_, file)| file.chunks.len())
+                .sum()
+        }))
+    }
+
     fn chunk(&self, id: &ChunkId) -> Result<Option<Chunk>, StorageError> {
         Ok(locked(&self.state)
             .files
@@ -385,7 +402,8 @@ impl ChunkStore for InMemoryStore {
                 ..revision
             }),
         )
-        .map_err(|e| failed(e.to_string()))?;
+        .map_err(|e| failed(e.to_string()))?
+        .with_last_error(stored.last_error().cloned());
         state.files.insert(source.clone(), files);
         state.sources.insert(source.clone(), updated);
         Ok(())
@@ -408,7 +426,8 @@ impl StampStoredVersions for InMemoryStore {
                 ..revision
             }),
         )
-        .expect("a restorable source");
+        .expect("a restorable source")
+        .with_last_error(stored.last_error().cloned());
         state.sources.insert(source.clone(), aged);
     }
 }
@@ -508,40 +527,82 @@ fn score(query: &Query, mode: QueryMode, fields: &IndexFields) -> Option<f64> {
 
 // --- OperationLock ------------------------------------------------------------
 
-/// Releases one source's entry when dropped.
+/// The held locks (source to the operation that holds it, when it was named) and a
+/// signal for waiters.
+#[derive(Debug, Default)]
+struct LockTable {
+    held: Mutex<BTreeMap<SourceId, Option<String>>>,
+    released: Condvar,
+}
+
+/// Releases one source's entry when dropped and wakes the waiters.
 struct HeldLock {
-    held: Arc<Mutex<BTreeSet<SourceId>>>,
+    table: Arc<LockTable>,
     source: SourceId,
 }
 
 impl Drop for HeldLock {
     fn drop(&mut self) {
-        locked(&self.held).remove(&self.source);
+        locked(&self.table.held).remove(&self.source);
+        self.table.released.notify_all();
     }
 }
 
 /// An in-process operation lock: a second `acquire` of a held source is `Busy`.
-/// Clones share the same set of held locks.
+/// `acquire_waiting` waits on a condition variable for the holder to let go and
+/// reports the holder's operation when the wait runs out. Clones share the same
+/// held locks.
 #[derive(Debug, Clone, Default)]
 pub struct FakeOperationLock {
-    held: Arc<Mutex<BTreeSet<SourceId>>>,
+    table: Arc<LockTable>,
 }
 
 impl FakeOperationLock {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn guard(&self, source: &SourceId) -> LockGuard {
+        LockGuard::new(HeldLock {
+            table: Arc::clone(&self.table),
+            source: source.clone(),
+        })
+    }
 }
 
 impl OperationLock for FakeOperationLock {
     fn acquire(&self, source: &SourceId) -> Result<LockGuard, StorageError> {
-        if !locked(&self.held).insert(source.clone()) {
+        let mut held = locked(&self.table.held);
+        if held.contains_key(source) {
             return Err(StorageError::Busy);
         }
-        Ok(LockGuard::new(HeldLock {
-            held: Arc::clone(&self.held),
-            source: source.clone(),
-        }))
+        held.insert(source.clone(), None);
+        Ok(self.guard(source))
+    }
+
+    fn acquire_waiting(
+        &self,
+        source: &SourceId,
+        operation: &str,
+        max_wait: Duration,
+    ) -> Result<LockGuard, StorageError> {
+        let mut held = locked(&self.table.held);
+        if !max_wait.is_zero() {
+            held = self
+                .table
+                .released
+                .wait_timeout_while(held, max_wait, |held| held.contains_key(source))
+                .expect("fake lock state is not poisoned")
+                .0;
+        }
+        if let Some(running) = held.get(source) {
+            return Err(match running {
+                Some(running) => StorageError::locked_by(running),
+                None => StorageError::Busy,
+            });
+        }
+        held.insert(source.clone(), Some(operation.to_owned()));
+        Ok(self.guard(source))
     }
 }
 
@@ -653,6 +714,20 @@ impl FakeGitClient {
             unsafe_paths,
         });
         id
+    }
+
+    /// Renames the default branch of the remote at `location` to `branch`, as when
+    /// a repository moves from `master` to `main`. Clones tracking the old name can
+    /// no longer fetch it; `default_branch` reports the new one.
+    ///
+    /// # Panics
+    /// When the remote was not created with `add_remote`.
+    pub fn rename_default_branch(&self, location: &str, branch: &str) {
+        locked(&self.state)
+            .remotes
+            .get_mut(&remote_key(location))
+            .expect("remote exists")
+            .branch = branch.to_owned();
     }
 
     /// Makes the next operation fail with `error`.

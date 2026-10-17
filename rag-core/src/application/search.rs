@@ -8,6 +8,7 @@
 
 use crate::application::dto::{
     show_chunk_command, SearchRequest, SearchResponse, SearchResultDto, SCHEMA_VERSION,
+    UNTRUSTED_CONTENT,
 };
 use crate::application::error::{AppError, Scrubbed, StorageError};
 use crate::application::ports::{ChunkSearcher, SourceRepository, TOTAL_MATCHES_CAP};
@@ -18,7 +19,9 @@ use crate::domain::path_glob::{InvalidGlob, PathGlob};
 use crate::domain::query::{Query, QueryMode};
 use crate::domain::scored_chunk::ScoredChunk;
 use crate::domain::search_filters::SearchFilters;
-use crate::domain::source::Source;
+use crate::domain::source::{Source, SourceStatus};
+use crate::domain::source_id::SourceId;
+use crate::domain::untrusted_text::sanitize_untrusted;
 
 /// The most hits one page may ask for.
 pub const MAX_K: usize = 50;
@@ -29,6 +32,9 @@ pub const MAX_OFFSET: usize = TOTAL_MATCHES_CAP;
 pub const NO_MATCH_HINT: &str = "no chunk matched the query; try fewer or different words, or check the --repo, --lang and --path filters";
 /// Hint when the page is past the last hit.
 pub const PAST_END_HINT: &str = "the offset is past the last hit; use a smaller --offset";
+/// Hint when nothing matched and `notices` explains that some sources cannot be
+/// searched (or failed their last update), so other words are not the first thing to try.
+pub const NOTICES_HINT: &str = "nothing matched, and some sources are not searchable or failed their last update; read `notices` before trying other words";
 /// Hint when only the OR fallback matched.
 pub const PARTIAL_HINT: &str = "no chunk matched every word; these hits match some of the words, so check for typos or drop a word";
 
@@ -49,14 +55,16 @@ impl<'a> Search<'a> {
                 "the query has no searchable words; use letters or digits",
             ))
         })?;
-        if self.sources.list()?.is_empty() {
+        let registered = self.sources.list()?;
+        if registered.is_empty() {
             return Err(StorageError::IndexMissing.into());
         }
         let filters = self.filters(request)?;
         let k = request.k.clamp(1, MAX_K);
         let offset = request.offset.min(MAX_OFFSET);
         let retrieval = retrieve(self.searcher, &query, &filters, offset, k)?;
-        build_response(&query, &retrieval, offset)
+        let notices = notices(&registered, &filters.sources);
+        build_response(&query, &retrieval, offset, notices)
     }
 
     fn filters(&self, request: &SearchRequest) -> Result<SearchFilters, AppError> {
@@ -108,8 +116,11 @@ pub(crate) fn unknown_source(wanted: &str) -> AppError {
 }
 
 /// The sources a user-typed `--repo` value names: the source with that name
-/// (case-insensitive), else every source with that slug or full id. Empty when
-/// nothing matches.
+/// (case-insensitive), else every source with exactly that slug or full id, else (only
+/// when nothing matched exactly) every source whose slug or id matches ignoring case.
+/// Slugs are not case-folded: `github.com/O/R` and `github.com/o/r` may be two
+/// sources, and an exact match never also returns the other. Empty when nothing
+/// matches.
 pub(crate) fn find_sources(
     sources: &dyn SourceRepository,
     wanted: &str,
@@ -117,13 +128,21 @@ pub(crate) fn find_sources(
     if let Some(source) = sources.find_by_name(wanted)? {
         return Ok(vec![source]);
     }
-    let wanted = wanted.to_lowercase();
-    Ok(sources
-        .list()?
+    let all = sources.list()?;
+    let exact: Vec<Source> = all
+        .iter()
+        .filter(|source| source.id().slug() == wanted || source.id().as_str() == wanted)
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+    let folded = wanted.to_lowercase();
+    Ok(all
         .into_iter()
         .filter(|source| {
-            source.id().slug().to_lowercase() == wanted
-                || source.id().as_str().to_lowercase() == wanted
+            source.id().slug().to_lowercase() == folded
+                || source.id().as_str().to_lowercase() == folded
         })
         .collect())
 }
@@ -134,6 +153,7 @@ fn build_response(
     query: &Query,
     retrieval: &Retrieval,
     offset: usize,
+    notices: Vec<String>,
 ) -> Result<SearchResponse, AppError> {
     let best = retrieval
         .hits
@@ -148,6 +168,7 @@ fn build_response(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SearchResponse {
         schema_version: SCHEMA_VERSION,
+        content: UNTRUSTED_CONTENT,
         query: query.text().to_owned(),
         mode: retrieval.mode.as_str().to_owned(),
         total_hits: retrieval.total_matches,
@@ -156,8 +177,9 @@ fn build_response(
         offset,
         has_more: retrieval.has_more,
         truncated: false,
-        hint: hint(retrieval, results.len()),
+        hint: hint(retrieval, results.len(), !notices.is_empty()),
         results,
+        notices,
     })
 }
 
@@ -186,9 +208,13 @@ fn result(
         path: chunk.path.as_str().to_owned(),
         lines: [snippet.first_line, snippet.last_line],
         language: chunk.language.name().to_owned(),
-        heading: chunk.heading(),
-        matched_terms: snippet.matched_terms,
-        snippet: snippet.text,
+        heading: chunk.heading().map(|heading| sanitize_untrusted(&heading)),
+        matched_terms: snippet
+            .matched_terms
+            .iter()
+            .map(|term| sanitize_untrusted(term))
+            .collect(),
+        snippet: sanitize_untrusted(&snippet.text),
         show: show_chunk_command(&chunk.id),
     })
 }
@@ -203,12 +229,14 @@ fn relative_score(score: f64, best: f64) -> f64 {
     }
 }
 
-fn hint(retrieval: &Retrieval, returned: usize) -> Option<String> {
+fn hint(retrieval: &Retrieval, returned: usize, has_notices: bool) -> Option<String> {
     if returned == 0 {
-        let text = if retrieval.total_matches == 0 {
-            NO_MATCH_HINT
-        } else {
+        let text = if retrieval.total_matches > 0 {
             PAST_END_HINT
+        } else if has_notices {
+            NOTICES_HINT
+        } else {
+            NO_MATCH_HINT
         };
         Some(text.to_owned())
     } else if retrieval.mode == QueryMode::OrFallback {
@@ -217,6 +245,42 @@ fn hint(retrieval: &Retrieval, returned: usize) -> Option<String> {
         None
     }
 }
+/// What the caller should know about the sources behind a search: the registered
+/// ones that cannot be searched (no indexed revision yet), and those whose last
+/// update failed (the old index is still served). Only the sources the search touched
+/// (`wanted`, or all when it is empty) are reported.
+fn notices(registered: &[Source], wanted: &[SourceId]) -> Vec<String> {
+    registered
+        .iter()
+        .filter(|source| wanted.is_empty() || wanted.contains(source.id()))
+        .filter_map(notice)
+        .collect()
+}
+
+fn notice(source: &Source) -> Option<String> {
+    if source.status() == SourceStatus::Removing {
+        return None;
+    }
+    let name = sanitize_untrusted(source.name());
+    let slug = source.id().slug();
+    let reason = source
+        .last_error()
+        .map(|error| format!("{}: {}", error.code, error.message));
+    match (source.indexed(), source.status()) {
+        (None, status) => Some(format!(
+            "source {name:?} is registered but not searchable yet (status: {}{}); ask the user to run `rag update {slug}`",
+            status.as_str(),
+            reason.map_or_else(String::new, |reason| format!(", last error {reason}")),
+        )),
+        (Some(revision), SourceStatus::Failed) => Some(format!(
+            "source {name:?}: the last update failed ({}); results come from its previous index at commit {}; ask the user to run `rag update {slug}`",
+            reason.unwrap_or_else(|| "no error was recorded".to_owned()),
+            revision.commit.short(),
+        )),
+        (Some(_), _) => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use crate::application::ports::{ChunkStore, IndexChanges, IndexedFile, SourceRepository};
@@ -273,8 +337,12 @@ mod tests {
     use super::{Search, MAX_K, MAX_OFFSET, NO_MATCH_HINT, PARTIAL_HINT, PAST_END_HINT};
     use crate::application::dto::{ErrorResponse, SearchRequest, SearchResponse};
     use crate::application::error::{AppError, ErrorCode};
+    use crate::application::ports::SourceRepository;
     use crate::application::testkit::{InMemoryStore, StampStoredVersions};
+    use crate::domain::git_location::GitLocation;
     use crate::domain::index_versions::IndexVersions;
+    use crate::domain::source::Source;
+    use crate::domain::source_id::SourceId;
 
     const GOLDEN_TWO_HITS: &str = include_str!("../../tests/golden/search_two_hits.json.golden");
     const GOLDEN_NO_MATCH: &str = include_str!("../../tests/golden/search_no_match.json.golden");
@@ -529,6 +597,165 @@ mod tests {
         assert!(response.total_hits >= response.returned);
         let from_a = response.results.iter().filter(|r| r.path == "a.rs").count();
         assert!(from_a <= 2, "at most two hits per file");
+    }
+
+    #[test]
+    fn every_search_response_marks_its_content_untrusted() {
+        let response = ok(&store(), &SearchRequest::new("parse_config"));
+        assert_eq!(response.content, "untrusted");
+        assert!(json(&response).contains(r#""content":"untrusted""#));
+        let empty = ok(&store(), &SearchRequest::new("zzzunknownzzz"));
+        assert_eq!(empty.content, "untrusted");
+    }
+
+    #[test]
+    fn hostile_text_in_snippets_and_headings_is_neutralised_in_core() {
+        let store = InMemoryStore::new();
+        index(
+            &store,
+            URL,
+            "Docs",
+            &[
+                (
+                    "src/hostile.rs",
+                    "pub fn hostile() {\n    // \u{1b}[2J wipe \u{202e}gnp\u{e0041}\u{e0042} \u{9b}31m\n}\n",
+                ),
+                (
+                    "docs/evil.md",
+                    "# Head\u{202e}ing \u{e0041}\n\nhostile body\n",
+                ),
+            ],
+        );
+        let response = ok(&store, &SearchRequest::new("hostile"));
+        assert_eq!(response.results.len(), 2);
+        for result in &response.results {
+            for text in std::iter::once(&result.snippet).chain(result.heading.as_ref()) {
+                assert!(
+                    crate::domain::untrusted_text::is_clean(text),
+                    "{text:?} still holds control or invisible characters"
+                );
+            }
+        }
+        let code = response
+            .results
+            .iter()
+            .find(|r| r.path == "src/hostile.rs")
+            .unwrap();
+        assert!(
+            code.snippet.contains("?[2J wipe ?gnp??"),
+            "{:?}",
+            code.snippet
+        );
+        let doc = response
+            .results
+            .iter()
+            .find(|r| r.path == "docs/evil.md")
+            .unwrap();
+        assert_eq!(doc.heading.as_deref(), Some("Head?ing ?"));
+    }
+
+    fn register_only(store: &InMemoryStore, url: &str, name: &str) -> Source {
+        let location = GitLocation::parse(url).unwrap();
+        let id = SourceId::from_location(&location).unwrap();
+        let source = Source::register(id, name, location);
+        store.save(&source).unwrap();
+        source
+    }
+
+    #[test]
+    fn registered_but_unsearchable_sources_get_a_specific_hint_and_notice() {
+        let store = InMemoryStore::new();
+        register_only(&store, "https://github.com/o/new", "new");
+
+        let response = ok(&store, &SearchRequest::new("parse"));
+
+        assert_eq!(response.returned, 0);
+        let hint = response.hint.as_deref().unwrap();
+        assert_ne!(hint, NO_MATCH_HINT, "never the try-other-words hint");
+        assert!(hint.contains("notices"), "{hint}");
+        let [notice] = &response.notices[..] else {
+            panic!("one notice: {:?}", response.notices)
+        };
+        assert!(notice.contains("\"new\""), "{notice}");
+        assert!(notice.contains("cloning"), "{notice}");
+        assert!(notice.contains("ask the user to run"), "{notice}");
+        assert!(notice.contains("`rag update github.com/o/new`"), "{notice}");
+        assert!(json(&response).contains(r#""notices":["#));
+    }
+
+    #[test]
+    fn a_failed_first_index_names_the_last_error_in_the_notice() {
+        let store = InMemoryStore::new();
+        let mut source = register_only(&store, "https://github.com/o/new", "new");
+        source.record_failure(
+            "network_or_auth",
+            "git: operation timed out",
+            crate::domain::indexed_at::IndexedAt::from_epoch_seconds(5),
+        );
+        store.save(&source).unwrap();
+
+        let response = ok(&store, &SearchRequest::new("parse"));
+
+        let notice = &response.notices[0];
+        assert!(notice.contains("failed"), "{notice}");
+        assert!(
+            notice.contains("network_or_auth: git: operation timed out"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn a_searchable_source_beside_an_unsearchable_one_keeps_its_results_and_adds_a_notice() {
+        let store = store();
+        register_only(&store, "https://github.com/o/new", "new");
+
+        let response = ok(&store, &SearchRequest::new("parse_config"));
+
+        assert!(!response.results.is_empty());
+        assert_eq!(response.hint, None, "results are fine; only a notice");
+        assert_eq!(response.notices.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_update_still_serves_the_old_index_and_says_so() {
+        let store = store();
+        let id =
+            crate::domain::source_id::SourceId::from_location(&GitLocation::parse(URL).unwrap())
+                .unwrap();
+        let mut source = store.get(&id).unwrap().unwrap();
+        source.record_failure(
+            "network_or_auth",
+            "offline",
+            crate::domain::indexed_at::IndexedAt::from_epoch_seconds(5),
+        );
+        store.save(&source).unwrap();
+
+        let response = ok(&store, &SearchRequest::new("parse_config"));
+
+        assert!(!response.results.is_empty(), "the old index is served");
+        let notice = &response.notices[0];
+        assert!(notice.contains("last update failed"), "{notice}");
+        assert!(notice.contains("network_or_auth: offline"), "{notice}");
+        assert!(notice.contains(&COMMIT[..7]), "{notice}");
+    }
+
+    #[test]
+    fn a_repo_filter_only_reports_the_sources_it_names() {
+        let store = store();
+        register_only(&store, "https://github.com/o/new", "new");
+        let mut request = SearchRequest::new("parse_config");
+        request.repos = vec!["docs".to_owned()];
+
+        let response = ok(&store, &request);
+
+        assert!(response.notices.is_empty(), "{:?}", response.notices);
+    }
+
+    #[test]
+    fn healthy_sources_produce_no_notices() {
+        assert!(ok(&store(), &SearchRequest::new("parse_config"))
+            .notices
+            .is_empty());
     }
 
     #[test]

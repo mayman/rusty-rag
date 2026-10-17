@@ -5,11 +5,13 @@ use serde::Serialize;
 use crate::application::dto::SCHEMA_VERSION;
 use crate::application::error::{AppError, StorageError};
 use crate::application::index_pipeline::IndexReport;
-use crate::application::indexer::Indexer;
+use crate::application::indexer::{Indexer, DEFAULT_LOCK_WAIT};
 use crate::application::ports::{ChunkStore, Clock, GitClient, OperationLock, SourceRepository};
+use crate::application::progress::{Progress, NO_PROGRESS};
 use crate::domain::git_location::GitLocation;
 use crate::domain::source::Source;
 use crate::domain::source_id::SourceId;
+use std::time::Duration;
 
 /// Input of the add use case.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub struct AddSource<'a> {
     git: &'a dyn GitClient,
     locks: &'a dyn OperationLock,
     clock: &'a dyn Clock,
+    progress: &'a dyn Progress,
+    lock_wait: Duration,
 }
 
 impl<'a> AddSource<'a> {
@@ -71,7 +75,22 @@ impl<'a> AddSource<'a> {
             git,
             locks,
             clock,
+            progress: &NO_PROGRESS,
+            lock_wait: DEFAULT_LOCK_WAIT,
         }
+    }
+
+    /// Reports the phases of the add to `progress`.
+    pub fn with_progress(mut self, progress: &'a dyn Progress) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    /// How long to wait for the operation lock of the source (default
+    /// `DEFAULT_LOCK_WAIT`); `Duration::ZERO` fails at once (`--no-wait`).
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     pub fn execute(&self, request: &AddRequest) -> Result<AddResponse, AppError> {
@@ -79,8 +98,9 @@ impl<'a> AddSource<'a> {
             .map_err(|error| AppError::Usage(error.to_string().into()))?;
         let id = SourceId::from_location(&location)
             .map_err(|error| AppError::Usage(error.to_string().into()))?;
-        let _lock = self.locks.acquire(&id)?;
-        let indexer = Indexer::new(self.sources, self.store, self.git, self.clock);
+        let _lock = self.locks.acquire_waiting(&id, "add", self.lock_wait)?;
+        let indexer = Indexer::new(self.sources, self.store, self.git, self.clock)
+            .with_progress(self.progress);
 
         let (source, report, already_added) = match self.sources.get(&id)? {
             // The same location again is an update.
@@ -125,8 +145,9 @@ impl<'a> AddSource<'a> {
 mod tests {
     use super::*;
     use crate::application::error::{ErrorCode, GitError, StorageError};
-    use crate::application::indexer_test_support::{id_of, GitSpy, World, REMOTE};
+    use crate::application::indexer_test_support::{id_of, GitSpy, RecordingLock, World, REMOTE};
     use crate::domain::source::SourceStatus;
+    use std::time::Duration;
 
     fn code(error: &AppError) -> ErrorCode {
         error.code()
@@ -233,10 +254,66 @@ mod tests {
         let w = World::new();
         w.commit(&[("a.rs", "fn a() {}\n")]);
         let _held = w.locks.acquire(&w.id()).unwrap();
-        let error = w.add().unwrap_err();
+        let error = w
+            .add_source()
+            .with_lock_wait(Duration::ZERO)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap_err();
         assert_eq!(error, AppError::Storage(StorageError::Busy));
         assert_eq!(error.code().exit_code(), 6);
         assert!(w.store.get(&w.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn add_waits_for_the_lock_by_default_for_twenty_seconds() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let locks = RecordingLock::new(&w.locks);
+
+        w.add_source_locked(&locks)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap();
+
+        assert_eq!(DEFAULT_LOCK_WAIT, Duration::from_secs(20));
+        assert_eq!(locks.waits(), [("add".to_owned(), Duration::from_secs(20))]);
+    }
+
+    #[test]
+    fn add_does_not_wait_when_told_not_to() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let locks = RecordingLock::new(&w.locks);
+
+        w.add_source_locked(&locks)
+            .with_lock_wait(Duration::ZERO)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap();
+
+        assert_eq!(locks.waits(), [("add".to_owned(), Duration::ZERO)]);
+    }
+
+    #[test]
+    fn add_names_the_operation_in_progress_when_the_wait_runs_out() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let _held = w
+            .locks
+            .acquire_waiting(&w.id(), "update", Duration::ZERO)
+            .unwrap();
+
+        let error = w
+            .add_source()
+            .with_lock_wait(Duration::from_millis(30))
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap_err();
+
+        assert_eq!(error, AppError::Storage(StorageError::locked_by("update")));
+        assert_eq!(error.code().exit_code(), 6);
+        assert!(error.to_string().contains("`update`"), "{error}");
+        assert!(
+            w.store.get(&w.id()).unwrap().is_none(),
+            "nothing was started"
+        );
     }
 
     #[test]

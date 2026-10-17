@@ -1,6 +1,8 @@
 //! Builders for output tests: response DTOs with fixed ids, commits, and times.
 
-use rag_core::application::dto::{SearchResponse, SearchResultDto, SCHEMA_VERSION};
+use rag_core::application::dto::{
+    SearchResponse, SearchResultDto, SCHEMA_VERSION, UNTRUSTED_CONTENT,
+};
 
 /// The short commit every fixture result carries.
 pub const COMMIT: &str = "abababa";
@@ -41,6 +43,7 @@ pub fn result(
 pub fn response(query: &str, results: Vec<SearchResultDto>) -> SearchResponse {
     SearchResponse {
         schema_version: SCHEMA_VERSION,
+        content: UNTRUSTED_CONTENT,
         query: query.to_owned(),
         mode: "and".to_owned(),
         total_hits: results.len(),
@@ -50,6 +53,7 @@ pub fn response(query: &str, results: Vec<SearchResultDto>) -> SearchResponse {
         has_more: false,
         truncated: false,
         results,
+        notices: Vec::new(),
         hint: None,
     }
 }

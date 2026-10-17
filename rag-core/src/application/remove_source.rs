@@ -30,6 +30,9 @@ pub struct RemoveResponse {
     pub name: String,
     /// False when the clone could not be deleted; leftovers are garbage-collected.
     pub checkout_removed: bool,
+    /// Why the clone could not be deleted (scrubbed), when it could not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkout_error: Option<String>,
 }
 
 pub struct RemoveSource<'a> {
@@ -65,12 +68,17 @@ impl<'a> RemoveSource<'a> {
         // stops appearing in results at once. The clone is only disk space: a
         // leftover is garbage-collected later.
         self.store.remove_source(&id)?;
-        let checkout_removed = self.git.remove_checkout(&id).is_ok();
+        let checkout_error = self
+            .git
+            .remove_checkout(&id)
+            .err()
+            .map(|error| AppError::from(error).to_string());
         Ok(RemoveResponse {
             schema_version: SCHEMA_VERSION,
             repo: id.slug().to_owned(),
             name: source.name().to_owned(),
-            checkout_removed,
+            checkout_removed: checkout_error.is_none(),
+            checkout_error,
         })
     }
 }
@@ -158,6 +166,41 @@ mod tests {
 
         assert!(!response.checkout_removed, "a leftover is tolerated");
         assert!(w.store.get(&w.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_clone_that_stays_behind_says_why() {
+        let w = indexed_world();
+        w.git.fail_next(GitError::Failed(
+            "cannot delete C:/data/repos/abc: access denied, see https://user:tok3n@host/x".into(),
+        ));
+
+        let response = w
+            .remove_source()
+            .execute(&RemoveRequest::new("example.com/o/r"))
+            .unwrap();
+
+        let reason = response.checkout_error.as_deref().unwrap();
+        assert!(reason.contains("access denied"), "{reason}");
+        assert!(!reason.contains("tok3n"), "never a credential: {reason}");
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(
+            json.contains(r#""checkout_removed":false,"checkout_error":"#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_clean_removal_has_no_checkout_error() {
+        let w = indexed_world();
+        let response = w
+            .remove_source()
+            .execute(&RemoveRequest::new("example.com/o/r"))
+            .unwrap();
+        assert_eq!(response.checkout_error, None);
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("checkout_error"));
     }
 
     #[test]

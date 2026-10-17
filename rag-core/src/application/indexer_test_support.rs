@@ -3,18 +3,30 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::application::add_source::{AddRequest, AddResponse, AddSource};
+use crate::application::error::StorageError;
 use crate::application::error::{AppError, GitError};
-use crate::application::ports::{GitClient, TreeListing};
+use crate::application::ports::{
+    ChunkStore, GitClient, IndexChanges, LockGuard, OperationLock, ReindexedChunk,
+    SourceRepository, TreeListing,
+};
+use crate::application::progress::{Phase, Progress};
 use crate::application::reindex::Reindex;
 use crate::application::remove_source::RemoveSource;
 use crate::application::testkit::{FakeGitClient, FakeOperationLock, FixedClock, InMemoryStore};
 use crate::application::update_source::UpdateSource;
+use crate::domain::chunk::Chunk;
+use crate::domain::chunk_id::ChunkId;
 use crate::domain::git_location::GitLocation;
 use crate::domain::git_ref::GitRef;
+use crate::domain::index_versions::IndexVersions;
 use crate::domain::indexed_at::IndexedAt;
+use crate::domain::manifest::Manifest;
 use crate::domain::oid::{BlobOid, CommitId};
+use crate::domain::repo_path::RepoPath;
+use crate::domain::source::{Source, SourceStatus};
 use crate::domain::source_id::SourceId;
 
 pub const REMOTE: &str = "https://example.com/o/r";
@@ -61,6 +73,18 @@ impl World {
 
     pub fn add_source_via<'a>(&'a self, git: &'a dyn GitClient) -> AddSource<'a> {
         AddSource::new(&self.store, &self.store, git, &self.locks, &self.clock)
+    }
+
+    pub fn add_source_with<'a>(&'a self, progress: &'a dyn Progress) -> AddSource<'a> {
+        self.add_source().with_progress(progress)
+    }
+
+    pub fn add_source_locked<'a>(&'a self, locks: &'a dyn OperationLock) -> AddSource<'a> {
+        AddSource::new(&self.store, &self.store, &self.git, locks, &self.clock)
+    }
+
+    pub fn update_source_locked<'a>(&'a self, locks: &'a dyn OperationLock) -> UpdateSource<'a> {
+        UpdateSource::new(&self.store, &self.store, &self.git, locks, &self.clock)
     }
 
     pub fn update_source(&self) -> UpdateSource<'_> {
@@ -180,5 +204,206 @@ impl GitClient for GitSpy<'_> {
     fn remove_checkout(&self, source: &SourceId) -> Result<(), GitError> {
         self.note("remove_checkout");
         self.inner.remove_checkout(source)
+    }
+}
+
+/// A progress that writes every call down and reports 5 ms for each phase.
+#[derive(Default)]
+pub struct RecordingProgress {
+    events: Mutex<Vec<String>>,
+}
+
+impl RecordingProgress {
+    /// `kind:phase` (`begin:fetch`, `detail:list`, `end:read`) of every call, in order.
+    pub fn sequence(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.splitn(3, ':').take(2).collect::<Vec<_>>().join(":"))
+            .collect()
+    }
+
+    /// The full `kind:phase:text` of every call.
+    pub fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl Progress for RecordingProgress {
+    fn begin(&self, phase: Phase, detail: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("begin:{}:{detail}", phase.as_str()));
+    }
+
+    fn detail(&self, phase: Phase, text: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("detail:{}:{text}", phase.as_str()));
+    }
+
+    fn end(&self, phase: Phase) -> u64 {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("end:{}:", phase.as_str()));
+        5
+    }
+}
+
+/// A lock that forwards to another and records every `acquire_waiting` it is asked:
+/// the operation and the longest wait.
+pub struct RecordingLock<'a> {
+    inner: &'a dyn OperationLock,
+    waits: Mutex<Vec<(String, Duration)>>,
+}
+
+impl<'a> RecordingLock<'a> {
+    pub fn new(inner: &'a dyn OperationLock) -> Self {
+        Self {
+            inner,
+            waits: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn waits(&self) -> Vec<(String, Duration)> {
+        self.waits.lock().unwrap().clone()
+    }
+}
+
+impl OperationLock for RecordingLock<'_> {
+    fn acquire(&self, source: &SourceId) -> Result<LockGuard, StorageError> {
+        self.inner.acquire(source)
+    }
+
+    fn acquire_waiting(
+        &self,
+        source: &SourceId,
+        operation: &str,
+        max_wait: Duration,
+    ) -> Result<LockGuard, StorageError> {
+        self.waits
+            .lock()
+            .unwrap()
+            .push((operation.to_owned(), max_wait));
+        self.inner.acquire_waiting(source, operation, max_wait)
+    }
+}
+
+/// A store that forwards to an `InMemoryStore` and can misbehave on request: fail
+/// every `commit_index` with a given error, pretend one source was removed after it
+/// was listed, and write down the status of every `save`.
+pub struct SpiedStore<'a> {
+    inner: &'a InMemoryStore,
+    commit_error: Option<StorageError>,
+    hidden: Option<SourceId>,
+    saved: Mutex<Vec<SourceStatus>>,
+}
+
+impl<'a> SpiedStore<'a> {
+    pub fn new(inner: &'a InMemoryStore) -> Self {
+        Self {
+            inner,
+            commit_error: None,
+            hidden: None,
+            saved: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every `commit_index` fails with `error`, changing nothing.
+    pub fn failing_commits(mut self, error: StorageError) -> Self {
+        self.commit_error = Some(error);
+        self
+    }
+
+    /// `get` says `id` does not exist, though `list` still names it.
+    pub fn hiding(mut self, id: &SourceId) -> Self {
+        self.hidden = Some(id.clone());
+        self
+    }
+
+    /// The status of every source passed to `save`, in order.
+    pub fn saved_statuses(&self) -> Vec<SourceStatus> {
+        self.saved.lock().unwrap().clone()
+    }
+}
+
+impl SourceRepository for SpiedStore<'_> {
+    fn get(&self, id: &SourceId) -> Result<Option<Source>, StorageError> {
+        if self.hidden.as_ref() == Some(id) {
+            return Ok(None);
+        }
+        self.inner.get(id)
+    }
+
+    fn find_by_name(&self, name: &str) -> Result<Option<Source>, StorageError> {
+        self.inner.find_by_name(name)
+    }
+
+    fn list(&self) -> Result<Vec<Source>, StorageError> {
+        self.inner.list()
+    }
+
+    fn save(&self, source: &Source) -> Result<(), StorageError> {
+        self.saved.lock().unwrap().push(source.status());
+        self.inner.save(source)
+    }
+}
+
+impl ChunkStore for SpiedStore<'_> {
+    fn commit_index(
+        &self,
+        source: &Source,
+        expected_base: Option<&CommitId>,
+        changes: &IndexChanges,
+    ) -> Result<(), StorageError> {
+        match &self.commit_error {
+            Some(error) => Err(error.clone()),
+            None => self.inner.commit_index(source, expected_base, changes),
+        }
+    }
+
+    fn remove_source(&self, id: &SourceId) -> Result<(), StorageError> {
+        self.inner.remove_source(id)
+    }
+
+    fn manifest(&self, source: &SourceId) -> Result<Manifest, StorageError> {
+        self.inner.manifest(source)
+    }
+
+    fn chunk_count(&self, source: &SourceId) -> Result<usize, StorageError> {
+        self.inner.chunk_count(source)
+    }
+
+    fn chunk_count_for_paths(
+        &self,
+        source: &SourceId,
+        paths: &[RepoPath],
+    ) -> Result<usize, StorageError> {
+        self.inner.chunk_count_for_paths(source, paths)
+    }
+
+    fn chunk(&self, id: &ChunkId) -> Result<Option<Chunk>, StorageError> {
+        self.inner.chunk(id)
+    }
+
+    fn chunks(&self, source: &SourceId) -> Result<Vec<Chunk>, StorageError> {
+        self.inner.chunks(source)
+    }
+
+    fn stored_versions(&self, source: &SourceId) -> Result<Option<IndexVersions>, StorageError> {
+        self.inner.stored_versions(source)
+    }
+
+    fn rewrite_index_fields(
+        &self,
+        source: &SourceId,
+        fields: &[ReindexedChunk],
+        versions: IndexVersions,
+    ) -> Result<(), StorageError> {
+        self.inner.rewrite_index_fields(source, fields, versions)
     }
 }

@@ -14,7 +14,7 @@ use rag_core::domain::language::Language;
 use rag_core::domain::line_range::LineRange;
 use rag_core::domain::oid::CommitId;
 use rag_core::domain::repo_path::RepoPath;
-use rag_core::domain::source::{IndexedRevision, Source, SourceStatus};
+use rag_core::domain::source::{IndexedRevision, LastError, Source, SourceStatus};
 use rag_core::domain::source_id::SourceId;
 use rusqlite::{Connection, OptionalExtension, Params, Row};
 
@@ -22,7 +22,8 @@ use super::error::{failed, storage_error};
 
 /// Select list matching `RawSource::read`.
 pub(crate) const SOURCE_COLUMNS: &str = "source_id, name, location, git_ref, status, \
-     indexed_commit, indexed_at, tokenizer_version, chunker_version, policy_version";
+     indexed_commit, indexed_at, tokenizer_version, chunker_version, policy_version, \
+     last_error_code, last_error_message, last_error_at";
 
 /// Select list matching `RawChunk::read`.
 pub(crate) const CHUNK_COLUMNS: &str =
@@ -38,6 +39,7 @@ pub(crate) struct RawSource {
     commit: Option<String>,
     at: Option<i64>,
     versions: [Option<i64>; 3],
+    last_error: Option<(String, String, i64)>,
 }
 
 impl RawSource {
@@ -51,6 +53,10 @@ impl RawSource {
             commit: row.get(5)?,
             at: row.get(6)?,
             versions: [row.get(7)?, row.get(8)?, row.get(9)?],
+            last_error: match (row.get(10)?, row.get(11)?, row.get(12)?) {
+                (Some(code), Some(message), Some(at)) => Some((code, message, at)),
+                _ => None,
+            },
         })
     }
 
@@ -81,7 +87,13 @@ impl RawSource {
             (None, _, _) => None,
             _ => return Err(corrupt("revision")),
         };
+        let last_error = self.last_error.map(|(code, message, at)| LastError {
+            code,
+            message,
+            at: IndexedAt::from_epoch_seconds(at),
+        });
         Source::restore(id, self.name.clone(), location, git_ref, status, indexed)
+            .map(|source| source.with_last_error(last_error))
             .map_err(|e| failed(format!("stored source {}: {e}", self.id)))
     }
 }

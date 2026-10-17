@@ -8,6 +8,7 @@
 //! `commit_index`, as the use cases do.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::application::error::StorageError;
 use crate::application::ports::{
@@ -230,6 +231,45 @@ pub fn contract_source_repository<R: SourceRepository>(make: impl Fn() -> R) {
     save_replaces_and_list_is_ordered_by_id(&make());
     names_are_unique_case_insensitively(&make());
     save_never_writes_an_indexed_revision(&make());
+    save_persists_the_last_error(&make());
+}
+
+fn save_persists_the_last_error<R: SourceRepository>(repo: &R) {
+    let mut source = Source::register(source_id("one"), "one", location("one"));
+    repo.save(&source).unwrap();
+    assert_eq!(repo.get(source.id()).unwrap().unwrap().last_error(), None);
+
+    source.record_failure(
+        "network_or_auth",
+        "git: operation timed out",
+        IndexedAt::from_epoch_seconds(1_234),
+    );
+    repo.save(&source).unwrap();
+    let stored = repo.get(source.id()).unwrap().unwrap();
+    assert_eq!(stored.status(), SourceStatus::Failed);
+    assert_eq!(
+        stored.last_error(),
+        source.last_error(),
+        "code, message, and time round trip"
+    );
+    assert_eq!(
+        repo.list().unwrap()[0].last_error(),
+        source.last_error(),
+        "list carries the last error too"
+    );
+    assert_eq!(
+        repo.find_by_name("one").unwrap().unwrap().last_error(),
+        source.last_error(),
+        "and so does the lookup by name"
+    );
+
+    source.record_failure("error", "second", IndexedAt::from_epoch_seconds(2_000));
+    repo.save(&source).unwrap();
+    assert_eq!(
+        repo.get(source.id()).unwrap().unwrap().last_error(),
+        source.last_error(),
+        "a later failure replaces the earlier one"
+    );
 }
 
 fn empty_catalog_knows_nothing<R: SourceRepository>(repo: &R) {
@@ -414,6 +454,64 @@ pub fn contract_chunk_store<S: ChunkStore + SourceRepository + StampStoredVersio
     rewrite_index_fields_rejects_a_mismatched_chunk_set(&make());
     rewrite_index_fields_rejects_a_changed_chunker_or_policy_version(&make());
     sources_are_isolated_and_removable(&make());
+    chunk_counts_for_paths_count_only_the_named_files(&make());
+    a_commit_clears_the_last_error(&make());
+}
+
+fn chunk_counts_for_paths_count_only_the_named_files<S: ChunkStore + SourceRepository>(store: &S) {
+    let s = source_id("one");
+    let doc = file(&s, "a.md", "# One\nalpha\n# Two\nbeta\n# Three\ngamma", 1);
+    let code = file(&s, "src/b.rs", "fn b() {}", 2);
+    let empty = IndexedFile {
+        chunks: Vec::new(),
+        ..file(&s, "c.txt", "", 3)
+    };
+    assert!(doc.chunks.len() > 1, "fixture: several chunks in one file");
+    first_index(store, "one", vec![doc.clone(), code.clone(), empty]);
+
+    let count = |paths: &[&str]| {
+        let paths: Vec<RepoPath> = paths.iter().map(|p| path(p)).collect();
+        store.chunk_count_for_paths(&s, &paths).unwrap()
+    };
+    assert_eq!(count(&["a.md"]), doc.chunks.len());
+    assert_eq!(count(&["a.md", "src/b.rs"]), chunk_total(&[&doc, &code]));
+    assert_eq!(
+        count(&["c.txt"]),
+        0,
+        "a stored file without chunks counts 0"
+    );
+    assert_eq!(count(&["never-stored.rs"]), 0, "unknown paths count 0");
+    assert_eq!(count(&[]), 0, "no paths, no chunks");
+    assert_eq!(
+        count(&["a.md", "a.md"]),
+        doc.chunks.len(),
+        "a path named twice counts once"
+    );
+    assert_eq!(
+        store
+            .chunk_count_for_paths(&source_id("unknown"), &[path("a.md")])
+            .unwrap(),
+        0,
+        "another source's files are not counted"
+    );
+}
+
+fn a_commit_clears_the_last_error<S: ChunkStore + SourceRepository>(store: &S) {
+    let s = source_id("one");
+    let mut first = first_index(store, "one", vec![file(&s, "a.rs", "fn a() {}", 1)]);
+    first.record_failure("error", "boom", IndexedAt::from_epoch_seconds(5));
+    store.save(&first).unwrap();
+    assert!(store.get(&s).unwrap().unwrap().last_error().is_some());
+
+    let next = next_index(
+        store,
+        &first,
+        2,
+        &upserts(vec![file(&s, "a.rs", "fn a2() {}", 3)]),
+    );
+    let stored = store.get(&s).unwrap().unwrap();
+    assert_eq!(stored, next);
+    assert_eq!(stored.last_error(), None, "a good index clears the error");
 }
 
 /// How many times `contract_commit_race` repeats the race on a fresh store.
@@ -2171,4 +2269,50 @@ pub fn contract_operation_lock<L: OperationLock>(make: impl Fn() -> L) {
     assert_eq!(lock.acquire(&a).unwrap_err(), StorageError::Busy);
     drop((again, other));
     lock.acquire(&b).expect("released locks can be retaken");
+
+    waiting_for_a_free_lock_succeeds_at_once(&lock);
+    waiting_on_a_held_lock_gives_up_with_a_retryable_error(&lock);
+    a_released_lock_is_taken_even_with_a_tiny_wait(&lock);
+}
+
+fn waiting_for_a_free_lock_succeeds_at_once<L: OperationLock>(lock: &L) {
+    let free = source_id("wait-free");
+    let guard = lock
+        .acquire_waiting(&free, "add", Duration::from_secs(5))
+        .expect("a free lock is taken without waiting");
+    assert!(
+        matches!(lock.acquire(&free), Err(StorageError::Busy)),
+        "the waiting acquire really holds the lock"
+    );
+    drop(guard);
+    lock.acquire(&free).expect("and releases it on drop");
+}
+
+fn waiting_on_a_held_lock_gives_up_with_a_retryable_error<L: OperationLock>(lock: &L) {
+    let busy = source_id("wait-busy");
+    let held = lock
+        .acquire_waiting(&busy, "add", Duration::ZERO)
+        .expect("the holder");
+    for wait in [Duration::ZERO, Duration::from_millis(30)] {
+        match lock.acquire_waiting(&busy, "update", wait) {
+            Err(StorageError::Busy) => {}
+            Err(StorageError::LockedBy(operation)) => assert!(
+                operation.as_str().contains("add"),
+                "the error names the operation in progress: {operation}"
+            ),
+            other => panic!("a held lock must not be taken ({wait:?}): {other:?}"),
+        }
+    }
+    drop(held);
+    lock.acquire_waiting(&busy, "update", Duration::from_millis(30))
+        .expect("free again");
+}
+
+fn a_released_lock_is_taken_even_with_a_tiny_wait<L: OperationLock>(lock: &L) {
+    // Threads are not available in this layer, so the holder is released before the
+    // wait starts; the contract pins that a wait never fails on a free lock.
+    let id = source_id("wait-released");
+    drop(lock.acquire(&id).expect("holder"));
+    lock.acquire_waiting(&id, "update", Duration::from_millis(1))
+        .expect("a released lock is taken even with a tiny wait");
 }

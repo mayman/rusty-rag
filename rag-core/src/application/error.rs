@@ -6,6 +6,10 @@
 use std::fmt;
 
 use crate::domain::git_location::scrub_credentials;
+use crate::domain::untrusted_text::sanitize_untrusted;
+
+/// Longest message a `Scrubbed` keeps, in characters (an ellipsis included).
+pub const MAX_MESSAGE_CHARS: usize = 500;
 
 /// Stable error codes: the JSON `error.code` string and the process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +62,11 @@ impl ErrorCode {
         }
     }
 
+    /// The code whose `as_str` is `text`.
+    pub fn parse(text: &str) -> Option<ErrorCode> {
+        Self::ALL.into_iter().find(|code| code.as_str() == text)
+    }
+
     /// What the caller can do about it, when that is the same every time.
     pub fn default_hint(&self) -> Option<&'static str> {
         match self {
@@ -69,20 +78,37 @@ impl ErrorCode {
     }
 }
 
-/// Message text with credentials removed (`scrub_credentials`) at construction. The
-/// only ways to build one are `new` and `From`, so no error can carry a password,
-/// token, or query secret that a subprocess or an adapter happened to quote.
+/// Message text made safe to show, at construction: credentials removed
+/// (`scrub_credentials`), control and invisible characters replaced
+/// (`sanitize_untrusted`; line breaks and tabs become spaces, so a message is one
+/// line), and the length capped at `MAX_MESSAGE_CHARS`. The only ways to build one
+/// are `new` and `From`, so no error can carry a password, token, or query secret
+/// that a subprocess or an adapter happened to quote, nor text that writes to a
+/// terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scrubbed(String);
 
 impl Scrubbed {
     pub fn new(text: &str) -> Self {
-        Self(scrub_credentials(text))
+        // Credentials go first: a cut made by the cap could otherwise split a URL and
+        // leave a secret that no scrubber recognises.
+        let scrubbed = scrub_credentials(text).replace(['\n', '\r', '\t'], " ");
+        let clean = sanitize_untrusted(&scrubbed);
+        Self(cap(clean))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn cap(text: String) -> String {
+    if text.chars().count() <= MAX_MESSAGE_CHARS {
+        return text;
+    }
+    let mut capped: String = text.chars().take(MAX_MESSAGE_CHARS - 3).collect();
+    capped.push_str("...");
+    capped
 }
 
 impl From<&str> for Scrubbed {
@@ -115,10 +141,22 @@ pub enum StorageError {
     /// The stored index is not at the commit the writer started from
     /// (`commit_index` with a stale `expected_base`).
     Conflict,
+    /// The operation lock of the source stayed held; the text names the operation in
+    /// progress. Like `Busy`, a retry later can succeed.
+    LockedBy(Scrubbed),
     /// Another source already has this name (compared case-insensitively).
     NameTaken(Scrubbed),
     /// Anything else; the message is safe to show.
     Failed(Scrubbed),
+}
+
+impl StorageError {
+    /// The lock of a source is held by `operation` (`add`, `update`).
+    pub fn locked_by(operation: &str) -> Self {
+        Self::LockedBy(
+            format!("another rag process is running `{operation}` on this source").into(),
+        )
+    }
 }
 
 /// Failures of the git client.
@@ -154,7 +192,9 @@ impl AppError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Storage(StorageError::IndexMissing) => ErrorCode::IndexMissing,
-            Self::Storage(StorageError::Busy | StorageError::Conflict)
+            Self::Storage(
+                StorageError::Busy | StorageError::LockedBy(_) | StorageError::Conflict,
+            )
             | Self::Git(GitError::Busy) => ErrorCode::IndexLocked,
             Self::Storage(StorageError::ReindexRequired) => ErrorCode::ReindexRequired,
             Self::Git(GitError::NotFound(_)) | Self::NotFound(_) => ErrorCode::NotFound,
@@ -171,6 +211,7 @@ impl fmt::Display for StorageError {
         match self {
             Self::IndexMissing => f.write_str("no index exists yet"),
             Self::Busy => f.write_str("the index is locked by another process"),
+            Self::LockedBy(operation) => write!(f, "{operation}; wait for it to finish and retry"),
             Self::ReindexRequired => f.write_str("the index was built by an older version"),
             Self::Conflict => {
                 f.write_str("the index changed while this command ran; retry the command")
@@ -239,6 +280,14 @@ mod tests {
     fn exit_codes_are_one_to_seven_in_order() {
         let codes: Vec<u8> = ErrorCode::ALL.iter().map(ErrorCode::exit_code).collect();
         assert_eq!(codes, [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn code_strings_parse_back_to_their_codes() {
+        for code in ErrorCode::ALL {
+            assert_eq!(ErrorCode::parse(code.as_str()), Some(code));
+        }
+        assert_eq!(ErrorCode::parse("skipped_busy"), None);
     }
 
     #[test]
@@ -345,6 +394,67 @@ mod tests {
         let error = AppError::from(StorageError::Conflict);
         assert_eq!(error.code().exit_code(), 6);
         assert_eq!(error.code().as_str(), "index_locked");
+    }
+
+    #[test]
+    fn scrubbed_text_loses_control_and_invisible_characters() {
+        let hostile = "a\u{1b}[2Jb\u{7}c\u{202e}d\u{e0041}e\u{9b}f";
+        let shown = Scrubbed::from(hostile);
+        assert_eq!(shown.as_str(), "a?[2Jb?c?d?e?f");
+    }
+
+    #[test]
+    fn scrubbed_text_is_one_line() {
+        assert_eq!(
+            Scrubbed::from("one\ntwo\r\nthree\tfour").as_str(),
+            "one two  three four"
+        );
+    }
+
+    #[test]
+    fn scrubbed_text_is_capped_near_500_characters() {
+        let long = "x".repeat(2000);
+        let shown = Scrubbed::from(long.as_str());
+        assert_eq!(shown.as_str().chars().count(), 500);
+        assert!(shown.as_str().ends_with("..."), "{}", shown.as_str());
+        let short = "y".repeat(500);
+        assert_eq!(Scrubbed::from(short.as_str()).as_str(), short);
+    }
+
+    #[test]
+    fn the_cap_never_splits_a_credential_into_something_unrecognisable() {
+        let text = format!(
+            "{} https://user:s3cretpassword@github.com/o/r",
+            "x".repeat(470)
+        );
+        let shown = Scrubbed::from(text.as_str());
+        assert!(!shown.as_str().contains("s3cr") && !shown.as_str().contains("user:"));
+        assert!(shown.as_str().chars().count() <= 500);
+    }
+
+    #[test]
+    fn locked_by_builds_the_message_for_an_operation() {
+        let error = AppError::from(StorageError::locked_by("update"));
+        assert_eq!(
+            error.to_string(),
+            "another rag process is running `update` on this source; wait for it to finish and retry"
+        );
+        let hostile = AppError::from(StorageError::locked_by("up\u{1b}[2Jdate"));
+        assert!(!hostile.to_string().contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_held_lock_names_the_operation_and_exits_six() {
+        let error = AppError::from(StorageError::LockedBy(
+            "another rag process is running `update`".into(),
+        ));
+        assert_eq!(error.code(), ErrorCode::IndexLocked);
+        assert_eq!(error.code().exit_code(), 6);
+        assert!(error.to_string().contains("`update`"), "{error}");
+        assert!(
+            error.to_string().contains("retry") || error.to_string().contains("wait"),
+            "{error}"
+        );
     }
 
     const LEAK: &str =

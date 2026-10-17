@@ -18,13 +18,16 @@ use crate::domain::tree_entry::TreeEntry;
 
 /// Version of the rules in this module. Bump it when they change, so indexes built
 /// under older rules are reindexed.
-pub const POLICY_VERSION: u32 = 1;
+pub const POLICY_VERSION: u32 = 2;
 /// Files larger than this are skipped (about 1 MB).
 pub const MAX_FILE_BYTES: u64 = 1_000_000;
 /// The most files one source may index (after the skip rules).
 pub const MAX_FILES_PER_SOURCE: usize = 20_000;
 /// The most chunks one source may hold.
 pub const MAX_CHUNKS_PER_SOURCE: usize = 200_000;
+/// The most bytes of accepted files (by `ls-tree` sizes) one source may hold: 200 MiB.
+/// Checked before any blob is read.
+pub const MAX_SOURCE_BYTES: u64 = 200 * 1024 * 1024;
 /// Git LFS pointer files are shorter than this.
 const MAX_LFS_POINTER_BYTES: usize = 1024;
 const LFS_POINTER_HEADER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
@@ -107,7 +110,7 @@ const GENERATED_SUFFIXES: &[&str] = &[
 const VENDORED_DIRECTORIES: &[&str] =
     &["node_modules", "vendor", "third_party", "bower_components"];
 const SECRET_EXTENSIONS: &[&str] = &[
-    "pem", "key", "p12", "pfx", "jks", "keystore", "ppk", "tfvars", "kdbx",
+    "pem", "key", "p12", "pfx", "jks", "keystore", "ppk", "tfvars", "kdbx", "p8", "pkcs12", "gpg",
 ];
 const SECRET_NAMES: &[&str] = &[
     ".netrc",
@@ -126,6 +129,9 @@ const SECRET_NAMES: &[&str] = &[
     ".pgpass",
     ".git-credentials",
     "kubeconfig",
+    ".dockercfg",
+    ".vault_pass",
+    "secrets.toml",
 ];
 /// Extensions of prose, which is often one long line per paragraph and so exempt
 /// from the minified heuristic.
@@ -148,6 +154,10 @@ const TOKEN_SHAPES: &[TokenShape] = &[
     TokenShape::new("xoxs-", 10, TailKind::DashedAlphanumeric),
     TokenShape::new("glpat-", 20, TailKind::Word),
     TokenShape::new("AIza", 35, TailKind::Word),
+    TokenShape::new("sk-ant-", 20, TailKind::Word),
+    TokenShape::new("sk_live_", 16, TailKind::Alphanumeric),
+    TokenShape::new("npm_", 36, TailKind::Alphanumeric),
+    TokenShape::new("AccountKey=", 40, TailKind::Base64),
 ];
 const SECRET_NAME_PREFIXES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
 const ENV_TEMPLATE_SUFFIXES: &[&str] = &["example", "sample", "template", "dist"];
@@ -165,7 +175,19 @@ pub struct IndexPolicy;
 impl IndexPolicy {
     /// Judges a file from its path and size alone.
     pub fn check_entry(entry: &TreeEntry) -> Result<(), SkipReason> {
-        let path = entry.path.as_str().to_ascii_lowercase();
+        Self::check_path(&entry.path)?;
+        if entry.size > MAX_FILE_BYTES {
+            return Err(SkipReason::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Judges a file from its path alone: the name, directory, and extension rules
+    /// of `check_entry` without the size. `rag show` applies it again to a stored
+    /// path, so a file the rules refuse by name can never be shown, whatever a
+    /// store holds.
+    pub fn check_path(path: &RepoPath) -> Result<(), SkipReason> {
+        let path = path.as_str().to_ascii_lowercase();
         let (directories, name) = path.rsplit_once('/').unwrap_or(("", &path));
         if directories
             .split('/')
@@ -187,9 +209,6 @@ impl IndexPolicy {
         }
         if extension(name).is_some_and(|ext| BINARY_EXTENSIONS.contains(&ext)) {
             return Err(SkipReason::Binary);
-        }
-        if entry.size > MAX_FILE_BYTES {
-            return Err(SkipReason::TooLarge);
         }
         Ok(())
     }
@@ -238,6 +257,19 @@ impl IndexPolicy {
         }
         Ok(())
     }
+
+    /// Fails when the accepted files of a source add up to more than
+    /// `MAX_SOURCE_BYTES`. The caller sums the sizes `git ls-tree` reported, so the
+    /// check needs no blob.
+    pub fn check_source_bytes(bytes: u64) -> Result<(), SourceTooLarge> {
+        if bytes > MAX_SOURCE_BYTES {
+            return Err(SourceTooLarge::Bytes {
+                found: bytes,
+                limit: MAX_SOURCE_BYTES,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A source over the per-source caps (v1 has no partial or resumable indexing).
@@ -245,13 +277,15 @@ impl IndexPolicy {
 pub enum SourceTooLarge {
     Files { found: usize, limit: usize },
     Chunks { found: usize, limit: usize },
+    Bytes { found: u64, limit: u64 },
 }
 
 impl fmt::Display for SourceTooLarge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (found, limit, what) = match self {
-            Self::Files { found, limit } => (found, limit, "files"),
-            Self::Chunks { found, limit } => (found, limit, "chunks"),
+            Self::Files { found, limit } => (*found as u64, *limit as u64, "files"),
+            Self::Chunks { found, limit } => (*found as u64, *limit as u64, "chunks"),
+            Self::Bytes { found, limit } => (*found, *limit, "bytes of files"),
         };
         write!(
             f,
@@ -272,6 +306,8 @@ enum TailKind {
     Word,
     /// Letters, digits, and `-`.
     DashedAlphanumeric,
+    /// Letters, digits, `+`, `/`, and `=` (a base64 key).
+    Base64,
 }
 
 impl TailKind {
@@ -281,6 +317,7 @@ impl TailKind {
             Self::UpperAlphanumeric => c.is_ascii_uppercase() || c.is_ascii_digit(),
             Self::Word => c.is_ascii_alphanumeric() || matches!(c, '_' | '-'),
             Self::DashedAlphanumeric => c.is_ascii_alphanumeric() || c == '-',
+            Self::Base64 => c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='),
         }
     }
 }
@@ -358,6 +395,7 @@ fn is_secret_name(name: &str) -> bool {
         return !ENV_TEMPLATE_SUFFIXES.contains(&suffix);
     }
     SECRET_NAMES.contains(&name)
+        || (name.starts_with("service-account") && name.ends_with(".json"))
         || extension(name).is_some_and(|ext| SECRET_EXTENSIONS.contains(&ext))
         || (SECRET_NAME_PREFIXES.iter().any(|p| name.starts_with(p)) && !name.ends_with(".pub"))
 }
@@ -378,7 +416,7 @@ fn line_count(content: &[u8]) -> usize {
 mod tests {
     use super::{
         IndexPolicy, SkipReason, SourceTooLarge, MAX_CHUNKS_PER_SOURCE, MAX_FILES_PER_SOURCE,
-        MAX_FILE_BYTES,
+        MAX_FILE_BYTES, MAX_SOURCE_BYTES,
     };
     use crate::domain::oid::BlobOid;
     use crate::domain::repo_path::RepoPath;
@@ -780,6 +818,125 @@ mod tests {
                 limit: MAX_CHUNKS_PER_SOURCE
             })
         );
+    }
+
+    #[test]
+    fn a_source_is_capped_in_accepted_bytes_at_200_megabytes() {
+        assert_eq!(MAX_SOURCE_BYTES, 200 * 1024 * 1024);
+        assert_eq!(IndexPolicy::check_source_bytes(MAX_SOURCE_BYTES), Ok(()));
+        assert_eq!(
+            IndexPolicy::check_source_bytes(MAX_SOURCE_BYTES + 1),
+            Err(SourceTooLarge::Bytes {
+                found: MAX_SOURCE_BYTES + 1,
+                limit: MAX_SOURCE_BYTES
+            })
+        );
+        let shown = SourceTooLarge::Bytes {
+            found: 300_000_000,
+            limit: MAX_SOURCE_BYTES,
+        }
+        .to_string();
+        assert!(
+            shown.contains("300000000") && shown.contains("bytes") && shown.contains("too large"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn credential_stores_added_by_the_third_review_are_secret_names() {
+        for path in [
+            ".dockercfg",
+            "home/.dockercfg",
+            ".vault_pass",
+            "ansible/.vault_pass",
+            "keys/AuthKey_ABC123.p8",
+            "apple.P8",
+            "certs/client.pkcs12",
+            "secrets/db.gpg",
+            "service-account.json",
+            "gcp/service-account-prod.json",
+            "Service-Account-Key.JSON",
+            "config/secrets.toml",
+            ".streamlit/secrets.toml",
+        ] {
+            assert_eq!(verdict(path), Err(SkipReason::SecretName), "{path}");
+        }
+        for path in [
+            "docs/service-accounts.md",
+            "src/service_account.rs",
+            "docs/secrets-policy.toml",
+            "src/vault_pass.rs",
+            "p8.md",
+        ] {
+            assert_eq!(verdict(path), Ok(()), "{path}");
+        }
+    }
+
+    #[test]
+    fn check_path_applies_the_name_rules_without_a_size() {
+        let path = |text: &str| RepoPath::from_git(text).unwrap();
+        assert_eq!(
+            IndexPolicy::check_path(&path(".env")),
+            Err(SkipReason::SecretName)
+        );
+        assert_eq!(
+            IndexPolicy::check_path(&path("node_modules/x/y.js")),
+            Err(SkipReason::Vendored)
+        );
+        assert_eq!(
+            IndexPolicy::check_path(&path("keys/server.pem")),
+            Err(SkipReason::SecretName)
+        );
+        assert_eq!(IndexPolicy::check_path(&path("src/main.rs")), Ok(()));
+        assert_eq!(
+            IndexPolicy::check_path(&path("big.rs")),
+            Ok(()),
+            "a path alone has no size to judge"
+        );
+    }
+
+    #[test]
+    fn more_token_prefixes_are_secret_content() {
+        let tokens = [
+            format!("sk-ant-{}", "api03-aB_".repeat(5)),
+            format!("sk_live_{}", "a1B2c3D4".repeat(3)),
+            format!("npm_{}", "aB3".repeat(12)),
+            format!("AccountKey={}", "Ab1+/".repeat(9)),
+        ];
+        for token in tokens {
+            for text in [
+                format!("key = \"{token}\"\n"),
+                format!("{token}\n"),
+                token.clone(),
+            ] {
+                assert_eq!(
+                    content(text.as_bytes()),
+                    Err(SkipReason::SecretContent),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_prefixes_alone_are_not_tokens() {
+        for text in [
+            "sk-ant- keys start with this prefix",
+            "sk-ant-short",
+            "sk_live_short",
+            "npm_short",
+            "the npm_config_cache variable",
+            "AccountKey=",
+            "AccountKey=short",
+            "my_sk_live_aaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert_eq!(content(text.as_bytes()), Ok(()), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_policy_version_moves_when_the_rules_do() {
+        assert_eq!(super::POLICY_VERSION, 2);
     }
 
     #[test]

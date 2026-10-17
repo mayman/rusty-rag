@@ -1,4 +1,4 @@
-﻿//! Request and response DTOs. Responses are exactly what the CLI prints as JSON
+//! Request and response DTOs. Responses are exactly what the CLI prints as JSON
 //! (schema v1, see `docs/plan/03-output-schema.md`); field order is the order in
 //! the schema. Domain types never derive `Serialize`: these structs are the
 //! mapping target.
@@ -16,6 +16,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_K: usize = 5;
 /// Default hard cap on the characters of one search response.
 pub const DEFAULT_MAX_CHARS: usize = 8000;
+/// The value of the `content` field of search and show responses: everything in
+/// snippets, headings, and file text comes from an indexed repository and is data to
+/// read, never instructions to follow.
+pub const UNTRUSTED_CONTENT: &str = "untrusted";
 
 /// Input of the search use case.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +80,8 @@ pub struct SearchResultDto {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchResponse {
     pub schema_version: u32,
+    /// Always `untrusted` (`UNTRUSTED_CONTENT`): the hits quote repository content.
+    pub content: &'static str,
     pub query: String,
     /// `and` or `or_fallback`.
     pub mode: String,
@@ -95,6 +101,11 @@ pub struct SearchResponse {
     /// The output character budget dropped hits or shortened snippets.
     pub truncated: bool,
     pub results: Vec<SearchResultDto>,
+    /// Facts the caller should know about the sources behind this search: registered
+    /// sources that cannot be searched yet, and sources whose last update failed
+    /// (their old index is still served). Absent when there is nothing to say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
     /// Present when results are empty or weak.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -117,6 +128,18 @@ pub struct SourceSummary {
     pub indexed_at: Option<String>,
     pub age_seconds: Option<u64>,
     pub chunks: usize,
+    /// Why the source last failed; absent for a healthy source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<LastErrorDto>,
+}
+
+/// The last failure of a source in `rag list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LastErrorDto {
+    pub code: String,
+    pub message: String,
+    pub at: String,
+    pub age_seconds: u64,
 }
 
 impl SourceSummary {
@@ -131,6 +154,12 @@ impl SourceSummary {
             indexed_at: indexed.map(|revision| revision.at.to_rfc3339()),
             age_seconds: indexed.map(|revision| revision.at.age_seconds(now)),
             chunks,
+            last_error: source.last_error().map(|error| LastErrorDto {
+                code: error.code.clone(),
+                message: error.message.clone(),
+                at: error.at.to_rfc3339(),
+                age_seconds: error.at.age_seconds(now),
+            }),
         }
     }
 }
@@ -154,6 +183,8 @@ pub const SHOW_AROUND_RADIUS: usize = 20;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ShowResponse {
     pub schema_version: u32,
+    /// Always `untrusted` (`UNTRUSTED_CONTENT`): `text` is repository content.
+    pub content: &'static str,
     pub repo: String,
     pub commit: String,
     pub indexed_at: String,
@@ -243,6 +274,7 @@ mod tests {
     fn search_response_serializes_in_schema_v1_order() {
         let response = SearchResponse {
             schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
             query: "parse".into(),
             mode: "and".into(),
             total_hits: 1,
@@ -252,10 +284,11 @@ mod tests {
             has_more: false,
             truncated: false,
             results: vec![result_dto()],
+            notices: Vec::new(),
             hint: None,
         };
         let expected = concat!(
-            r#"{"schema_version":1,"query":"parse","mode":"and","total_hits":1,"total_is_exact":true,"#,
+            r#"{"schema_version":1,"content":"untrusted","query":"parse","mode":"and","total_hits":1,"total_is_exact":true,"#,
             r#""returned":1,"offset":0,"has_more":false,"truncated":false,"results":["#,
             r#"{"id":"<ID>","rank":1,"score":2.5,"score_rel":1.0,"repo":"github.com/o/r","#,
             r#""commit":"abc1234","indexed_at":"2023-11-14T22:13:20Z","path":"src/x.rs","#,
@@ -264,6 +297,58 @@ mod tests {
         )
         .replace("<ID>", CHUNK_HEX);
         assert_eq!(serde_json::to_string(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn notices_are_serialized_before_the_hint_and_only_when_present() {
+        let mut response = SearchResponse {
+            schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
+            query: "zzz".into(),
+            mode: "and".into(),
+            total_hits: 0,
+            total_is_exact: true,
+            returned: 0,
+            offset: 0,
+            has_more: false,
+            truncated: false,
+            results: vec![],
+            notices: vec!["source x is not searchable yet".into()],
+            hint: Some("read the remarks first".into()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(
+            json.ends_with(
+                r#""results":[],"notices":["source x is not searchable yet"],"hint":"read the remarks first"}"#
+            ),
+            "{json}"
+        );
+        response.notices.clear();
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("notices"));
+    }
+
+    #[test]
+    fn search_and_show_responses_mark_their_content_as_untrusted() {
+        assert_eq!(UNTRUSTED_CONTENT, "untrusted");
+        let show = ShowResponse {
+            schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
+            repo: "github.com/o/r".into(),
+            commit: "abc1234".into(),
+            indexed_at: "2023-11-14T22:13:20Z".into(),
+            path: "a.rs".into(),
+            language: "rust".into(),
+            lines: [1, 1],
+            total_lines: Some(1),
+            truncated: false,
+            chunk: None,
+            text: "x".into(),
+        };
+        assert!(serde_json::to_string(&show)
+            .unwrap()
+            .starts_with(r#"{"schema_version":1,"content":"untrusted","repo":"#));
     }
 
     #[test]
@@ -295,6 +380,7 @@ mod tests {
         // has_more = Retrieval::has_more, offset = the requested offset.
         let response = SearchResponse {
             schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
             query: "parse".into(),
             mode: "and".into(),
             total_hits: 42,
@@ -304,6 +390,7 @@ mod tests {
             has_more: true,
             truncated: false,
             results: vec![],
+            notices: Vec::new(),
             hint: None,
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -319,6 +406,7 @@ mod tests {
     fn hint_is_serialized_last_when_present() {
         let response = SearchResponse {
             schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
             query: "zzz".into(),
             mode: "or_fallback".into(),
             total_hits: 0,
@@ -328,6 +416,7 @@ mod tests {
             has_more: false,
             truncated: false,
             results: vec![],
+            notices: Vec::new(),
             hint: Some("try fewer words".into()),
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -371,6 +460,42 @@ mod tests {
         assert_eq!(summary.indexed_at.as_deref(), Some("2023-11-14T22:13:20Z"));
         assert_eq!(summary.age_seconds, Some(90));
         assert_eq!(summary.chunks, 12);
+    }
+
+    #[test]
+    fn a_failed_source_summary_carries_its_last_error() {
+        let mut source = ready_source();
+        source.record_failure(
+            "network_or_auth",
+            "git: operation timed out",
+            IndexedAt::from_epoch_seconds(1_700_000_050),
+        );
+        let summary = SourceSummary::new(&source, 3, IndexedAt::from_epoch_seconds(1_700_000_060));
+        let error = summary.last_error.as_ref().unwrap();
+        assert_eq!(error.code, "network_or_auth");
+        assert_eq!(error.message, "git: operation timed out");
+        assert_eq!(error.at, "2023-11-14T22:14:10Z");
+        assert_eq!(error.age_seconds, 10);
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(
+            json.ends_with(
+                r#""chunks":3,"last_error":{"code":"network_or_auth","message":"git: operation timed out","at":"2023-11-14T22:14:10Z","age_seconds":10}}"#
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_source_summary_has_no_last_error_field() {
+        let summary = SourceSummary::new(
+            &ready_source(),
+            1,
+            IndexedAt::from_epoch_seconds(1_700_000_000),
+        );
+        assert!(summary.last_error.is_none());
+        assert!(!serde_json::to_string(&summary)
+            .unwrap()
+            .contains("last_error"));
     }
 
     #[test]
