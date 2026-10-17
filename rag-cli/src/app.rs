@@ -175,6 +175,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
             let writer = Writer::open(&layout)?;
             let response =
                 RemoveSource::new(&writer.store, &writer.store, &writer.git, &writer.locks)
+                    .with_lock_wait(options.lock_wait())
                     .execute(&RemoveRequest::new(&name))?;
             Ok(Executed::ok(match mode {
                 Mode::Json => report::render_remove_json(&response),

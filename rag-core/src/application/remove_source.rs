@@ -4,9 +4,10 @@ use serde::Serialize;
 
 use crate::application::dto::SCHEMA_VERSION;
 use crate::application::error::AppError;
-use crate::application::indexer::resolve_source;
+use crate::application::indexer::{resolve_source, DEFAULT_LOCK_WAIT};
 use crate::application::ports::{ChunkStore, GitClient, OperationLock, SourceRepository};
 use crate::application::search::unknown_source;
+use std::time::Duration;
 
 /// Input of the remove use case.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub struct RemoveSource<'a> {
     store: &'a dyn ChunkStore,
     git: &'a dyn GitClient,
     locks: &'a dyn OperationLock,
+    lock_wait: Duration,
 }
 
 impl<'a> RemoveSource<'a> {
@@ -55,12 +57,20 @@ impl<'a> RemoveSource<'a> {
             store,
             git,
             locks,
+            lock_wait: DEFAULT_LOCK_WAIT,
         }
+    }
+
+    /// How long to wait for the operation lock of the source (default
+    /// `DEFAULT_LOCK_WAIT`); `Duration::ZERO` fails at once (`--no-wait`).
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     pub fn execute(&self, request: &RemoveRequest) -> Result<RemoveResponse, AppError> {
         let id = resolve_source(self.sources, &request.name)?.id().clone();
-        let _lock = self.locks.acquire(&id)?;
+        let _lock = self.locks.acquire_waiting(&id, "remove", self.lock_wait)?;
         // Look again under the lock: the source may have been removed meanwhile.
         let source = self
             .sources
@@ -217,11 +227,47 @@ mod tests {
     }
 
     #[test]
-    fn remove_is_refused_while_the_source_is_locked() {
+    fn remove_waits_for_the_lock_by_default_for_twenty_seconds() {
+        use crate::application::indexer_test_support::RecordingLock;
+        use std::time::Duration;
+        let w = indexed_world();
+        let locks = RecordingLock::new(&w.locks);
+
+        w.remove_source_locked(&locks)
+            .execute(&RemoveRequest::new("example.com/o/r"))
+            .unwrap();
+
+        assert_eq!(
+            locks.waits(),
+            [("remove".to_owned(), Duration::from_secs(20))]
+        );
+    }
+
+    #[test]
+    fn remove_names_the_operation_in_progress_when_the_wait_runs_out() {
+        use std::time::Duration;
+        let w = indexed_world();
+        let _held = w
+            .locks
+            .acquire_waiting(&w.id(), "update", Duration::ZERO)
+            .unwrap();
+        let error = w
+            .remove_source()
+            .with_lock_wait(Duration::from_millis(30))
+            .execute(&RemoveRequest::new("example.com/o/r"))
+            .unwrap_err();
+        assert_eq!(error.code().exit_code(), 6);
+        assert!(error.to_string().contains("`update`"), "{error}");
+        assert!(w.store.get(&w.id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_is_refused_at_once_while_the_source_is_locked_when_told_not_to_wait() {
         let w = indexed_world();
         let held = w.locks.acquire(&w.id()).unwrap();
         let error = w
             .remove_source()
+            .with_lock_wait(std::time::Duration::ZERO)
             .execute(&RemoveRequest::new("example.com/o/r"))
             .unwrap_err();
         assert_eq!(error.code().exit_code(), 6);

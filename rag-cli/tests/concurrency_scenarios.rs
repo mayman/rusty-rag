@@ -662,6 +662,34 @@ fn two_different_repositories_added_at_once_both_succeed() {
 }
 
 #[test]
+fn colliding_default_names_of_simultaneous_adds_never_fail() {
+    let _s = scenario("5b repeated colliding adds");
+    for round in 0..10 {
+        let rag = Rag::new();
+        let one = Upstream::empty();
+        one.write("src/one.rs", "pub fn onefunction() {}\n");
+        one.commit("one");
+        let two = Upstream::empty();
+        two.write("src/two.rs", "pub fn twofunction() {}\n");
+        two.commit("two");
+        let a1 = ["add", one.location()];
+        let a2 = ["add", two.location()];
+        let first = rag.spawn(&a1);
+        let second = rag.spawn(&a2);
+
+        let mut names = Vec::new();
+        for (process, args) in [(first, a1), (second, a2)] {
+            let (code, response, stderr) = process.finish(&args);
+            assert_eq!(code, 0, "round {round}: {response}\n{stderr}");
+            names.push(response["name"].as_str().unwrap().to_owned());
+        }
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 2, "round {round}: names must differ");
+    }
+}
+
+#[test]
 fn update_all_while_a_remove_runs_reports_the_removed_source_as_skipped_or_absent() {
     let _s = scenario("6 update all during remove");
     let rag = Rag::new();
@@ -682,18 +710,9 @@ fn update_all_while_a_remove_runs_reports_the_removed_source_as_skipped_or_absen
     let (update_code, updated, update_err) = update.finish(&update_args);
     let (remove_code, removed, remove_err) = remove.finish(&remove_args);
 
-    // `remove` does not wait for a lock: while the update held the source it answers
-    // `index_locked` (exit 6) and changes nothing. Both outcomes are legitimate; in the
-    // second the remove is repeated once the update is done.
-    match remove_code {
-        0 => {}
-        6 => {
-            assert_eq!(removed["error"]["code"], "index_locked", "{removed}");
-            rag.json(&remove_args, 0);
-        }
-        other => panic!("remove exited {other}: {removed}\n{remove_err}"),
-    }
-    note!("remove exited {remove_code} while the update ran");
+    // `remove` waits for the lock like `update` does, so it always succeeds, either
+    // before the update reached the source or right after it let go.
+    assert_eq!(remove_code, 0, "{removed}\n{remove_err}");
     assert_eq!(update_code, 0, "{updated}\n{update_err}");
     assert_eq!(updated["failed"], 0, "{updated}");
     for entry in updated["sources"].as_array().unwrap() {

@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::application::dto::SCHEMA_VERSION;
 use crate::application::error::{AppError, StorageError};
 use crate::application::index_pipeline::IndexReport;
-use crate::application::indexer::{Indexer, DEFAULT_LOCK_WAIT};
+use crate::application::indexer::{Indexed, Indexer, DEFAULT_LOCK_WAIT};
 use crate::application::ports::{ChunkStore, Clock, GitClient, OperationLock, SourceRepository};
 use crate::application::progress::{Progress, NO_PROGRESS};
 use crate::domain::git_location::GitLocation;
@@ -115,6 +115,46 @@ impl<'a> AddSource<'a> {
         Ok(id.slug().to_owned())
     }
 
+    /// Registers and indexes a new source. A name that was defaulted may be taken by
+    /// a concurrent add of another source between the check and the save; the loser
+    /// then picks the next free candidate. An explicit `--name` is never changed.
+    /// The registering save is the first thing `first_index` does, so a refused name
+    /// leaves nothing behind to undo.
+    fn register(
+        &self,
+        indexer: &Indexer<'_>,
+        request: &AddRequest,
+        id: &SourceId,
+        location: &GitLocation,
+    ) -> Result<Indexed, AppError> {
+        let attempts = id.default_names(location).len() + 1;
+        let mut tried = 0;
+        loop {
+            let name = self.name_for(request, id, location)?;
+            let retryable = !Self::is_explicit(request) && tried < attempts;
+            tried += 1;
+            if self.sources.find_by_name(&name)?.is_some() {
+                // Taken between choosing and checking: for a defaulted name, choose again.
+                if retryable {
+                    continue;
+                }
+                return Err(StorageError::NameTaken(name.as_str().into()).into());
+            }
+            let source = Source::register(id.clone(), &name, location.clone());
+            match indexer.first_index(source) {
+                Err(AppError::Storage(StorageError::NameTaken(_))) if retryable => {}
+                other => return other,
+            }
+        }
+    }
+
+    fn is_explicit(request: &AddRequest) -> bool {
+        request
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty())
+    }
+
     pub fn execute(&self, request: &AddRequest) -> Result<AddResponse, AppError> {
         let location = GitLocation::parse(&request.location)
             .map_err(|error| AppError::Usage(error.to_string().into()))?;
@@ -136,11 +176,7 @@ impl<'a> AddSource<'a> {
                 (indexed.source, indexed.report, false)
             }
             None => {
-                let name = self.name_for(request, &id, &location)?;
-                if self.sources.find_by_name(&name)?.is_some() {
-                    return Err(StorageError::NameTaken(name.as_str().into()).into());
-                }
-                let indexed = indexer.first_index(Source::register(id, &name, location))?;
+                let indexed = self.register(&indexer, request, &id, &location)?;
                 (indexed.source, indexed.report, false)
             }
         };
@@ -286,6 +322,80 @@ mod tests {
 
         assert_eq!(first.name, "serde");
         assert_eq!(second.name, "bob/serde");
+    }
+
+    /// A catalog in which a rival add wins the race for a name: the first `save`
+    /// registers the rival under `name` and then reports `NameTaken`, as a unique
+    /// index would for the loser.
+    struct LosesTheRace<'a> {
+        inner: &'a crate::application::testkit::InMemoryStore,
+        rival_url: &'a str,
+        name: &'a str,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    impl SourceRepository for LosesTheRace<'_> {
+        fn get(&self, id: &SourceId) -> Result<Option<Source>, StorageError> {
+            self.inner.get(id)
+        }
+        fn find_by_name(&self, name: &str) -> Result<Option<Source>, StorageError> {
+            self.inner.find_by_name(name)
+        }
+        fn list(&self) -> Result<Vec<Source>, StorageError> {
+            self.inner.list()
+        }
+        fn save(&self, source: &Source) -> Result<(), StorageError> {
+            if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let rival = Source::register(
+                    id_of(self.rival_url),
+                    self.name,
+                    GitLocation::parse(self.rival_url).unwrap(),
+                );
+                self.inner.save(&rival)?;
+                return Err(StorageError::NameTaken(self.name.into()));
+            }
+            self.inner.save(source)
+        }
+    }
+
+    #[test]
+    fn a_default_name_taken_by_a_rival_during_the_add_moves_on_to_the_next_candidate() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let sources = LosesTheRace {
+            inner: &w.store,
+            rival_url: "https://example.com/x/r",
+            name: "r",
+            raced: false.into(),
+        };
+
+        let response = AddSource::new(&sources, &w.store, &w.git, &w.locks, &w.clock)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap();
+
+        assert_eq!(response.name, "o/r");
+        assert_eq!(response.status, "ready");
+    }
+
+    #[test]
+    fn an_explicit_name_taken_by_a_rival_during_the_add_is_still_refused() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let sources = LosesTheRace {
+            inner: &w.store,
+            rival_url: "https://example.com/x/r",
+            name: "docs",
+            raced: false.into(),
+        };
+
+        let error = AddSource::new(&sources, &w.store, &w.git, &w.locks, &w.clock)
+            .execute(&AddRequest::named(REMOTE, "docs"))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Storage(StorageError::NameTaken(_))),
+            "{error}"
+        );
     }
 
     #[test]

@@ -103,6 +103,10 @@ impl World {
         RemoveSource::new(&self.store, &self.store, git, &self.locks)
     }
 
+    pub fn remove_source_locked<'a>(&'a self, locks: &'a dyn OperationLock) -> RemoveSource<'a> {
+        RemoveSource::new(&self.store, &self.store, &self.git, locks)
+    }
+
     pub fn reindex(&self) -> Reindex<'_> {
         self.reindex_via(&self.git)
     }

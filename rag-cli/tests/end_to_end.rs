@@ -854,7 +854,7 @@ fn a_source_busy_in_another_process_exits_six_and_a_short_wait_succeeds() {
         for args in [
             &["update", &name, "--no-wait"][..],
             &["add", upstream.location(), "--no-wait"],
-            &["remove", &name],
+            &["remove", &name, "--no-wait"],
         ] {
             let error = rag.json(args, 6);
             assert_eq!(error["error"]["code"], "index_locked", "{args:?}");
