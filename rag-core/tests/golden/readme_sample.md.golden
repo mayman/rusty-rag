@@ -1,0 +1,22 @@
+# Project
+
+Intro text.
+
+## Install
+
+Run the installer.
+
+### Windows
+Use the MSI.
+
+## Usage
+
+```bash
+# this is a comment, not a heading
+rag search "parseConfig"
+```
+
+### Windows
+Same name, different path.
+# Appendix
+Done.
