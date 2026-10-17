@@ -7,6 +7,15 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+dirs = "7.0.0"
+rag-core = { version = "0.1.0", path = "../rag-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde_json.workspace = true
+thiserror = "2.0.21"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rag-core = { path = "../rag-core", features = ["testkit"] }
+tempfile.workspace = true

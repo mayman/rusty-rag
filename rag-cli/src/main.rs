@@ -5,6 +5,8 @@
 
 use clap::Parser;
 
+mod output;
+
 /// Local-first keyword search over git repositories.
 #[derive(Parser)]
 #[command(name = "rag", version, about)]

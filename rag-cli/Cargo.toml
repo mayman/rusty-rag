@@ -12,5 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+rag-core = { version = "0.1.0", path = "../rag-core" }
+rag-infra = { version = "0.1.0", path = "../rag-infra" }
+serde_json.workspace = true
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
