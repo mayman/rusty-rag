@@ -59,6 +59,17 @@ const FILESYSTEM_ATTEMPTS: u32 = 5;
 /// A git lock file older than this belongs to a git that was killed: no live process
 /// holds a lock for ten minutes.
 const STALE_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// True when a volume-probe file is old enough to have been abandoned. When its age
+/// cannot be read the probe counts as fresh: leaving one file is harmless, deleting a
+/// live one makes another process's startup fail.
+fn probe_is_stale(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= crate::config::STALE_PROBE_AGE)
+}
 /// The ref that pins the last fetched commit.
 const PIN_REF: &str = "refs/rag/head";
 
@@ -135,6 +146,10 @@ impl SystemGitClient {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == HOOKS_DIR_NAME {
+                continue;
+            }
+            // Another process may be between writing its volume probe and renaming it.
+            if name.starts_with(crate::config::VOLUME_PROBE_PREFIX) && !probe_is_stale(&path) {
                 continue;
             }
             // Held until the end of this iteration.

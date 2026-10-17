@@ -24,6 +24,12 @@ use std::path::{Path, PathBuf};
 /// The environment variable that overrides the data directory.
 pub const HOME_ENV: &str = "RUSTY_RAG_HOME";
 
+/// Name prefix of the short-lived probe files `DataLayout::verify_same_volume` puts in `tmp/`.
+pub const VOLUME_PROBE_PREFIX: &str = ".volume-probe-";
+
+/// A probe file older than this was left by a process that died mid-probe.
+pub const STALE_PROBE_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Why the data directory could not be determined or created.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -103,12 +109,14 @@ impl DataLayout {
 
     /// Checks that a file can be renamed from `tmp/` into `repos/` (the move a clone
     /// makes), which fails across volumes. Both directories must exist
-    /// (`ensure_dirs`). Leaves nothing behind.
+    /// (`ensure_dirs`). Leaves nothing behind. The probe file lives in `tmp/` for a
+    /// moment, so the garbage sweep must leave `VOLUME_PROBE_PREFIX` files alone unless
+    /// they are old (a probe abandoned by a killed process).
     pub fn verify_same_volume(&self) -> Result<(), ConfigError> {
         // Unique per process and call, so concurrent `rag` processes never share a probe file.
         static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
-            ".volume-probe-{}-{}",
+            "{VOLUME_PROBE_PREFIX}{}-{}",
             std::process::id(),
             PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );

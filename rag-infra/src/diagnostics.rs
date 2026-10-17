@@ -102,7 +102,9 @@ impl Diagnostics for SystemDiagnostics {
 
     fn leftovers(&self, registered_checkouts: &[String]) -> Leftovers {
         let tmp_entries = entries(&self.layout.tmp_dir())
-            .filter(|(name, _)| name != HOOKS_DIR_NAME)
+            .filter(|(name, _)| {
+                name != HOOKS_DIR_NAME && !name.starts_with(crate::config::VOLUME_PROBE_PREFIX)
+            })
             .count();
         let unregistered_checkouts = entries(&self.layout.repos_dir())
             .filter(|(name, is_dir)| *is_dir && !registered_checkouts.contains(name))

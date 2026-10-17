@@ -101,6 +101,29 @@ fn collect_garbage_empties_the_scratch_directory() {
 }
 
 #[test]
+fn collect_garbage_leaves_the_volume_probe_another_process_is_using() {
+    // Another rag process writes a probe file into tmp/ and renames it into repos/
+    // a moment later; sweeping it in between made that rename fail (found on macOS CI).
+    let sandbox = Sandbox::new();
+    let fresh = sandbox.layout.tmp_dir().join(".volume-probe-4242-0");
+    std::fs::write(&fresh, b"").unwrap();
+    let abandoned = sandbox.layout.tmp_dir().join(".volume-probe-4243-0");
+    std::fs::write(&abandoned, b"").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&abandoned)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+
+    sandbox.client.collect_garbage(&lock_for(&sandbox));
+
+    assert!(fresh.exists(), "a probe in use by another process stays");
+    assert!(!abandoned.exists(), "a probe left behind long ago goes");
+}
+
+#[test]
 fn collect_garbage_leaves_the_staging_directory_of_a_source_that_is_locked() {
     let upstream = Upstream::new();
     let sandbox = Sandbox::new();
