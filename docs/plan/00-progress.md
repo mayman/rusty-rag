@@ -47,10 +47,21 @@ Updated as work lands. `[x]` = done and verified, `[~]` = done but not yet indep
 - [x] 6. Query use cases: search, show, list (lane/usecases-query)
 - [x] CLI wiring and composition root; end-to-end tests run the real binary (commit 3f905c4)
 - [x] Review round 3 round 1: safety and behaviour fixes (doc 12.2; commits 0f9d031, ee3640b, a192e95)
-- [~] Review round 3 round 2: output schema and UX fixes (in progress)
-- [ ] SKILL.md rewrite to match the final CLI, then install to `~/.claude/skills/rag/` (step 8)
-- [ ] 7. Relevance set (about 20 queries), git integration tests, concurrency test
-- [ ] 9. Real-world test on 2 to 3 of your repos, tune chunking and weights, measure (see the system-design lists)
+- [x] Review round 3 round 2: output schema and UX fixes (commits 0efe2e9, 9e6d0a2, cecb753)
+- [x] Friendly default source names, name-race retry, `remove` lock wait, two startup races fixed (1738d89, f7dd3c8, b115738)
+- [x] 7. Relevance set (34 cases, mutation-checked prior), 30 concurrency/crash/git-integration scenarios against the real binary
+- [x] Ranking prior (docs over tests, query-time, before LIMIT) validated on real cargo/tokio indexes
+- [x] 9. Real-world run: serde, anyhow, tokio, cargo on Windows (search 16-80 ms, first add 1.4-4.2 s, 38 MB peak RSS)
+- [x] SKILL.md rewritten and installed to `~/.claude/skills/rag/`; `rag` installed with `cargo install --path rag-cli --locked`
+- [x] Hardening round: `--deadline`, `rag doctor`, git lock handling, hints, README/SETUP/RELEASING, CI + release workflows (written, NOT yet run on GitHub)
+- [x] Workspace `rust-version` raised to 1.89
+
+**Open before a public release**
+- [ ] LICENSE file (maintainer's choice)
+- [ ] First GitHub run: CI on macOS/Linux (tests were developed on Windows only) and a `workflow_dispatch` dry run of the release workflow
+- [ ] Pin GitHub Actions to commit SHAs; consider provenance attestation and Windows/macOS signing
+- [ ] 150k-chunk synthetic scale test (cold start, worst OR query)
+- [ ] `rag gc` / FTS optimize; process-tree kill via job object on Windows; per-repo sensitivity exclusion (v1.1 backlog)
 **Open items (section 10)**
 - [ ] Sensitive-repo exclusion setting, if needed
 - [ ] macOS/Linux CI builds in v1 or later

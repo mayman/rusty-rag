@@ -9,7 +9,7 @@ rag search "<q>" [-k 5] [--repo R]... [--lang L]... [--path GLOB] [--offset N] [
 rag show --chunk <chunk> [--max-chars N]
 rag show <repo> <path> [--lines S-E | --around N] [--max-chars N]
 rag reindex [name | --all]        rebuild after a tokenizer/chunker/policy change; no name = all (`--all` is an alias)
-Global flags: --human (people-readable output), --no-wait (fail at once instead of waiting up to 20 s for a busy source)
+rag doctor [--integrity]          read-only diagnostics: data dir and sizes, per-source state, leftovers, git version, lock state`nGlobal flags: --human (people-readable output), --no-wait (fail at once instead of waiting up to 20 s for a busy source), --deadline <secs> (wall-clock budget for add/update/reindex, default 100, 0 = none; on expiry exit 1 `deadline_exceeded`, re-run to resume)
 ```
 
 `rag add .` indexes the committed HEAD of the current project (not recommended; the skill forbids it unless asked). Clones are object-database only (no working tree), so content is read with `rag show`; see section 12. The default source name is the repo's last path segment (`serde`), falling back to `owner/name`, then the slug, when taken. `--repo` accepts the source `name`, the `host/owner/name` slug, or a unique `/`-boundary suffix of the slug (names are case-insensitive and unique; ambiguous suffixes are a usage error listing candidates). stdout is always exactly one JSON object (or the `--human` text); progress goes to stderr only.

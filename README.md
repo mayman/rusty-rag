@@ -47,7 +47,7 @@ rag show --chunk <chunk>                      # the full text of one hit
 | `rag show --chunk <chunk> [--max-chars N]` | Show one search hit in full. |
 | `rag show <repo> <path> [--lines S-E \| --around N] [--max-chars N]` | Show lines of an indexed file. `<path>` is repo-relative. |
 | `rag reindex [name \| --all]` | Rebuild the index after a tokenizer, chunker or policy change. No name, or `--all`, rebuilds every source. |
-| `rag doctor` | Diagnostics (being added). |
+| `rag doctor [--integrity]` | Read-only diagnostics: data directory and index size, per-source state (commit, age, status, checkout present, stale versions, last error, lock held), leftovers in `tmp/`, and the git version. `--integrity` also runs SQLite's integrity check. |
 
 Global flags, accepted by every command:
 

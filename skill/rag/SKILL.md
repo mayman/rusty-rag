@@ -59,7 +59,7 @@ Errors arrive on stdout as `{"error":{"code","message","hint","details"?}}` (`hi
 | Code | Meaning | Action |
 |---|---|---|
 | 0 | ok (zero results included) | If empty, read `hint`, rephrase once. |
-| 1 | generic error | Read `message`. Do not retry blindly. For `update`/`reindex` over several sources the exit code is the shared error code when every failed source failed the same way, else 1, and the body is a report: read `sources[].error` and `sources[].result` (exit 0 can include `skipped_busy`/`skipped_removed` entries). |
+| 1 | generic error, including `deadline_exceeded` (a long `add`/`update` hit its `--deadline`, default 100 s) | Read `message`. For `deadline_exceeded` the same command can be re-run to resume. Otherwise do not retry blindly. For `update`/`reindex` over several sources the exit code is the shared error code when every failed source failed the same way, else 1, and the body is a report: read `sources[].error` and `sources[].result` (exit 0 can include `skipped_busy`/`skipped_removed` entries). |
 | 2 | usage error | Fix the command using this file. |
 | 3 | not found | Unknown source: `details.valid_names` lists the valid ones; run `rag list`, retry once. A chunk id that is gone (an update replaced it): run `rag search` again. A missing path or line range: check the `rag show` arguments. |
 | 4 | auth, network or git timeout | Stop and report. Never retry in a loop. Never put credentials in a URL. |
