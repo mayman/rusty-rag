@@ -773,3 +773,65 @@ fn many_writers_opening_a_fresh_database_at_once_all_succeed() {
         });
     }
 }
+
+#[test]
+fn a_doc_chunk_with_a_slightly_lower_raw_bm25_beats_a_test_chunk_before_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let s = source_id("one");
+    index(
+        &store,
+        "one",
+        vec![
+            file(&s, "a/tests/prior.rs", "gizmo", 1),
+            file(
+                &s,
+                "z/docs/prior.md",
+                "gizmo is described at some length here",
+                2,
+            ),
+            file(&s, "src/other.rs", "unrelated words only", 3),
+        ],
+    );
+    let raw_scores: Vec<(String, f64)> = raw(&dir)
+        .prepare(
+            "SELECT c.path, -bm25(chunks_fts) FROM chunks_fts \
+             JOIN chunks c ON c.chunk_rowid = chunks_fts.rowid \
+             WHERE chunks_fts MATCH 'gizmo' ORDER BY c.path",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let [(test_path, test_raw), (doc_path, doc_raw)] = raw_scores.as_slice() else {
+        panic!("two matches expected: {raw_scores:?}");
+    };
+    assert_eq!(
+        (test_path.as_str(), doc_path.as_str()),
+        ("a/tests/prior.rs", "z/docs/prior.md")
+    );
+    assert!(
+        test_raw > doc_raw && doc_raw * 1.15 > *test_raw * 0.7,
+        "fixture: the doc is raw-worse ({doc_raw} < {test_raw}) but wins with the prior"
+    );
+
+    let query = Query::parse("gizmo").unwrap();
+    let all = SearchFilters::default();
+    let both = store.search(&query, QueryMode::And, &all, 50).unwrap();
+    let paths: Vec<&str> = both.hits.iter().map(|h| h.chunk.path.as_str()).collect();
+    assert_eq!(paths, ["z/docs/prior.md", "a/tests/prior.rs"]);
+    assert!(
+        (both.hits[0].score - doc_raw * 1.15).abs() < 1e-9,
+        "score is prior-adjusted"
+    );
+    assert!((both.hits[1].score - test_raw * 0.7).abs() < 1e-9);
+
+    let one = store.search(&query, QueryMode::And, &all, 1).unwrap();
+    assert_eq!(one.hits.len(), 1);
+    assert_eq!(
+        one.hits[0].chunk.path.as_str(),
+        "z/docs/prior.md",
+        "the prior applies before the limit"
+    );
+}

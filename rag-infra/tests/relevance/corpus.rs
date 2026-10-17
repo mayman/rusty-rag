@@ -149,6 +149,46 @@ pub const DOCS: &[Doc] = &[
         text: include_str!("fixtures/widgets/package-lock.json"),
     },
     Doc {
+        repo: "widgets",
+        path: "docs/guide/leases.md",
+        text: include_str!("fixtures/widgets/docs/guide/leases.md"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "tests/test_leases.py",
+        text: include_str!("fixtures/widgets/tests/test_leases.py"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "docs/api/circuit_breaker.md",
+        text: include_str!("fixtures/widgets/docs/api/circuit_breaker.md"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "src/net/circuit.spec.ts",
+        text: include_str!("fixtures/widgets/src/net/circuit.spec.ts"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "docs/guide/shutdown.md",
+        text: include_str!("fixtures/widgets/docs/guide/shutdown.md"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "src/net/shutdown_test.go",
+        text: include_str!("fixtures/widgets/src/net/shutdown_test.go"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "docs/api/pagination.md",
+        text: include_str!("fixtures/widgets/docs/api/pagination.md"),
+    },
+    Doc {
+        repo: "widgets",
+        path: "tests/test_pagination.py",
+        text: include_str!("fixtures/widgets/tests/test_pagination.py"),
+    },
+    Doc {
         repo: "tools",
         path: "src/config/loader.rs",
         text: include_str!("fixtures/tools/src/config/loader.rs"),

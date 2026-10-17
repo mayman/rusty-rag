@@ -1,6 +1,7 @@
 //! `ChunkSearcher` over `chunks_fts`: one read transaction per search, ranking by
 //! bm25 with the column weights pinned in `schema::COLUMN_WEIGHTS`, scores negated so
-//! that higher is better, filters applied before the limit.
+//! that higher is better and scaled by the path prior (`domain::path_prior`), filters
+//! applied before the limit.
 //!
 //! The ranked query is narrow on purpose. It selects the row id, the score, and the
 //! sort keys, never the chunk text, so ranking a common term over a large index
@@ -16,6 +17,7 @@ use rag_core::application::error::StorageError;
 use rag_core::application::ports::{ChunkSearcher, SearchOutcome, TOTAL_MATCHES_CAP};
 use rag_core::domain::index_versions::IndexVersions;
 use rag_core::domain::path_glob::PathGlob;
+use rag_core::domain::path_prior::path_prior;
 use rag_core::domain::query::{Query, QueryMode};
 use rag_core::domain::repo_path::RepoPath;
 use rag_core::domain::scored_chunk::ScoredChunk;
@@ -33,6 +35,9 @@ use super::SqliteStore;
 /// The SQL function that applies the domain `PathGlob` to a stored path.
 const PATH_GLOB_FUNCTION: &str = "rag_path_glob";
 
+/// The SQL function that applies the domain `path_prior` to a stored path.
+const PATH_PRIOR_FUNCTION: &str = "rag_path_prior";
+
 /// Registers `rag_path_glob(pattern, path)` on a read connection. The pattern is
 /// parsed once per statement (the argument is cached as auxiliary data), the path
 /// is checked with `PathGlob::matches`, so the glob is a domain rule even though SQL
@@ -49,6 +54,22 @@ pub(super) fn register_path_glob(connection: &Connection) -> rusqlite::Result<()
             })?;
             let path = context.get_raw(1).as_str()?;
             Ok(RepoPath::from_git(path).is_ok_and(|path| glob.matches(&path)))
+        },
+    )
+}
+
+/// Registers `rag_path_prior(path)`: the multiplier of `domain::path_prior` (1.0 for
+/// a stored path that is not a safe `RepoPath`). Cheap: string comparisons on a
+/// path, evaluated once per matching row inside the ranking query, so the prior
+/// shapes the order before `LIMIT` keeps the best rows.
+pub(super) fn register_path_prior(connection: &Connection) -> rusqlite::Result<()> {
+    connection.create_scalar_function(
+        PATH_PRIOR_FUNCTION,
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let path = context.get_raw(0).as_str()?;
+            Ok(RepoPath::from_git(path).map_or(1.0, |path| path_prior(&path)))
         },
     )
 }
@@ -162,12 +183,15 @@ impl Matching {
         Self { from_where, params }
     }
 
-    /// Ranks the matches best first. Selects the row id and the score; the sort keys
-    /// are the columns of the tie-break (`ScoredChunk::ranking_order`). No text.
+    /// Ranks the matches best first. Selects the row id and the score (negated bm25
+    /// times the path prior, so documentation outranks tests at similar relevance
+    /// and the prior acts before `LIMIT`); the sort keys are the columns of the
+    /// tie-break (`ScoredChunk::ranking_order`). No text.
     fn ranked_sql(&self) -> String {
         let [path, heading, body] = COLUMN_WEIGHTS;
         format!(
-            "SELECT c.chunk_rowid, -bm25(chunks_fts, {path:?}, {heading:?}, {body:?}) AS score \
+            "SELECT c.chunk_rowid, \
+             -bm25(chunks_fts, {path:?}, {heading:?}, {body:?}) * {PATH_PRIOR_FUNCTION}(c.path) AS score \
              {} \
              ORDER BY score DESC, c.source_id, c.path, c.start_line, c.chunk_id \
              LIMIT ?",
@@ -266,13 +290,14 @@ mod tests {
     use rag_core::domain::source_id::SourceId;
     use rusqlite::Connection;
 
-    use super::{register_path_glob, Matching};
+    use super::{register_path_glob, register_path_prior, Matching};
     use crate::sqlite::schema::initialize;
 
     fn database() -> Connection {
         let mut connection = Connection::open_in_memory().expect("in-memory database");
         initialize(&mut connection).expect("schema");
         register_path_glob(&connection).expect("glob function");
+        register_path_prior(&connection).expect("prior function");
         connection
     }
 
@@ -307,6 +332,25 @@ mod tests {
         assert!(!sql.contains("heading_path"), "{sql}");
         assert!(sql.contains("ORDER BY") && sql.contains("LIMIT"), "{sql}");
         assert!(sql.contains("rag_path_glob(?, c.path)"), "{sql}");
+        assert!(
+            sql.contains("* rag_path_prior(c.path) AS score")
+                && sql.contains("ORDER BY score DESC"),
+            "the prior is part of the score the ORDER BY sorts, before LIMIT:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn the_prior_function_applies_the_domain_multipliers_to_a_stored_path() {
+        let connection = database();
+        let prior = |path: &str| -> f64 {
+            connection
+                .query_row("SELECT rag_path_prior(?1)", [path], |row| row.get(0))
+                .expect("prior call")
+        };
+        assert_eq!(prior("docs/guide.md"), 1.15);
+        assert_eq!(prior("tests/a.rs"), 0.7);
+        assert_eq!(prior("src/lib.rs"), 1.0);
+        assert_eq!(prior("a/../b.rs"), 1.0, "an unsafe stored path is neutral");
     }
 
     #[test]

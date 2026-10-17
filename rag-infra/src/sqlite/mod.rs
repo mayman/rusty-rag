@@ -312,6 +312,7 @@ fn connect_reader(target: &str) -> rusqlite::Result<Connection> {
     connection.busy_timeout(READER_BUSY_TIMEOUT)?;
     connection.pragma_update(None, "cache_size", READER_CACHE_KIB)?;
     search::register_path_glob(&connection)?;
+    search::register_path_prior(&connection)?;
     Ok(connection)
 }
 

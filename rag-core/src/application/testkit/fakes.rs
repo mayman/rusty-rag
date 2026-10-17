@@ -24,6 +24,7 @@ use crate::domain::index_versions::IndexVersions;
 use crate::domain::indexed_at::IndexedAt;
 use crate::domain::manifest::Manifest;
 use crate::domain::oid::{BlobOid, CommitId};
+use crate::domain::path_prior::path_prior;
 use crate::domain::query::{Query, QueryMode};
 use crate::domain::repo_path::RepoPath;
 use crate::domain::scored_chunk::ScoredChunk;
@@ -464,7 +465,7 @@ impl ChunkSearcher for InMemoryStore {
             .filter_map(|(chunk, fields)| {
                 score(query, mode, fields).map(|score| ScoredChunk {
                     chunk: chunk.clone(),
-                    score,
+                    score: score * path_prior(&chunk.path),
                 })
             })
             .collect();

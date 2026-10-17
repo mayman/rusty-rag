@@ -17,6 +17,7 @@ pub mod line_range;
 pub mod manifest;
 pub mod oid;
 pub mod path_glob;
+pub mod path_prior;
 pub mod query;
 pub mod repo_path;
 pub mod scored_chunk;

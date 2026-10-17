@@ -269,6 +269,54 @@ const CASES: &[Case] = &[
             false,
         )
     },
+    plain(
+        "docs before tests (heading + prose)",
+        "lease renewal",
+        "widgets",
+        "docs/guide/leases.md",
+        Want::Top1,
+        true,
+    ),
+    plain(
+        "docs before tests (*.spec.ts)",
+        "circuit breaker",
+        "widgets",
+        "docs/api/circuit_breaker.md",
+        Want::Top1,
+        true,
+    ),
+    plain(
+        "docs before tests (*_test.go)",
+        "graceful shutdown",
+        "widgets",
+        "docs/guide/shutdown.md",
+        Want::Top1,
+        true,
+    ),
+    plain(
+        "docs before tests (tests/ directory)",
+        "pagination cursor",
+        "widgets",
+        "docs/api/pagination.md",
+        Want::Top1,
+        true,
+    ),
+    plain(
+        "test file is the only match",
+        "LEASE_TEST_SENTINEL",
+        "widgets",
+        "tests/test_leases.py",
+        Want::Top1,
+        true,
+    ),
+    plain(
+        "test file is the only match",
+        "invoice_total_of_no_items_is_zero",
+        "widgets",
+        "tests/test_billing.py",
+        Want::Top1,
+        true,
+    ),
 ];
 
 fn clock() -> FixedClock {
@@ -436,7 +484,7 @@ fn the_fixed_corpus_indexes_the_expected_files_and_skips_the_noise() {
             },
         ]
     );
-    assert_eq!(corpus::DOCS.len(), 26);
+    assert_eq!(corpus::DOCS.len(), 34);
 }
 
 #[test]

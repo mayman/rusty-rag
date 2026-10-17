@@ -1475,6 +1475,7 @@ pub fn contract_chunk_search<
     rewritten_fields_are_what_search_matches(&loaded(&make()));
     replaced_and_removed_files_are_no_longer_found(&loaded(&make()));
     removing_a_source_empties_its_search_results(&loaded(&make()));
+    documentation_outranks_tests_at_equal_relevance(&make());
     at_most_two_hits_per_file(&make());
     one_file_with_many_matching_chunks_pages_cleanly(&make());
     hostile_queries_never_error(&loaded(&make()));
@@ -2116,6 +2117,55 @@ fn removing_a_source_empties_its_search_results<S: ChunkStore + ChunkSearcher>(c
     let empty = run(c.store, "parse_config", QueryMode::And);
     assert!(empty.hits.is_empty() && empty.revisions.is_empty());
     assert_eq!(empty.total_matches, 0);
+}
+
+/// The path prior (`domain::path_prior`) is part of the score: at equal raw
+/// relevance documentation beats a test even though the path tie-break would put the
+/// test first, the adjustment applies before the limit (one slot goes to the doc),
+/// and a test that is the only match is still found.
+fn documentation_outranks_tests_at_equal_relevance<
+    S: ChunkStore + SourceRepository + ChunkSearcher,
+>(
+    store: &S,
+) {
+    let s = source_id("one");
+    first_index(
+        store,
+        "one",
+        vec![
+            file(&s, "a/tests/prior.rs", "priorneedle", 1),
+            file(&s, "z/docs/prior.md", "priorneedle", 2),
+            file(&s, "only/tests/solo.rs", "soloneedle", 3),
+        ],
+    );
+
+    let both = search(store, "priorneedle", QueryMode::And);
+    assert_eq!(
+        paths_of(&both),
+        ["z/docs/prior.md", "a/tests/prior.rs"],
+        "the documentation outranks the test"
+    );
+    assert!(both[0].score > both[1].score, "the score carries the prior");
+
+    let one = store
+        .search(
+            &query("priorneedle"),
+            QueryMode::And,
+            &SearchFilters::default(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        paths_of(&one.hits),
+        ["z/docs/prior.md"],
+        "the prior applies before the limit"
+    );
+
+    assert_eq!(
+        paths_of(&search(store, "soloneedle", QueryMode::And)),
+        ["only/tests/solo.rs"],
+        "a test that is the only match still appears"
+    );
 }
 
 fn at_most_two_hits_per_file<S: ChunkStore + SourceRepository + ChunkSearcher>(store: &S) {
