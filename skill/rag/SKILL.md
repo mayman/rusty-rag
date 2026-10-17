@@ -30,7 +30,7 @@ rag update [name]                  # only when the user asks (no name = all)
 rag remove <name>                  # only when the user asks
 rag reindex [name]                 # only when the user asks (no name = all)
 ```
-- `--repo` accepts the source `name` from `rag list` (preferred) or its `host/owner/name` slug. `--repo` and `--lang` may repeat.
+- `--repo` accepts the source `name` from `rag list` (preferred; by default the repo's last path segment, e.g. `serde`, or `owner/name` if that was taken), the `host/owner/name` slug, or any unique `owner/name` suffix of it. `--repo` and `--lang` may repeat.
 - Keep `-k` small. Do not raise `-k` to see more: page with `--offset` (below).
 - Quote any path argument. A first `rag add` of a large repo can take minutes; run it in the background and poll `rag list`.
 
