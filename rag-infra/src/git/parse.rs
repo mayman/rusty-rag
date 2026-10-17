@@ -210,7 +210,7 @@ mod tests {
         let output = format!("{OID} blob 0\n\n").into_bytes();
         assert_eq!(
             parse_batch(&output, std::slice::from_ref(&oid)).unwrap(),
-            [Vec::new()]
+            [Vec::<u8>::new()]
         );
         let cut = format!("{OID} blob 10\nabc").into_bytes();
         assert!(parse_batch(&cut, &[oid]).is_err());
