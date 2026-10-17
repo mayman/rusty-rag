@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use rag_core::application::add_source::{AddRequest, AddSource};
+use rag_core::application::doctor::{Catalog, Doctor, DoctorRequest};
 use rag_core::application::dto::{ListResponse, SearchRequest};
 use rag_core::application::error::{AppError, Scrubbed, StorageError};
 use rag_core::application::indexer::DEFAULT_LOCK_WAIT;
@@ -19,6 +20,7 @@ use rag_core::application::update_source::{UpdateRequest, UpdateSource};
 use rag_infra::clock::SystemClock;
 use rag_infra::config::{ConfigError, DataLayout};
 use rag_infra::deadline::Deadline;
+use rag_infra::diagnostics::SystemDiagnostics;
 use rag_infra::git::SystemGitClient;
 use rag_infra::lock::FileOperationLock;
 use rag_infra::sqlite::SqliteStore;
@@ -26,7 +28,7 @@ use rag_infra::sqlite::SqliteStore;
 use crate::cli::Command;
 use crate::location::resolve_target;
 use crate::output::error::EXIT_OK;
-use crate::output::{list, report, search, show};
+use crate::output::{doctor, list, report, search, show};
 use crate::progress::StderrProgress;
 
 /// How a response is written.
@@ -130,6 +132,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
             }))
         }
         Command::List => run_list(&layout, mode),
+        Command::Doctor { integrity } => run_doctor(&layout, integrity, mode),
         Command::Add { target, name } => {
             let location = resolve_target(&target)?;
             let request = AddRequest { location, name };
@@ -225,6 +228,26 @@ fn run_search(
             let response = search::fit_to_budget(response, request.max_chars);
             crate::output::human::render_search_human(&response)
         }
+    }))
+}
+
+/// `rag doctor`: looks, never changes. The database is opened read-only and only when
+/// it exists; a database that cannot be opened is a finding in the report.
+fn run_doctor(layout: &DataLayout, integrity: bool, mode: Mode) -> Result<Executed, AppError> {
+    let diagnostics = SystemDiagnostics::new(layout.clone());
+    let store = SqliteStore::open_for_read(layout.root());
+    let catalog = match &store {
+        Ok(store) => Ok(Catalog {
+            sources: store,
+            chunks: store,
+        }),
+        Err(error) => Err(error.clone()),
+    };
+    let response =
+        Doctor::new(&SystemClock, &diagnostics, catalog).execute(&DoctorRequest { integrity })?;
+    Ok(Executed::ok(match mode {
+        Mode::Json => doctor::render_doctor_json(&response),
+        Mode::Human => doctor::render_doctor_human(&response),
     }))
 }
 

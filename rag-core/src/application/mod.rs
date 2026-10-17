@@ -2,6 +2,7 @@
 //! Depends on the domain layer only.
 
 pub mod add_source;
+pub mod doctor;
 pub mod dto;
 pub mod error;
 pub mod index_pipeline;

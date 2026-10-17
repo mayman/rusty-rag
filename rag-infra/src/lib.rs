@@ -5,6 +5,7 @@
 pub mod clock;
 pub mod config;
 pub mod deadline;
+pub mod diagnostics;
 pub mod git;
 pub mod lock;
 pub mod sqlite;

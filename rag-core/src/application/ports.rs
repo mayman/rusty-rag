@@ -321,6 +321,70 @@ pub trait GitClient: Send + Sync {
     fn remove_checkout(&self, source: &SourceId) -> Result<(), GitError>;
 }
 
+/// What the host knows about the database file, as `rag doctor` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DatabaseFacts {
+    pub exists: bool,
+    pub size_bytes: u64,
+    /// Size of the write-ahead log beside the database; 0 when there is none.
+    pub wal_bytes: u64,
+    /// The outcome of the integrity check when it was asked for: `ok`, or the
+    /// problems found, in one line.
+    pub integrity: Option<String>,
+}
+
+/// What the host knows about `git`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GitFacts {
+    /// `git` could be started.
+    pub on_path: bool,
+    /// The first line of `git --version`, when it ran.
+    pub version_text: Option<String>,
+}
+
+/// Whether the operation lock of a source is taken right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockState {
+    Free,
+    /// Held; the operation the holder runs, when it said.
+    Held(Option<String>),
+}
+
+/// Files and directories nobody owns, counted and never deleted by `rag doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Leftovers {
+    /// Entries in the scratch directory (clone staging, trash).
+    pub tmp_entries: usize,
+    /// Clone directories that no registered source owns.
+    pub unregistered_checkouts: usize,
+}
+
+/// Read-only questions about the data directory and the machine that only the host
+/// can answer. Nothing here creates, changes, or deletes anything.
+pub trait Diagnostics: Send + Sync {
+    /// The data directory, for display (`/` as the separator).
+    fn data_dir(&self) -> String;
+
+    /// `Err` when the data directory exists but cannot be read. A directory that does
+    /// not exist yet is fine: nothing has been added.
+    fn check_data_dir(&self) -> Result<(), StorageError>;
+
+    /// The database file; `check_integrity` also runs SQLite's integrity check.
+    fn database(&self, check_integrity: bool) -> DatabaseFacts;
+
+    fn git(&self) -> GitFacts;
+
+    /// The clone of `source` is in place.
+    fn checkout_present(&self, source: &SourceId) -> bool;
+
+    /// A non-blocking look at the operation lock of `source`.
+    fn operation_lock(&self, source: &SourceId) -> LockState;
+
+    /// Counts the leftovers; `registered_checkouts` are the checkout directory names
+    /// (`SourceId::checkout_dir_name`) the catalog owns.
+    fn leftovers(&self, registered_checkouts: &[String]) -> Leftovers;
+}
+
 /// Proof that the operation lock of one source is held. The lock is released when
 /// the guard is dropped.
 pub struct LockGuard {

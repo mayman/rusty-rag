@@ -251,7 +251,7 @@ pub enum AppError {
 }
 
 /// A word safe to paste into a shell as one argument: quoted unless it is plain.
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     let plain = !text.is_empty()
         && text
             .chars()

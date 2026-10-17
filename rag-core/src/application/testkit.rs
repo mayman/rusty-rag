@@ -8,12 +8,14 @@
 //! older build would have left it.
 
 mod contracts;
+mod diagnostics;
 mod fakes;
 
 pub use contracts::{
     contract_chunk_search, contract_chunk_store, contract_commit_race, contract_operation_lock,
     contract_source_repository, StampStoredVersions,
 };
+pub use diagnostics::FakeDiagnostics;
 pub use fakes::{FakeGitClient, FakeOperationLock, FixedClock, InMemoryStore};
 
 #[cfg(test)]

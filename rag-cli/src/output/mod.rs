@@ -4,6 +4,7 @@
 //! cases in `rag-core`; this layer only renders them. Chunk text is untrusted
 //! data: JSON escapes it, and human output strips control characters.
 
+pub mod doctor;
 pub mod error;
 pub mod human;
 pub mod list;

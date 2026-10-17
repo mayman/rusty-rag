@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use rag_core::application::error::StorageError;
-use rag_core::application::ports::{LockGuard, OperationLock};
+use rag_core::application::ports::{LockGuard, LockState, OperationLock};
 use rag_core::domain::source_id::SourceId;
 
 /// How often a waiter tries again.
@@ -79,6 +79,23 @@ impl FileOperationLock {
             }
             Err(TryLockError::WouldBlock) => Err(StorageError::Busy),
             Err(TryLockError::Error(error)) => Err(failed(error)),
+        }
+    }
+
+    /// Whether the lock called `name` is held right now, looked at without waiting
+    /// and without creating anything: a lock that was never taken has no file and is
+    /// free. The probe takes a shared lock for an instant, so a holder of the
+    /// exclusive lock is seen and nobody else is kept out for longer than that.
+    pub fn state_of(&self, name: &str) -> LockState {
+        let path = self.dir.join(format!("{name}.lock"));
+        let Ok(file) = OpenOptions::new().read(true).open(path) else {
+            return LockState::Free;
+        };
+        match file.try_lock_shared() {
+            Ok(()) => LockState::Free,
+            Err(TryLockError::WouldBlock) => LockState::Held(self.holder_operation(name)),
+            // Cannot tell: the lock is not shown as held.
+            Err(TryLockError::Error(_)) => LockState::Free,
         }
     }
 

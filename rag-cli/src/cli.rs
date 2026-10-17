@@ -118,6 +118,12 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Check the installation, read-only: data directory, database, git, and every source.
+    Doctor {
+        /// Also run SQLite's integrity check of the database (slow on a large index).
+        #[arg(long)]
+        integrity: bool,
+    },
 }
 
 /// `S-E` as two 1-based line numbers.
@@ -291,6 +297,22 @@ mod tests {
         assert!(help.contains("default 100"), "{help}");
         assert!(help.contains("0 = no limit"), "{help}");
         assert!(help.contains("re-run"), "{help}");
+    }
+
+    #[test]
+    fn doctor_takes_an_optional_integrity_flag() {
+        let Command::Doctor { integrity } = parse(&["doctor"]).unwrap().command else {
+            panic!("not a doctor");
+        };
+        assert!(!integrity);
+        let Command::Doctor { integrity } = parse(&["doctor", "--integrity", "--human"])
+            .unwrap()
+            .command
+        else {
+            panic!("not a doctor");
+        };
+        assert!(integrity);
+        assert!(parse(&["doctor", "extra"]).is_err());
     }
 
     #[test]

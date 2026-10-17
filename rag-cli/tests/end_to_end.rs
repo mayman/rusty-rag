@@ -1151,3 +1151,124 @@ fn a_panic_free_run_prints_phase_lines_and_never_a_credential_on_stderr() {
     assert_eq!(phases, ["resolve", "fetch", "list", "read", "commit"]);
     assert!(response["index"]["phases"][0]["elapsed_ms"].is_u64());
 }
+
+// --- doctor, list hint, reindex --no-wait, --deadline ----------------------------------
+
+#[test]
+fn an_empty_list_carries_a_hint_for_the_user() {
+    let rag = Rag::new();
+    let response = rag.json(&["list"], 0);
+    assert_eq!(
+        response["hint"],
+        "no sources are indexed; ask the user to run `rag add <url|path>`"
+    );
+}
+
+#[test]
+fn doctor_on_a_fresh_machine_is_healthy_and_creates_nothing() {
+    let rag = Rag::new();
+
+    let report = rag.json(&["doctor"], 0);
+
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["database"]["exists"], false);
+    assert_eq!(report["sources"], serde_json::json!([]));
+    assert_eq!(report["git"]["on_path"], true);
+    assert!(!rag.data_dir().exists(), "doctor is read-only");
+}
+
+#[test]
+fn doctor_reports_each_source_and_the_state_of_its_files() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    rag.add(&upstream);
+
+    let report = rag.json(&["doctor", "--integrity"], 0);
+
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["database"]["exists"], true);
+    assert_eq!(report["database"]["integrity"], "ok");
+    assert!(report["database"]["size_bytes"].as_u64().unwrap() > 0);
+    let source = &report["sources"][0];
+    assert_eq!(source["name"], "project");
+    assert_eq!(source["status"], "ready");
+    assert_eq!(source["checkout"], "present");
+    assert_eq!(source["stale_versions"], false);
+    assert_eq!(source["operation_lock"], "free");
+    assert!(source["chunks"].as_u64().unwrap() >= 2);
+    assert!(report["data_dir"].as_str().unwrap().ends_with("/data"));
+}
+
+#[test]
+fn doctor_sees_a_held_lock_a_missing_clone_and_counts_leftovers_without_deleting_them() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    rag.add(&upstream);
+    let repos = rag.data_dir().join("repos");
+    let clone = std::fs::read_dir(&repos)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::rename(&clone, repos.join("..").join("moved-away")).unwrap();
+    std::fs::create_dir_all(repos.join("orphan")).unwrap();
+    std::fs::write(rag.data_dir().join("tmp").join("trash-x"), b"").unwrap();
+    let held = rag.hold_lock_of_only_source();
+
+    let report = rag.json(&["doctor"], 0);
+
+    drop(held);
+    assert_eq!(report["ok"], false);
+    let source = &report["sources"][0];
+    assert_eq!(source["checkout"], "missing");
+    assert_eq!(source["operation_lock"], "held");
+    assert_eq!(report["leftovers"]["unregistered_checkouts"], 1);
+    assert!(report["leftovers"]["tmp_entries"].as_u64().unwrap() >= 1);
+    assert!(!report["warnings"].as_array().unwrap().is_empty());
+    assert!(repos.join("orphan").exists(), "doctor deletes nothing");
+    assert!(rag.data_dir().join("tmp").join("trash-x").exists());
+}
+
+#[test]
+fn doctor_human_is_plain_text_with_the_warnings_listed() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    rag.add(&upstream);
+    std::fs::create_dir_all(rag.data_dir().join("repos").join("orphan")).unwrap();
+
+    let output = rag.run(&["doctor", "--human"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let shown = text(&output.stdout);
+    assert!(!shown.contains('\u{1b}'), "{shown}");
+    assert!(shown.contains("project"), "{shown}");
+    assert!(shown.contains("warning:"), "{shown}");
+    assert!(shown.contains("git"), "{shown}");
+}
+
+#[test]
+fn doctor_fails_only_when_the_data_directory_cannot_be_read() {
+    let rag = Rag::new();
+    std::fs::write(rag.data_dir(), b"a file where the directory should be").unwrap();
+    let report = rag.json(&["doctor"], 1);
+    assert_eq!(report["error"]["code"], "error");
+}
+
+#[test]
+fn reindex_honours_no_wait_and_a_deadline_of_zero_means_no_limit() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    rag.add(&upstream);
+    let held = rag.hold_lock_of_only_source();
+
+    let started = std::time::Instant::now();
+    let error = rag.json(&["reindex", "project", "--no-wait"], 6);
+    drop(held);
+
+    assert_eq!(error["error"]["code"], "index_locked");
+    assert!(started.elapsed() < Duration::from_secs(10), "did not wait");
+    let done = rag.json(&["reindex", "--deadline", "0"], 0);
+    assert_eq!(done["sources"][0]["result"], "up_to_date");
+}
