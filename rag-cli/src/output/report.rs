@@ -47,6 +47,18 @@ fn index_summary(report: &IndexReport) -> String {
     if !skipped.is_empty() {
         text += &format!("; skipped: {}", skipped.join(", "));
     }
+    if !report.skipped_secret_paths.is_empty() {
+        let paths: Vec<String> = report
+            .skipped_secret_paths
+            .iter()
+            .map(|path| cell(path))
+            .collect();
+        text += &format!(
+            "; left out as secrets ({}): {}",
+            paths.len(),
+            paths.join(", ")
+        );
+    }
     text
 }
 
@@ -68,7 +80,10 @@ pub fn render_add_human(response: &AddResponse) -> String {
 fn update_line(entry: &UpdateEntry) -> String {
     let name = cell(&entry.name);
     if let Some(error) = &entry.error {
-        return format!("{name}: failed: {}\n", cell(&error.message));
+        return match entry.result.as_str() {
+            "failed" => format!("{name}: failed: {}\n", cell(&error.message)),
+            _ => format!("{name}: skipped, {}\n", cell(&error.message)),
+        };
     }
     let Some(report) = &entry.index else {
         return format!("{name}: {}\n", entry.result);
@@ -100,7 +115,11 @@ pub fn render_remove_human(response: &RemoveResponse) -> String {
         cell(&response.repo)
     );
     if !response.checkout_removed {
-        out += "the local clone could not be deleted now; it is cleaned up later\n";
+        let why = response
+            .checkout_error
+            .as_deref()
+            .map_or_else(String::new, |why| format!(" ({})", cell(why)));
+        out += &format!("the local clone could not be deleted now{why}; it is cleaned up later\n");
     }
     out
 }
@@ -108,7 +127,10 @@ pub fn render_remove_human(response: &RemoveResponse) -> String {
 fn reindex_line(entry: &ReindexEntry) -> String {
     let name = cell(&entry.name);
     match &entry.error {
-        Some(error) => format!("{name}: failed: {}\n", cell(&error.message)),
+        Some(error) if entry.result == "failed" => {
+            format!("{name}: failed: {}\n", cell(&error.message))
+        }
+        Some(error) => format!("{name}: skipped, {}\n", cell(&error.message)),
         None => format!("{name}: {}, {} chunks\n", entry.result, entry.chunks),
     }
 }
@@ -263,6 +285,76 @@ mod tests {
         removed.checkout_removed = false;
         assert!(render_remove_human(&removed).contains("cleaned up later"));
         assert!(render_remove_json(&removed).contains(r#""checkout_removed":false"#));
+    }
+
+    #[test]
+    fn a_skipped_source_is_not_called_a_failure() {
+        let mut busy = entry("skipped_busy", Some(COMMIT_A), None);
+        busy.error = Some(ErrorBody {
+            code: "index_locked".to_owned(),
+            message: "another rag process is running `add` on this source".to_owned(),
+            hint: None,
+        });
+        let text = render_update_human(&updates(vec![busy], None));
+        assert_eq!(
+            text,
+            "r: skipped, another rag process is running `add` on this source\n"
+        );
+    }
+
+    #[test]
+    fn a_skipped_reindex_is_not_called_a_failure() {
+        let response = ReindexResponse {
+            schema_version: SCHEMA_VERSION,
+            sources: vec![ReindexEntry {
+                repo: "github.com/o/r".to_owned(),
+                name: "r".to_owned(),
+                result: "skipped_removed".to_owned(),
+                chunks: 0,
+                index: None,
+                error: Some(ErrorBody {
+                    code: "not_found".to_owned(),
+                    message: "the source was removed while the command ran".to_owned(),
+                    hint: None,
+                }),
+            }],
+            failed: 0,
+            message: None,
+        };
+        assert_eq!(
+            render_reindex_human(&response),
+            "r: skipped, the source was removed while the command ran\n"
+        );
+    }
+
+    #[test]
+    fn secret_skipped_files_are_listed_by_path() {
+        let mut with_secrets = report(COMMIT_A);
+        with_secrets.skipped_secret_paths = vec![".env".to_owned(), "keys/id_rsa".to_owned()];
+        let text = render_add_human(&AddResponse {
+            index: with_secrets,
+            ..added(false)
+        });
+        assert!(
+            text.contains("left out as secrets (2): .env, keys/id_rsa"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_clone_that_could_not_be_deleted_says_why() {
+        let removed = RemoveResponse {
+            schema_version: SCHEMA_VERSION,
+            repo: "github.com/o/r".to_owned(),
+            name: "r".to_owned(),
+            checkout_removed: false,
+            checkout_error: Some("access denied".to_owned()),
+        };
+        let text = render_remove_human(&removed);
+        assert!(
+            text.contains("could not be deleted now (access denied)"),
+            "{text}"
+        );
     }
 
     #[test]

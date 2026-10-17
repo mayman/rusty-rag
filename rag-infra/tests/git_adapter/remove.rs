@@ -132,3 +132,64 @@ fn collect_garbage_leaves_the_staging_directory_of_a_source_that_is_locked() {
     sandbox.client.collect_garbage(&locks);
     assert!(!staging.exists());
 }
+
+#[test]
+fn unregistered_checkouts_are_removed_and_registered_ones_kept() {
+    let upstream = Upstream::with_files(&[("a.txt", b"1")]);
+    let sandbox = Sandbox::new();
+    let kept = upstream.source_id();
+    sandbox
+        .client
+        .clone_shallow(&kept, &upstream.location(), &main_ref())
+        .unwrap();
+    let orphan = sandbox.layout.repos_dir().join("0123456789ab");
+    std::fs::create_dir_all(orphan.join("objects")).unwrap();
+    std::fs::write(orphan.join("objects").join("junk"), "x").unwrap();
+
+    let kept_name = kept.checkout_dir_name().to_owned();
+    sandbox
+        .client
+        .collect_unregistered_checkouts(&lock_for(&sandbox), &|name| name == kept_name);
+
+    assert!(!orphan.exists());
+    assert!(sandbox.checkout_dir(&kept).is_dir());
+}
+
+#[test]
+fn an_unregistered_checkout_whose_lock_is_held_is_left_alone() {
+    let sandbox = Sandbox::new();
+    let locks = lock_for(&sandbox);
+    let busy = sandbox.layout.repos_dir().join("aaaaaaaaaaaa");
+    std::fs::create_dir_all(&busy).unwrap();
+    let guard = locks.try_acquire_named("aaaaaaaaaaaa");
+
+    sandbox
+        .client
+        .collect_unregistered_checkouts(&locks, &|_| false);
+    assert!(busy.is_dir(), "an add may be cloning it right now");
+
+    drop(guard);
+    sandbox
+        .client
+        .collect_unregistered_checkouts(&locks, &|_| false);
+    assert!(!busy.exists());
+}
+
+#[test]
+fn the_registry_is_asked_only_after_the_lock_is_taken() {
+    let sandbox = Sandbox::new();
+    let locks = lock_for(&sandbox);
+    let dir = sandbox.layout.repos_dir().join("bbbbbbbbbbbb");
+    std::fs::create_dir_all(&dir).unwrap();
+    let other = lock_for(&sandbox);
+    sandbox
+        .client
+        .collect_unregistered_checkouts(&locks, &|name| {
+            assert!(
+                other.try_acquire_named(name).is_err(),
+                "the lock is held while the registry is consulted"
+            );
+            true
+        });
+    assert!(dir.is_dir());
+}

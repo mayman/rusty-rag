@@ -19,6 +19,11 @@ pub fn classify(stderr: &str) -> GitError {
 
     if has(&["index.lock", "shallow.lock", "another git process"]) {
         GitError::Busy
+    } else if has(&["dubious ownership", "safe.directory"]) {
+        GitError::Failed(
+            "git refused to open the repository because its folder is owned by another user (\"dubious ownership\"); ask the user to mark it safe with `git config --global --add safe.directory <folder>` or to copy the repository to a folder they own"
+                .into(),
+        )
     } else if has(&[
         "couldn't find remote ref",
         "does not appear to be a git repository",
@@ -95,6 +100,18 @@ mod tests {
             GitError::TooLarge(_) => "too_large",
             GitError::Failed(_) => "failed",
         }
+    }
+
+    #[test]
+    fn dubious_ownership_is_explained_and_names_the_way_out() {
+        let stderr = "fatal: detected dubious ownership in repository at 'C:/work/repo'\nTo add an exception for this directory, call:\n\n\tgit config --global --add safe.directory C:/work/repo";
+        let GitError::Failed(message) = classify(stderr) else {
+            panic!("a refused folder is a plain failure");
+        };
+        let message = message.to_string();
+        assert!(message.contains("owned by another user"), "{message}");
+        assert!(message.contains("safe.directory"), "{message}");
+        assert!(message.contains("ask the user"), "{message}");
     }
 
     #[test]

@@ -4,34 +4,20 @@
 
 use rag_core::application::dto::{ListResponse, SearchResponse, SourceSummary};
 use rag_core::application::error::AppError;
+use rag_core::domain::untrusted_text::sanitize_untrusted;
 
-/// Replaces control and invisible format characters with `?`. Newlines are kept.
+/// Repository text made safe for a terminal: control and invisible characters are
+/// replaced (`sanitize_untrusted`, the one rule the core also applies). Newlines and
+/// tabs are kept.
 pub fn terminal_safe(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '\n' => '\n',
-            c if c.is_control() || is_format(c) => '?',
-            c => c,
-        })
-        .collect()
+    sanitize_untrusted(text)
 }
 
-/// `terminal_safe` on one line: newlines become spaces, so a cell stays one line.
+/// `terminal_safe` on one line: newlines and tabs become spaces, so a cell stays one
+/// line and a table stays aligned.
 pub fn cell(text: &str) -> String {
-    terminal_safe(text).replace('\n', " ")
+    terminal_safe(text).replace(['\n', '\t'], " ")
 }
-
-/// Bidirectional controls, zero-width and invisible format characters.
-fn is_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-    )
-}
-
 /// Indent of snippet lines and of the detail lines under a result.
 const INDENT: &str = "    ";
 
@@ -77,6 +63,9 @@ pub fn render_search_human(response: &SearchResponse) -> String {
     if response.truncated {
         out += "output cut to the size budget: narrow the query or raise --max-chars\n";
     }
+    for notice in &response.notices {
+        out += &format!("notice: {}\n", cell(notice));
+    }
     if let Some(hint) = &response.hint {
         out += &format!("hint: {}\n", cell(hint));
     }
@@ -113,6 +102,17 @@ pub fn render_list_human(response: &ListResponse) -> String {
         line += &row[5];
         out += line.trim_end();
         out.push('\n');
+    }
+    for summary in &response.sources {
+        if let Some(error) = &summary.last_error {
+            out += &format!(
+                "{}: last error {} ago ({}): {}\n",
+                cell(&summary.name),
+                age(Some(error.age_seconds)),
+                cell(&error.code),
+                cell(&error.message)
+            );
+        }
     }
     out
 }
@@ -156,7 +156,9 @@ pub fn render_error_human(error: &AppError) -> String {
 mod tests {
     use super::{render_error_human, render_list_human, render_search_human, terminal_safe};
     use crate::output::test_support::{response, result, INDEXED_AT};
-    use rag_core::application::dto::{ListResponse, SearchResponse, SourceSummary, SCHEMA_VERSION};
+    use rag_core::application::dto::{
+        LastErrorDto, ListResponse, SearchResponse, SourceSummary, SCHEMA_VERSION,
+    };
     use rag_core::application::error::{AppError, StorageError};
     use rag_core::application::search::NO_MATCH_HINT;
     use rag_core::domain::git_location::GitLocation;
@@ -265,7 +267,7 @@ mod tests {
 
     #[test]
     fn terminal_safe_keeps_newlines_and_plain_text() {
-        assert_eq!(terminal_safe("a\nb\tc"), "a\nb?c");
+        assert_eq!(terminal_safe("a\nb\tc"), "a\nb\tc");
         assert_eq!(terminal_safe("hÃ©llo æ—¥æœ¬"), "hÃ©llo æ—¥æœ¬");
     }
 
@@ -326,6 +328,37 @@ x     github.com/o/x  cloning  -        -    0
         assert_eq!(text.lines().count(), 2, "{text}");
     }
 
+    #[test]
+    fn notices_come_before_the_hint() {
+        let mut page = response("alpha", vec![]);
+        page.notices = vec!["r is still being indexed".to_owned()];
+        page.hint = Some("ask the user".to_owned());
+        let text = render_search_human(&page);
+        assert!(
+            text.ends_with("notice: r is still being indexed\nhint: ask the user\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_source_shows_why_under_the_table() {
+        let mut broken = summary("r", "https://github.com/o/r", Some(INDEXED_AT), 2);
+        broken.last_error = Some(LastErrorDto {
+            code: "network_or_auth".to_owned(),
+            message: "git: operation timed out".to_owned(),
+            at: "2023-11-14T22:14:10Z".to_owned(),
+            age_seconds: 80,
+        });
+        let response = ListResponse {
+            schema_version: SCHEMA_VERSION,
+            sources: vec![broken],
+        };
+        let text = render_list_human(&response);
+        assert!(
+            text.ends_with("r: last error 1m ago (network_or_auth): git: operation timed out\n"),
+            "{text}"
+        );
+    }
     #[test]
     fn errors_show_the_message_and_the_hint() {
         assert_eq!(

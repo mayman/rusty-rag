@@ -14,6 +14,10 @@ pub struct Cli {
     /// JSON output (the default).
     #[arg(long, global = true, conflicts_with = "human", hide = true)]
     pub json: bool,
+    /// Fail at once, instead of waiting up to 20 seconds, when another process is
+    /// adding or updating the same source.
+    #[arg(long, global = true)]
+    pub no_wait: bool,
     #[command(subcommand)]
     pub command: Command,
 }

@@ -2,10 +2,15 @@
 //! command, runs the use case, and renders its response. No business rules live
 //! here; the use cases in `rag-core` own them.
 
+use std::time::Duration;
+
 use rag_core::application::add_source::{AddRequest, AddSource};
 use rag_core::application::dto::{ListResponse, SearchRequest, SCHEMA_VERSION};
 use rag_core::application::error::{AppError, Scrubbed, StorageError};
+use rag_core::application::indexer::DEFAULT_LOCK_WAIT;
 use rag_core::application::list_sources::ListSources;
+use rag_core::application::ports::SourceRepository;
+use rag_core::application::progress::Progress;
 use rag_core::application::reindex::{Reindex, ReindexRequest};
 use rag_core::application::remove_source::{RemoveRequest, RemoveSource};
 use rag_core::application::search::Search;
@@ -21,6 +26,7 @@ use crate::cli::Command;
 use crate::location::resolve_target;
 use crate::output::error::EXIT_OK;
 use crate::output::{list, report, search, show};
+use crate::progress::StderrProgress;
 
 /// How a response is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,18 +50,33 @@ impl Executed {
         }
     }
 
-    /// Success, except that `failed` sources make the exit code 1.
-    fn with_failures(stdout: String, failed: usize) -> Self {
-        Self {
-            stdout,
-            code: u8::from(failed > 0),
+    /// The output with the exit code the response decided on (`exit_code`).
+    fn with_code(stdout: String, code: u8) -> Self {
+        Self { stdout, code }
+    }
+}
+
+/// What the process was asked beyond the command itself.
+pub struct RunOptions<'a> {
+    /// Where the progress lines for stderr go; also measures the phases.
+    pub progress: &'a StderrProgress,
+    /// `--no-wait`: do not wait for another process working on the same source.
+    pub no_wait: bool,
+}
+
+impl RunOptions<'_> {
+    fn lock_wait(&self) -> Duration {
+        if self.no_wait {
+            Duration::ZERO
+        } else {
+            DEFAULT_LOCK_WAIT
         }
     }
 }
 
-/// Runs `command` against the data directory named by the environment. `progress`
-/// receives the lines meant for stderr.
-pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Executed, AppError> {
+/// Runs `command` against the data directory named by the environment.
+pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Executed, AppError> {
+    let progress: &dyn Progress = options.progress;
     let layout = DataLayout::from_environment().map_err(config_error)?;
     match command {
         Command::Search {
@@ -108,7 +129,9 @@ pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Exec
             let location = resolve_target(&target)?;
             let request = AddRequest { location, name };
             let writer = Writer::open(&layout)?;
-            progress(&format!("indexing {}", request.location));
+            options
+                .progress
+                .note(&format!("indexing {}", request.location));
             let response = AddSource::new(
                 &writer.store,
                 &writer.store,
@@ -116,6 +139,8 @@ pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Exec
                 &writer.locks,
                 &SystemClock,
             )
+            .with_progress(progress)
+            .with_lock_wait(options.lock_wait())
             .execute(&request)?;
             Ok(Executed::ok(match mode {
                 Mode::Json => report::render_add_json(&response),
@@ -125,7 +150,7 @@ pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Exec
         Command::Update { name } => {
             let request = name.map_or_else(UpdateRequest::all, |name| UpdateRequest::named(&name));
             let writer = Writer::open(&layout)?;
-            progress("updating and indexing");
+            options.progress.note("updating and indexing");
             let response = UpdateSource::new(
                 &writer.store,
                 &writer.store,
@@ -133,13 +158,15 @@ pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Exec
                 &writer.locks,
                 &SystemClock,
             )
+            .with_progress(progress)
+            .with_lock_wait(options.lock_wait())
             .execute(&request)?;
-            Ok(Executed::with_failures(
+            Ok(Executed::with_code(
                 match mode {
                     Mode::Json => report::render_update_json(&response),
                     Mode::Human => report::render_update_human(&response),
                 },
-                response.failed,
+                response.exit_code(),
             ))
         }
         Command::Remove { name } => {
@@ -156,7 +183,7 @@ pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Exec
             let request =
                 name.map_or_else(ReindexRequest::all, |name| ReindexRequest::named(&name));
             let writer = Writer::open(&layout)?;
-            progress("reindexing");
+            options.progress.note("reindexing");
             let response = Reindex::new(
                 &writer.store,
                 &writer.store,
@@ -164,13 +191,14 @@ pub fn run(command: Command, mode: Mode, progress: &dyn Fn(&str)) -> Result<Exec
                 &writer.locks,
                 &SystemClock,
             )
+            .with_progress(progress)
             .execute(&request)?;
-            Ok(Executed::with_failures(
+            Ok(Executed::with_code(
                 match mode {
                     Mode::Json => report::render_reindex_json(&response),
                     Mode::Human => report::render_reindex_human(&response),
                 },
-                response.failed,
+                response.exit_code(),
             ))
         }
     }
@@ -217,17 +245,28 @@ struct Writer {
 }
 
 impl Writer {
-    /// Creates the data directory if needed, collects leftover scratch space from
-    /// crashed runs, and opens the index for writing.
+    /// Creates the data directory if needed, opens the index for writing, and
+    /// collects leftovers of crashed or half-finished runs: scratch space, and
+    /// clones that no registered source owns.
     fn open(layout: &DataLayout) -> Result<Self, AppError> {
         layout.ensure_dirs().map_err(config_error)?;
         layout.verify_same_volume().map_err(config_error)?;
         let git = git_client(layout);
         let locks = FileOperationLock::new(layout.locks_dir());
-        git.collect_garbage(&locks);
         let store = SqliteStore::open_for_write(layout.root())?;
+        git.collect_garbage(&locks);
+        git.collect_unregistered_checkouts(&locks, &|hash| owns_checkout(&store, hash));
         Ok(Self { store, git, locks })
     }
+}
+
+/// Whether a registered source has the clone directory `hash`. When the catalog
+/// cannot be read the answer is yes: nothing is deleted on a guess.
+fn owns_checkout(sources: &dyn SourceRepository, hash: &str) -> bool {
+    sources.list().map_or(true, |all| {
+        all.iter()
+            .any(|source| source.id().checkout_dir_name() == hash)
+    })
 }
 
 fn git_client(layout: &DataLayout) -> SystemGitClient {

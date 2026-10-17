@@ -7,6 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use rag_core::application::error::StorageError;
 use rag_core::application::ports::OperationLock;
@@ -41,6 +42,64 @@ fn separate_instances_over_one_directory_exclude_each_other() {
     );
     drop(held);
     second.acquire(&source("a")).unwrap();
+}
+
+#[test]
+fn a_timed_out_wait_names_the_operation_in_progress() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = FileOperationLock::new(temp.path().join("locks"));
+    let second = FileOperationLock::new(temp.path().join("locks"));
+    let _held = first
+        .acquire_waiting(&source("a"), "add", Duration::ZERO)
+        .unwrap();
+    for wait in [Duration::ZERO, Duration::from_millis(60)] {
+        assert_eq!(
+            second
+                .acquire_waiting(&source("a"), "update", wait)
+                .unwrap_err(),
+            StorageError::locked_by("add")
+        );
+    }
+    assert_eq!(
+        second.acquire(&source("a")).unwrap_err(),
+        StorageError::Busy,
+        "a plain acquire stays Busy"
+    );
+}
+
+#[test]
+fn a_lock_taken_without_a_name_does_not_inherit_an_old_operation() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = FileOperationLock::new(temp.path().join("locks"));
+    drop(
+        lock.acquire_waiting(&source("a"), "add", Duration::ZERO)
+            .unwrap(),
+    );
+    let _held = lock.acquire(&source("a")).unwrap();
+    assert_eq!(
+        lock.acquire_waiting(&source("a"), "update", Duration::ZERO)
+            .unwrap_err(),
+        StorageError::Busy
+    );
+}
+
+#[test]
+fn a_wait_ends_as_soon_as_the_holder_lets_go() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("locks");
+    let holder = FileOperationLock::new(dir.clone());
+    let waiter = FileOperationLock::new(dir);
+    let held = holder.acquire(&source("a")).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+    let started = Instant::now();
+    waiter
+        .acquire_waiting(&source("a"), "update", Duration::from_secs(10))
+        .expect("the lock frees up while waiting");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    releaser.join().unwrap();
 }
 
 #[test]

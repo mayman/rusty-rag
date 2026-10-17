@@ -139,6 +139,35 @@ impl SystemGitClient {
         }
     }
 
+    /// Removes the directories of `repos` that no catalog row owns: what a removal
+    /// that could not delete its clone, or an add that never reached its first save,
+    /// left behind. `is_registered` gets the directory name (the checkout hash) and
+    /// answers from the catalog; it is asked only after the source's operation lock
+    /// is taken, and the lock is held while the directory is deleted, so a source
+    /// being added or removed by another process is never touched. Best effort.
+    pub fn collect_unregistered_checkouts(
+        &self,
+        locks: &FileOperationLock,
+        is_registered: &dyn Fn(&str) -> bool,
+    ) {
+        let Ok(entries) = std::fs::read_dir(&self.repos_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(_lock) = locks.try_acquire_named(&name) else {
+                continue;
+            };
+            if !is_registered(&name) {
+                let _ = self.remove_tree(&path);
+            }
+        }
+    }
+
     fn checkout_dir(&self, source: &SourceId) -> PathBuf {
         self.repos_dir.join(source.checkout_dir_name())
     }
