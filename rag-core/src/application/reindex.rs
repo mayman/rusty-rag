@@ -130,21 +130,24 @@ impl<'a> Reindex<'a> {
         if all.is_empty() {
             return Ok(Self::response(Vec::new(), Some(NO_SOURCES_MESSAGE)));
         }
-        let entries = all
-            .iter()
-            .map(|source| match self.reindex_one(source.id()) {
+        let mut entries = Vec::with_capacity(all.len());
+        for source in &all {
+            entries.push(match self.reindex_one(source.id()) {
                 Ok(Some(entry)) => entry,
                 Ok(None) => Self::unfinished_entry(
                     source,
                     "skipped_removed",
                     &AppError::NotFound("the source was removed while the command ran".into()),
                 ),
+                // The budget of the whole command is spent: stop, do not go on to
+                // the next source. The ones done are committed.
+                Err(error) if error.is_deadline() => return Err(error),
                 Err(error) if is_contention(&error) => {
                     Self::unfinished_entry(source, "skipped_busy", &error)
                 }
                 Err(error) => Self::unfinished_entry(source, "failed", &error),
-            })
-            .collect();
+            });
+        }
         Ok(Self::response(entries, None))
     }
 

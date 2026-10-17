@@ -113,6 +113,20 @@ mod tests {
     }
 
     #[test]
+    fn a_deadline_is_a_clean_json_error_with_exit_one_and_a_resume_hint() {
+        let error = AppError::DeadlineExceeded;
+        assert_eq!(exit_code(&error), 1);
+        assert_eq!(
+            render_error_json(&error),
+            concat!(
+                r#"{"error":{"code":"deadline_exceeded","#,
+                r#""message":"the time limit of this command (--deadline) ran out before it finished","#,
+                r#""hint":"re-run the same command to resume; the fetched data is kept"}}"#
+            )
+        );
+    }
+
+    #[test]
     fn a_conflict_exits_six_because_it_is_a_lost_race() {
         assert_eq!(exit_code(&AppError::Storage(StorageError::Conflict)), 6);
     }

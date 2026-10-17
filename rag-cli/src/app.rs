@@ -18,6 +18,7 @@ use rag_core::application::show_file::{ShowFile, ShowFileRequest};
 use rag_core::application::update_source::{UpdateRequest, UpdateSource};
 use rag_infra::clock::SystemClock;
 use rag_infra::config::{ConfigError, DataLayout};
+use rag_infra::deadline::Deadline;
 use rag_infra::git::SystemGitClient;
 use rag_infra::lock::FileOperationLock;
 use rag_infra::sqlite::SqliteStore;
@@ -62,6 +63,8 @@ pub struct RunOptions<'a> {
     pub progress: &'a StderrProgress,
     /// `--no-wait`: do not wait for another process working on the same source.
     pub no_wait: bool,
+    /// `--deadline`: the wall-clock budget of add, update, and reindex.
+    pub deadline: Deadline,
 }
 
 impl RunOptions<'_> {
@@ -108,7 +111,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
             max_chars,
         } => {
             let store = SqliteStore::open_for_read(layout.root())?;
-            let git = git_client(&layout);
+            let git = git_client(&layout, Deadline::none());
             let show_file = ShowFile::new(&store, &store, &git);
             let response = match (chunk, repo, path) {
                 (Some(id), _, _) => show_file.execute_chunk(&id, max_chars)?,
@@ -130,7 +133,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
         Command::Add { target, name } => {
             let location = resolve_target(&target)?;
             let request = AddRequest { location, name };
-            let writer = Writer::open(&layout)?;
+            let writer = Writer::open(&layout, options.deadline)?;
             options
                 .progress
                 .note(&format!("indexing {}", request.location));
@@ -151,7 +154,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
         }
         Command::Update { name } => {
             let request = name.map_or_else(UpdateRequest::all, |name| UpdateRequest::named(&name));
-            let writer = Writer::open(&layout)?;
+            let writer = Writer::open(&layout, options.deadline)?;
             options.progress.note("updating and indexing");
             let response = UpdateSource::new(
                 &writer.store,
@@ -172,7 +175,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
             ))
         }
         Command::Remove { name } => {
-            let writer = Writer::open(&layout)?;
+            let writer = Writer::open(&layout, Deadline::none())?;
             let response =
                 RemoveSource::new(&writer.store, &writer.store, &writer.git, &writer.locks)
                     .with_lock_wait(options.lock_wait())
@@ -185,7 +188,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
         Command::Reindex { name, all: _ } => {
             let request =
                 name.map_or_else(ReindexRequest::all, |name| ReindexRequest::named(&name));
-            let writer = Writer::open(&layout)?;
+            let writer = Writer::open(&layout, options.deadline)?;
             options.progress.note("reindexing");
             let response = Reindex::new(
                 &writer.store,
@@ -249,10 +252,10 @@ impl Writer {
     /// Creates the data directory if needed, opens the index for writing, and
     /// collects leftovers of crashed or half-finished runs: scratch space, and
     /// clones that no registered source owns.
-    fn open(layout: &DataLayout) -> Result<Self, AppError> {
+    fn open(layout: &DataLayout, deadline: Deadline) -> Result<Self, AppError> {
         layout.ensure_dirs().map_err(config_error)?;
         layout.verify_same_volume().map_err(config_error)?;
-        let git = git_client(layout);
+        let git = git_client(layout, deadline);
         let locks = FileOperationLock::new(layout.locks_dir());
         let store = SqliteStore::open_for_write(layout.root())?;
         git.collect_garbage(&locks);
@@ -270,8 +273,8 @@ fn owns_checkout(sources: &dyn SourceRepository, hash: &str) -> bool {
     })
 }
 
-fn git_client(layout: &DataLayout) -> SystemGitClient {
-    SystemGitClient::new(layout.repos_dir(), layout.tmp_dir())
+fn git_client(layout: &DataLayout, deadline: Deadline) -> SystemGitClient {
+    SystemGitClient::new(layout.repos_dir(), layout.tmp_dir()).with_deadline(deadline)
 }
 
 fn usage(message: &str) -> AppError {

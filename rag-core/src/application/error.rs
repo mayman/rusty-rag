@@ -342,6 +342,15 @@ impl AppError {
         }
     }
 
+    /// Whether the overall `--deadline` ran out. Not a failure of any source: the
+    /// stored index and the source row are as they were, and a re-run resumes.
+    pub fn is_deadline(&self) -> bool {
+        matches!(
+            self,
+            Self::DeadlineExceeded | Self::Git(GitError::DeadlineExceeded)
+        )
+    }
+
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Storage(StorageError::IndexMissing) => ErrorCode::IndexMissing,

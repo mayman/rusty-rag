@@ -26,7 +26,7 @@ use crate::application::index_pipeline::{IndexPipeline, IndexReport, IndexScope}
 use crate::application::ports::{
     ChunkStore, Clock, GitClient, ReindexedChunk, SourceRepository, TreeListing,
 };
-use crate::application::progress::{Phase, Progress, Timings, NO_PROGRESS};
+use crate::application::progress::{ensure_in_time, Phase, Progress, Timings, NO_PROGRESS};
 use crate::application::search::{ambiguous_source, find_sources, unknown_source};
 use crate::domain::git_ref::GitRef;
 use crate::domain::index_versions::IndexVersions;
@@ -185,7 +185,7 @@ impl<'a> Indexer<'a> {
     ) -> Result<T, AppError> {
         let outcome = work(source);
         if let Err(error) = &outcome {
-            if !is_contention(error) {
+            if !is_contention(error) && !error.is_deadline() {
                 source.record_failure(error.code().as_str(), &error.to_string(), self.clock.now());
                 // The original error is the one worth reporting.
                 let _ = self.sources.save(source);
@@ -200,7 +200,8 @@ impl<'a> Indexer<'a> {
         timings: &mut Timings,
         id: &SourceId,
         commit: &CommitId,
-    ) -> Result<TreeListing, GitError> {
+    ) -> Result<TreeListing, AppError> {
+        ensure_in_time(self.progress)?;
         timings.run(self.progress, Phase::List, "listing files", || {
             let listing = self.git.ls_tree(id, commit)?;
             self.progress
@@ -220,6 +221,7 @@ impl<'a> Indexer<'a> {
         recover: bool,
         fetch: impl Fn(&Source, &GitRef) -> Result<CommitId, GitError>,
     ) -> Result<CommitId, AppError> {
+        ensure_in_time(self.progress)?;
         let tracked = source
             .git_ref()
             .cloned()
@@ -266,6 +268,7 @@ impl<'a> Indexer<'a> {
     /// Registers `source` (a new one, or one that never finished indexing), clones
     /// its branch, and indexes everything the policy accepts.
     pub fn first_index(&self, mut source: Source) -> Result<Indexed, AppError> {
+        ensure_in_time(self.progress)?;
         self.sources.save(&source)?;
         let mut timings = Timings::new();
         let mut report = self.guarded(&mut source, |source| {
@@ -399,7 +402,6 @@ impl<'a> Indexer<'a> {
         let (mode, mut report) = self.guarded(&mut source, |source| {
             let at_indexed_commit = self
                 .list(&mut timings, source.id(), &indexed_commit)
-                .map_err(AppError::from)
                 .and_then(|listing| {
                     self.pipeline().run(
                         source,
@@ -620,5 +622,149 @@ mod tests {
             resolve_source(&store, "GitHub.com/O/R").unwrap().name(),
             "docs"
         );
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use crate::application::add_source::AddRequest;
+    use crate::application::error::{AppError, ErrorCode};
+    use crate::application::indexer_test_support::{DeadlineAfter, GitSpy, World, REMOTE};
+    use crate::application::ports::{ChunkStore, SourceRepository};
+    use crate::application::progress::Phase;
+    use crate::application::reindex::ReindexRequest;
+    use crate::application::testkit::StampStoredVersions;
+    use crate::application::update_source::UpdateRequest;
+    use crate::domain::index_versions::IndexVersions;
+    use crate::domain::source::SourceStatus;
+
+    #[test]
+    fn a_deadline_that_has_already_passed_stops_add_before_anything_is_done() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let spy = GitSpy::new(&w.git);
+        let late = DeadlineAfter::already_passed();
+
+        let error = w
+            .add_source_via(&spy)
+            .with_progress(&late)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap_err();
+
+        assert_eq!(error, AppError::DeadlineExceeded);
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+        assert!(
+            w.store.get(&w.id()).unwrap().is_none(),
+            "nothing registered"
+        );
+    }
+
+    #[test]
+    fn a_deadline_after_the_clone_leaves_the_source_resumable_and_a_rerun_finishes_it() {
+        let w = World::new();
+        let head = w.commit(&[("a.rs", "fn a() {}\n")]);
+        let late = DeadlineAfter::after(Phase::Fetch);
+
+        let error = w
+            .add_source_with(&late)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert_ne!(source.status(), SourceStatus::Failed, "not a failure");
+        assert!(
+            source.last_error().is_none(),
+            "no misleading error recorded"
+        );
+        assert!(source.indexed().is_none());
+
+        let spy = GitSpy::new(&w.git);
+        let response = w
+            .add_source_via(&spy)
+            .execute(&AddRequest::new(REMOTE))
+            .unwrap();
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.commit, head.to_string());
+        assert!(
+            !spy.called("default_branch"),
+            "the branch found by the first run is reused"
+        );
+    }
+
+    #[test]
+    fn a_deadline_during_an_update_keeps_the_last_good_index_and_records_no_failure() {
+        let w = World::new();
+        let first = w.commit(&[("a.rs", "fn a() {}\n")]);
+        w.add().unwrap();
+        let second = w.commit(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
+
+        for stop_after in [Phase::Fetch, Phase::List, Phase::Read] {
+            let late = DeadlineAfter::after(stop_after);
+            let error = w
+                .update_source()
+                .with_progress(&late)
+                .execute(&UpdateRequest::all())
+                .unwrap_err();
+
+            assert_eq!(error, AppError::DeadlineExceeded, "{stop_after:?}");
+            let source = w.store.get(&w.id()).unwrap().unwrap();
+            assert_eq!(source.status(), SourceStatus::Ready, "{stop_after:?}");
+            assert_eq!(source.indexed().unwrap().commit, first, "{stop_after:?}");
+            assert!(source.last_error().is_none(), "{stop_after:?}");
+            assert_eq!(
+                w.store.manifest(&w.id()).unwrap().len(),
+                1,
+                "{stop_after:?}"
+            );
+        }
+
+        let response = w.update_source().execute(&UpdateRequest::all()).unwrap();
+        assert_eq!(response.sources[0].result, "updated");
+        assert_eq!(
+            response.sources[0].index.as_ref().unwrap().commit,
+            second.to_string()
+        );
+    }
+
+    #[test]
+    fn a_deadline_stops_update_of_a_named_source_too() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        w.add().unwrap();
+        w.commit(&[("b.rs", "fn b() {}\n")]);
+        let late = DeadlineAfter::after(Phase::Fetch);
+
+        let error = w
+            .update_source()
+            .with_progress(&late)
+            .execute(&UpdateRequest::named("r"))
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+    }
+
+    #[test]
+    fn a_deadline_during_a_reindex_leaves_the_stale_index_for_the_rerun() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        w.add().unwrap();
+        let mut old = IndexVersions::current();
+        old.chunker = 0;
+        w.store.stamp_stored_versions(&w.id(), old);
+        let late = DeadlineAfter::after(Phase::List);
+
+        let error = w
+            .reindex()
+            .with_progress(&late)
+            .execute(&ReindexRequest::all())
+            .unwrap_err();
+
+        assert_eq!(error, AppError::DeadlineExceeded);
+        assert_eq!(w.store.stored_versions(&w.id()).unwrap(), Some(old));
+        let source = w.store.get(&w.id()).unwrap().unwrap();
+        assert!(source.last_error().is_none());
+        let response = w.reindex().execute(&ReindexRequest::all()).unwrap();
+        assert_eq!(response.sources[0].result, "full");
     }
 }

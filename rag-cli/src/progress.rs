@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use rag_core::application::error::Scrubbed;
 use rag_core::application::progress::{Phase, Progress};
+use rag_infra::deadline::Deadline;
 
 /// How long a phase may be silent before a heartbeat line says it is still running.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -57,6 +58,7 @@ impl Shared {
 pub struct StderrProgress {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
+    deadline: Deadline,
 }
 
 impl StderrProgress {
@@ -77,7 +79,14 @@ impl StderrProgress {
         Self {
             shared,
             worker: Some(worker),
+            deadline: Deadline::none(),
         }
+    }
+
+    /// Tells the use cases when the overall budget of the command is spent.
+    pub fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Prints a line of its own (scrubbed like every other).
@@ -145,6 +154,10 @@ impl Progress for StderrProgress {
             .map_or(0, |active| active.started.elapsed().as_millis());
         u64::try_from(elapsed).unwrap_or(u64::MAX)
     }
+
+    fn deadline_passed(&self) -> bool {
+        self.deadline.passed()
+    }
 }
 
 impl Drop for StderrProgress {
@@ -163,6 +176,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use rag_core::application::progress::{Phase, Progress};
+
+    use rag_infra::deadline::Deadline;
 
     use super::{Sink, StderrProgress};
 
@@ -262,6 +277,16 @@ mod tests {
         let before = lines.lock().unwrap().len();
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(lines.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn the_deadline_is_passed_only_once_its_time_is_up() {
+        let (progress, _lines) = progress(quiet());
+        assert!(!progress.deadline_passed(), "no deadline, no limit");
+        let progress = progress.with_deadline(Deadline::after(Duration::from_secs(3600)));
+        assert!(!progress.deadline_passed());
+        let progress = progress.with_deadline(Deadline::after(Duration::ZERO));
+        assert!(progress.deadline_passed());
     }
 
     #[test]

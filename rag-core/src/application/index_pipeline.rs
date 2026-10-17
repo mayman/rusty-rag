@@ -34,7 +34,9 @@ use crate::application::error::{AppError, GitError, StorageError};
 use crate::application::ports::{
     ChunkStore, Clock, GitClient, IndexChanges, IndexedFile, TreeListing, MAX_READ_BYTES,
 };
-use crate::application::progress::{Phase, PhaseTiming, Progress, Timings, NO_PROGRESS};
+use crate::application::progress::{
+    ensure_in_time, Phase, PhaseTiming, Progress, Timings, NO_PROGRESS,
+};
 use crate::domain::chunker::Chunker;
 use crate::domain::index_policy::{IndexPolicy, SkipReason, SourceTooLarge, MAX_CHUNKS_PER_SOURCE};
 use crate::domain::manifest::Manifest;
@@ -207,6 +209,7 @@ impl<'a> IndexPipeline<'a> {
         let batches = batches(&to_read);
         let batch_count = batches.len();
         for (number, batch) in batches.into_iter().enumerate() {
+            ensure_in_time(self.progress)?;
             let detail = format!("reading batch {}/{batch_count}", number + 1);
             let blobs = timings.run(self.progress, Phase::Read, &detail, || {
                 self.read_batch(id, &batch)
@@ -282,6 +285,7 @@ impl<'a> IndexPipeline<'a> {
             upserts,
             removals: removals.into_iter().collect(),
         };
+        ensure_in_time(self.progress)?;
         let mut next = source.clone();
         next.mark_ready(commit.clone(), self.clock.now());
         timings.run(self.progress, Phase::Commit, "writing the index", || {

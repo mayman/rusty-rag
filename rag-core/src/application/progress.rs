@@ -11,6 +11,8 @@
 
 use serde::Serialize;
 
+use crate::application::error::AppError;
+
 /// A step of an indexing operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -54,6 +56,23 @@ pub trait Progress: Send + Sync {
     /// that does not measure returns 0.
     fn end(&self, _phase: Phase) -> u64 {
         0
+    }
+
+    /// Whether the wall-clock budget of the whole command (`--deadline`) has run
+    /// out. The use cases ask between phases and before each batch of work, and stop
+    /// with `AppError::DeadlineExceeded` instead of starting more. The default has no
+    /// limit.
+    fn deadline_passed(&self) -> bool {
+        false
+    }
+}
+
+/// `Err(AppError::DeadlineExceeded)` when the budget of the command is spent.
+pub fn ensure_in_time(progress: &dyn Progress) -> Result<(), AppError> {
+    if progress.deadline_passed() {
+        Err(AppError::DeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 
@@ -118,7 +137,8 @@ impl Timings {
 mod tests {
     use std::sync::Mutex;
 
-    use super::{NoProgress, Phase, PhaseTiming, Progress, Timings, NO_PROGRESS};
+    use super::{ensure_in_time, NoProgress, Phase, PhaseTiming, Progress, Timings, NO_PROGRESS};
+    use crate::application::error::AppError;
 
     #[derive(Default)]
     struct Recorder {
@@ -163,6 +183,23 @@ mod tests {
         NoProgress.detail(Phase::Fetch, "y");
         assert_eq!(NoProgress.end(Phase::Fetch), 0);
         assert_eq!(NO_PROGRESS.end(Phase::List), 0);
+    }
+
+    #[test]
+    fn without_a_deadline_there_is_always_time_left() {
+        assert!(!NoProgress.deadline_passed());
+        assert_eq!(ensure_in_time(&NoProgress), Ok(()));
+    }
+
+    #[test]
+    fn a_passed_deadline_stops_the_operation_with_the_deadline_error() {
+        struct Late;
+        impl Progress for Late {
+            fn deadline_passed(&self) -> bool {
+                true
+            }
+        }
+        assert_eq!(ensure_in_time(&Late), Err(AppError::DeadlineExceeded));
     }
 
     #[test]

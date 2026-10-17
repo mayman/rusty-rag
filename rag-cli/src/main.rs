@@ -14,6 +14,7 @@ use clap::Parser;
 use rag_core::application::error::{AppError, Scrubbed};
 use rag_core::domain::git_location::scrub_credentials;
 use rag_core::domain::untrusted_text::sanitize_untrusted;
+use rag_infra::deadline::Deadline;
 
 mod app;
 mod cli;
@@ -62,10 +63,13 @@ fn execute(parsed: Result<Cli, clap::Error>, mode: Mode) -> ExitCode {
         Err(error) => return finish_parse_error(&error, mode),
     };
     let sink: Sink = Arc::new(|line| write_stderr(&format!("rag: {line}\n")));
-    let progress = StderrProgress::new(sink, HEARTBEAT);
+    // The budget starts now: it covers waiting for a lock, fetching, and indexing.
+    let deadline = Deadline::after_seconds(cli.deadline);
+    let progress = StderrProgress::new(sink, HEARTBEAT).with_deadline(deadline);
     let options = RunOptions {
         progress: &progress,
         no_wait: cli.no_wait,
+        deadline,
     };
     match app::run(cli.command, mode, &options) {
         Ok(executed) => {

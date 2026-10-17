@@ -3,6 +3,8 @@
 
 #[path = "git_adapter/clone.rs"]
 mod clone;
+#[path = "git_adapter/deadline.rs"]
+mod deadline;
 #[path = "git_adapter/remove.rs"]
 mod remove;
 #[path = "git_adapter/support.rs"]

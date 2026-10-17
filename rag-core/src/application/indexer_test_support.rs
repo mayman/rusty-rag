@@ -2,6 +2,7 @@
 //! fakes with one remote, and a spying git client.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -259,6 +260,44 @@ impl Progress for RecordingProgress {
             .unwrap()
             .push(format!("end:{}:", phase.as_str()));
         5
+    }
+}
+
+/// A progress whose deadline passes when a given phase ends (or has passed from the
+/// start), so a test can stop an operation at an exact point.
+pub struct DeadlineAfter {
+    phase: Option<Phase>,
+    passed: AtomicBool,
+}
+
+impl DeadlineAfter {
+    /// The deadline is over before anything starts.
+    pub fn already_passed() -> Self {
+        Self {
+            phase: None,
+            passed: AtomicBool::new(true),
+        }
+    }
+
+    /// The deadline passes the moment `phase` ends.
+    pub fn after(phase: Phase) -> Self {
+        Self {
+            phase: Some(phase),
+            passed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Progress for DeadlineAfter {
+    fn end(&self, phase: Phase) -> u64 {
+        if self.phase == Some(phase) {
+            self.passed.store(true, Ordering::SeqCst);
+        }
+        0
+    }
+
+    fn deadline_passed(&self) -> bool {
+        self.passed.load(Ordering::SeqCst)
     }
 }
 

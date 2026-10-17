@@ -35,6 +35,7 @@ use rag_core::domain::git_ref::GitRef;
 use rag_core::domain::oid::{BlobOid, CommitId};
 use rag_core::domain::source_id::SourceId;
 
+use crate::deadline::Deadline;
 use crate::lock::FileOperationLock;
 
 use self::classify::classify;
@@ -70,6 +71,7 @@ pub struct SystemGitClient {
     local_timeout: Duration,
     max_read_bytes: u64,
     isolated_config: bool,
+    deadline: Deadline,
 }
 
 impl SystemGitClient {
@@ -83,6 +85,7 @@ impl SystemGitClient {
             local_timeout: DEFAULT_LOCAL_TIMEOUT,
             max_read_bytes: MAX_READ_BYTES,
             isolated_config: false,
+            deadline: Deadline::none(),
         }
     }
 
@@ -99,6 +102,14 @@ impl SystemGitClient {
     /// settings, and proxies.
     pub fn with_isolated_config(mut self) -> Self {
         self.isolated_config = true;
+        self
+    }
+
+    /// Caps every git subprocess at the time left of the overall `deadline`: none
+    /// is started once it has passed, and a running one is killed when it does. The
+    /// error is `GitError::DeadlineExceeded`, not `Timeout`.
+    pub fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
         self
     }
 
@@ -216,7 +227,13 @@ impl SystemGitClient {
         timeout: Duration,
         max_stdout: usize,
     ) -> Result<Output, GitError> {
-        run_capped(command, input, timeout, max_stdout).map_err(|error| match error {
+        let allowed = match self.deadline.remaining() {
+            Some(left) if left.is_zero() => return Err(GitError::DeadlineExceeded),
+            Some(left) => timeout.min(left),
+            None => timeout,
+        };
+        run_capped(command, input, allowed, max_stdout).map_err(|error| match error {
+            RunError::TimedOut if self.deadline.passed() => GitError::DeadlineExceeded,
             RunError::TimedOut => GitError::Timeout,
             RunError::OutputTooLarge => {
                 GitError::TooLarge("git printed more output than the limit allows".into())
