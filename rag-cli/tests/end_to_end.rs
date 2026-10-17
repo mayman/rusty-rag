@@ -3,7 +3,13 @@
 //! user's real data directory or the network.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+use rag_core::application::ports::{OperationLock, SourceRepository};
+use rag_core::domain::index_versions::IndexVersions;
+use rag_infra::lock::FileOperationLock;
+use rag_infra::sqlite::SqliteStore;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -47,6 +53,42 @@ impl Upstream {
         std::fs::create_dir_all(&path).unwrap();
         git(&path, &["init", "-q", "-b", "main"]);
         Self { _temp: temp, path }
+    }
+
+    /// An initialised repository with no commits, in a directory called dir.
+    fn empty_in(dir: &str) -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join(dir);
+        std::fs::create_dir_all(&path).unwrap();
+        git(&path, &["init", "-q", "-b", "main"]);
+        Self { _temp: temp, path }
+    }
+
+    /// Records a file in the next commit without writing it to the work tree, so
+    /// names Windows cannot create (ux.rs) still get into the repository.
+    fn stage_blob(&self, name: &str, content: &str) {
+        let scratch = self.path.join(".blob-scratch");
+        std::fs::write(&scratch, content).unwrap();
+        let output = Command::new("git")
+            .current_dir(&self.path)
+            .args(["hash-object", "-w", ".blob-scratch"])
+            .output()
+            .expect("git runs");
+        assert!(output.status.success());
+        std::fs::remove_file(&scratch).unwrap();
+        let oid = text(&output.stdout).trim().to_owned();
+        // Git for Windows refuses device names in the index unless told otherwise.
+        git(
+            &self.path,
+            &[
+                "-c",
+                "core.protectNTFS=false",
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{oid},{name}"),
+            ],
+        );
     }
 
     /// A repository with one commit holding a Rust file and a guide.
@@ -500,4 +542,439 @@ fn help_and_version_exit_zero_on_stdout() {
         assert_eq!(output.status.code(), Some(0), "{flag}");
         assert!(!output.stdout.is_empty(), "{flag}");
     }
+}
+
+// --- round 1 of section 12.2: safety, partial failure, locking, recovery ----------
+
+impl Rag {
+    fn data_dir(&self) -> PathBuf {
+        self.home.path().join("data")
+    }
+
+    /// The operation lock of the only registered source, held by this test process
+    /// while a real `rag` process runs.
+    fn hold_lock_of_only_source(&self) -> rag_core::application::ports::LockGuard {
+        let store = SqliteStore::open_for_read(&self.data_dir()).unwrap();
+        let sources = store.list().unwrap();
+        assert_eq!(sources.len(), 1);
+        FileOperationLock::new(self.data_dir().join("locks"))
+            .acquire(sources[0].id())
+            .expect("the lock is free")
+    }
+}
+
+impl Upstream {
+    fn commit_staged(&self, message: &str) {
+        git(&self.path, &["commit", "-q", "-m", message]);
+    }
+}
+
+const SECRET_TOKEN: &str = "tok3n-must-not-leak";
+
+#[test]
+fn a_credential_in_the_url_never_reaches_stdout_stderr_or_the_data_directory() {
+    let rag = Rag::new();
+    let url = format!("https://user:{SECRET_TOKEN}@127.0.0.1:9/o/r.git");
+    for human in [false, true] {
+        let mut args = vec!["add", url.as_str()];
+        if human {
+            args.push("--human");
+        }
+        let output = rag.run(&args);
+        assert_ne!(output.status.code(), Some(0), "{args:?}");
+        assert!(
+            !text(&output.stdout).contains(SECRET_TOKEN),
+            "stdout {args:?}: {}",
+            text(&output.stdout)
+        );
+        assert!(
+            !text(&output.stderr).contains(SECRET_TOKEN),
+            "stderr {args:?}: {}",
+            text(&output.stderr)
+        );
+    }
+    // A bad argument makes clap quote it back.
+    let output = rag.run(&["search", "x", "--bogus", &url]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!text(&output.stdout).contains(SECRET_TOKEN));
+    assert!(!text(&output.stderr).contains(SECRET_TOKEN));
+    // Nothing the registry stored mentions it either.
+    let listed = rag.run(&["list"]);
+    assert!(!text(&listed.stdout).contains(SECRET_TOKEN));
+    if let Ok(database) = std::fs::read(rag.index_db()) {
+        let database = String::from_utf8_lossy(&database);
+        assert!(!database.contains(SECRET_TOKEN));
+    }
+}
+
+/// True when `value` holds a control or invisible character other than TAB and newline.
+fn has_hidden_characters(value: &str) -> bool {
+    value.chars().any(|c| {
+        (c.is_control() && c != '\n' && c != '\t')
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+    })
+}
+
+fn strings_of(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => items.iter().for_each(|item| strings_of(item, out)),
+        Value::Object(map) => map.values().for_each(|item| strings_of(item, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn hostile_file_content_cannot_reach_the_terminal_through_json_or_human_output() {
+    let rag = Rag::new();
+    let upstream = Upstream::empty();
+    upstream.write(
+        "src/hostile.rs",
+        "pub fn hostilemarker() {} // \u{1b}[2J\u{1b}]0;owned\u{7} \u{202e}reversed \u{200b}zero \u{e0041}\u{e0042}tag \u{9b}31m\n",
+    );
+    upstream.write(
+        "docs/hostile.md",
+        "# Title \u{202e}evil \u{e0041}\n\nhostilemarker in a paragraph \u{1b}[31mred\n",
+    );
+    upstream.commit("hostile");
+    let added = rag.add(&upstream);
+    let name = added["name"].as_str().unwrap().to_owned();
+
+    let found = rag.run(&["search", "hostilemarker"]);
+    assert_eq!(found.status.code(), Some(0));
+    let found_json = parse_json(&found.stdout, &["search"]);
+    assert_eq!(found_json["content"], "untrusted");
+    assert!(!found_json["results"].as_array().unwrap().is_empty());
+    let mut strings = Vec::new();
+    strings_of(&found_json, &mut strings);
+    for s in &strings {
+        assert!(!has_hidden_characters(s), "search JSON string: {s:?}");
+    }
+    assert!(
+        !text(&found.stdout).contains("\\u001b"),
+        "no escaped ESC either"
+    );
+
+    let chunk = found_json["results"][0]["id"].as_str().unwrap().to_owned();
+    let shown = rag.json(&["show", "--chunk", &chunk], 0);
+    assert_eq!(shown["content"], "untrusted");
+    let mut strings = Vec::new();
+    strings_of(&shown, &mut strings);
+    for s in &strings {
+        assert!(!has_hidden_characters(s), "show JSON string: {s:?}");
+    }
+    let by_path = rag.json(&["show", &name, "src/hostile.rs"], 0);
+    assert!(by_path["text"].as_str().unwrap().contains("hostilemarker"));
+    assert!(!has_hidden_characters(by_path["text"].as_str().unwrap()));
+
+    for args in [
+        &["search", "hostilemarker", "--human"][..],
+        &["show", "--chunk", &chunk, "--human"],
+        &["show", &name, "src/hostile.rs", "--human"],
+        &["list", "--human"],
+    ] {
+        let output = rag.run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        let stdout = text(&output.stdout);
+        assert!(!has_hidden_characters(&stdout), "{args:?}: {stdout:?}");
+    }
+}
+
+#[test]
+fn files_judged_secret_are_reported_and_cannot_be_shown_or_found() {
+    let rag = Rag::new();
+    let upstream = Upstream::empty();
+    upstream.write("src/ok.rs", "pub fn visiblefunction() {}\n");
+    upstream.write(".env", "API_KEY=supersecretvalue\n");
+    upstream.write(
+        "notes.txt",
+        "private notes\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecretbody\n-----END RSA PRIVATE KEY-----\n",
+    );
+    upstream.commit("secrets");
+
+    let added = rag.add(&upstream);
+    let name = added["name"].as_str().unwrap().to_owned();
+
+    assert_eq!(added["index"]["files_added"], 1, "only ok.rs counts");
+    let listed: Vec<&str> = added["index"]["skipped_secret_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(listed, [".env", "notes.txt"]);
+    for path in [".env", "notes.txt"] {
+        let error = rag.json(&["show", &name, path], 3);
+        assert_eq!(error["error"]["code"], "not_found", "{path}");
+    }
+    for query in ["supersecretvalue", "secretbody"] {
+        assert!(hit_paths(&rag.json(&["search", query], 0)).is_empty());
+    }
+    assert_eq!(
+        hit_paths(&rag.json(&["search", "visiblefunction"], 0)),
+        ["src/ok.rs"]
+    );
+}
+
+#[test]
+fn a_stale_index_exits_seven_until_reindexed() {
+    let rag = Rag::new();
+    let added = rag.add(&Upstream::with_sources());
+    let name = added["name"].as_str().unwrap().to_owned();
+    rag_infra::testing::age_index(
+        &rag.data_dir(),
+        IndexVersions {
+            tokenizer: 0,
+            ..IndexVersions::current()
+        },
+    );
+
+    let search = rag.json(&["search", "config"], 7);
+    assert_eq!(search["error"]["code"], "reindex_required");
+    let show = rag.json(&["show", &name, "src/config.rs"], 7);
+    assert_eq!(show["error"]["code"], "reindex_required");
+
+    let reindexed = rag.json(&["reindex", "--all"], 0);
+    assert_eq!(reindexed["failed"], 0);
+    assert_eq!(
+        hit_paths(&rag.json(&["search", "parseConfig"], 0)),
+        ["src/config.rs"]
+    );
+}
+
+#[test]
+fn a_source_busy_in_another_process_exits_six_and_a_short_wait_succeeds() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    let name = rag.add(&upstream)["name"].as_str().unwrap().to_owned();
+
+    {
+        let _held = rag.hold_lock_of_only_source();
+        for args in [
+            &["update", &name, "--no-wait"][..],
+            &["add", upstream.location(), "--no-wait"],
+            &["remove", &name],
+        ] {
+            let error = rag.json(args, 6);
+            assert_eq!(error["error"]["code"], "index_locked", "{args:?}");
+        }
+        // Update of everything skips the busy source; that is not a failure.
+        let all = rag.json(&["update", "--no-wait"], 0);
+        assert_eq!(all["sources"][0]["result"], "skipped_busy");
+        assert_eq!(all["failed"], 0);
+        // Searching never takes the lock.
+        assert_eq!(rag.json(&["search", "parseConfig"], 0)["returned"], 1);
+    }
+
+    // The default wait outlasts a holder that lets go within a second.
+    let held = rag.hold_lock_of_only_source();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(800));
+        drop(held);
+    });
+    let updated = rag.json(&["update", &name], 0);
+    assert_eq!(updated["sources"][0]["result"], "unchanged");
+    releaser.join().unwrap();
+}
+
+#[test]
+fn update_all_with_one_failing_source_updates_the_others_and_exits_with_its_code() {
+    let rag = Rag::new();
+    let good = Upstream::with_sources();
+    let doomed = Upstream::with_sources();
+    let good_name = rag.add(&good)["name"].as_str().unwrap().to_owned();
+    let doomed_name = rag.add(&doomed)["name"].as_str().unwrap().to_owned();
+    good.write("src/fresh.rs", "pub fn freshfunction() {}\n");
+    good.commit("fresh");
+    std::fs::remove_dir_all(doomed.path.join(".git")).unwrap();
+
+    let output = rag.run(&["update"]);
+    let response = parse_json(&output.stdout, &["update"]);
+
+    assert_eq!(response["failed"], 1, "{response}");
+    let entry = |name: &str| {
+        response["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in {response}"))
+            .clone()
+    };
+    assert_eq!(entry(&good_name)["result"], "updated");
+    let failed = entry(&doomed_name);
+    assert_eq!(failed["result"], "failed");
+    let code = failed["error"]["code"].as_str().unwrap();
+    let expected_exit = match code {
+        "not_found" => 3,
+        "network_or_auth" => 4,
+        _ => 1,
+    };
+    assert_eq!(output.status.code(), Some(expected_exit), "{code}");
+    assert_ne!(code, "index_locked");
+    // The good source really was updated, and the bad one says why in `list`.
+    assert_eq!(
+        hit_paths(&rag.json(&["search", "freshfunction"], 0)),
+        ["src/fresh.rs"]
+    );
+    let listed = rag.json(&["list"], 0);
+    let broken = listed["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == doomed_name.as_str())
+        .unwrap();
+    assert_eq!(broken["status"], "failed");
+    assert_eq!(broken["last_error"]["code"], code);
+    assert!(
+        broken["commit"].is_string(),
+        "the old index is still served"
+    );
+}
+
+#[test]
+fn a_file_named_like_a_windows_device_is_showable() {
+    let rag = Rag::new();
+    let upstream = Upstream::empty();
+    upstream.write("src/lib.rs", "pub fn libfunction() {}\n");
+    upstream.stage_blob("src/aux.rs", "pub fn auxfunction() {}\n");
+    git(&upstream.path, &["add", "src/lib.rs"]);
+    upstream.commit_staged("with aux");
+    let name = rag.add(&upstream)["name"].as_str().unwrap().to_owned();
+
+    let shown = rag.json(&["show", &name, "src/aux.rs"], 0);
+    assert!(shown["text"].as_str().unwrap().contains("auxfunction"));
+    assert_eq!(
+        hit_paths(&rag.json(&["search", "auxfunction"], 0)),
+        ["src/aux.rs"]
+    );
+}
+
+#[test]
+fn a_repository_in_a_non_ascii_path_with_spaces_is_indexed_and_shown() {
+    let rag = Rag::new();
+    let upstream = Upstream::empty_in("pr\u{f6}ject dir \u{65e5}\u{672c}");
+    upstream.write("src/caf\u{e9} file.rs", "pub fn cafefunction() {}\n");
+    upstream.commit("unicode");
+
+    let added = rag.add(&upstream);
+    let name = added["name"].as_str().unwrap().to_owned();
+    assert!(!added["repo"].as_str().unwrap().contains('\\'));
+
+    let found = rag.json(&["search", "cafefunction"], 0);
+    assert_eq!(hit_paths(&found), ["src/caf\u{e9} file.rs"]);
+    let shown = rag.json(&["show", &name, "src/caf\u{e9} file.rs"], 0);
+    assert!(shown["text"].as_str().unwrap().contains("cafefunction"));
+    assert_eq!(
+        rag.json(&["update", &name], 0)["sources"][0]["result"],
+        "unchanged"
+    );
+}
+
+#[test]
+fn adding_a_repository_without_commits_exits_three_with_not_found() {
+    let rag = Rag::new();
+    let empty = Upstream::empty();
+    let output = rag.run(&["add", empty.location()]);
+    assert_eq!(output.status.code(), Some(3));
+    let error = parse_json(&output.stdout, &["add"]);
+    assert_eq!(error["error"]["code"], "not_found");
+}
+
+fn big_upstream(files: usize) -> Upstream {
+    let upstream = Upstream::empty();
+    for n in 0..files {
+        upstream.write(
+            &format!("src/module{n}.rs"),
+            &format!("pub fn function_number_{n}() {{}}\n").repeat(40),
+        );
+    }
+    upstream.write("src/marker.rs", "pub fn recoverymarker() {}\n");
+    upstream.commit("big");
+    upstream
+}
+
+#[test]
+fn an_add_killed_midway_can_be_added_again() {
+    let rag = Rag::new();
+    let upstream = big_upstream(300);
+    for delay in [20, 150, 400] {
+        let mut child = rag
+            .command()
+            .args(["add", upstream.location()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("rag starts");
+        std::thread::sleep(Duration::from_millis(delay));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let added = rag.add(&upstream);
+
+    assert_eq!(added["status"], "ready");
+    assert_eq!(
+        hit_paths(&rag.json(&["search", "recoverymarker"], 0)),
+        ["src/marker.rs"]
+    );
+    let listed = rag.json(&["list"], 0);
+    assert_eq!(listed["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sources"][0]["status"], "ready");
+}
+
+#[test]
+fn two_processes_adding_the_same_repository_at_once_end_with_one_source() {
+    let rag = Rag::new();
+    let upstream = big_upstream(120);
+    let spawn = || {
+        rag.command()
+            .args(["add", upstream.location()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("rag starts")
+    };
+    let first = spawn();
+    let second = spawn();
+    let outputs = [
+        first.wait_with_output().unwrap(),
+        second.wait_with_output().unwrap(),
+    ];
+
+    let mut already = 0;
+    for output in &outputs {
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let response = parse_json(&output.stdout, &["add"]);
+        assert_eq!(response["status"], "ready");
+        if response["already_added"] == true {
+            already += 1;
+        }
+    }
+    assert_eq!(already, 1, "the loser waited for the lock and then updated");
+    assert_eq!(
+        rag.json(&["list"], 0)["sources"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(rag.json(&["search", "recoverymarker"], 0)["returned"], 1);
+}
+
+#[test]
+fn a_panic_free_run_prints_phase_lines_and_never_a_credential_on_stderr() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    let output = rag.run(&["add", upstream.location()]);
+    let stderr = text(&output.stderr);
+    for phase in ["resolve:", "fetch:", "list:", "read:", "commit:"] {
+        assert!(stderr.contains(phase), "{phase} in {stderr}");
+    }
+    let response = parse_json(&output.stdout, &["add"]);
+    let phases: Vec<&str> = response["index"]["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(phases, ["resolve", "fetch", "list", "read", "commit"]);
+    assert!(response["index"]["phases"][0]["elapsed_ms"].is_u64());
 }
