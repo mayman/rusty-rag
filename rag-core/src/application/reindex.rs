@@ -10,6 +10,7 @@ use crate::application::indexer::{
 };
 use crate::application::ports::{ChunkStore, Clock, GitClient, OperationLock, SourceRepository};
 use crate::application::progress::{Progress, NO_PROGRESS};
+use crate::application::search::unknown_source;
 use crate::domain::source::Source;
 use crate::domain::source_id::SourceId;
 
@@ -111,7 +112,7 @@ impl<'a> Reindex<'a> {
             let source = resolve_source(self.sources, name)?;
             let entry = self
                 .reindex_one(source.id())?
-                .ok_or_else(|| AppError::NotFound(format!("no source named {name:?}").into()))?;
+                .ok_or_else(|| unknown_source(self.sources, name))?;
             return Ok(Self::response(vec![entry], None));
         }
         let all = self.sources.list()?;

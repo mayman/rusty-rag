@@ -11,9 +11,6 @@ pub struct Cli {
     /// Plain text for people instead of JSON.
     #[arg(long, global = true)]
     pub human: bool,
-    /// JSON output (the default).
-    #[arg(long, global = true, conflicts_with = "human", hide = true)]
-    pub json: bool,
     /// Fail at once, instead of waiting up to 20 seconds, when another process is
     /// adding or updating the same source.
     #[arg(long, global = true)]
@@ -86,10 +83,10 @@ pub enum Command {
     },
     /// Rebuild the index of one source, or all, after a tokenizer or chunker change.
     Reindex {
-        /// Source name or slug.
+        /// Source name or slug; without a name every source is rebuilt.
         #[arg(conflicts_with = "all")]
         name: Option<String>,
-        /// Every source (also what no name means).
+        /// Rebuild every source (same as giving no name).
         #[arg(long)]
         all: bool,
     },
@@ -197,6 +194,27 @@ mod tests {
         };
         assert_eq!(lines, Some((3, 9)));
         assert!(parse(&["show", "r", "a.rs", "--around", "4"]).is_ok());
+    }
+
+    #[test]
+    fn the_hidden_json_flag_is_gone_because_json_is_the_default() {
+        assert!(parse(&["list", "--json"]).is_err());
+    }
+
+    #[test]
+    fn reindex_help_says_that_no_name_means_every_source_and_all_is_an_alias() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("reindex")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("without a name every source is rebuilt"),
+            "{help}"
+        );
+        assert!(help.contains("same as giving no name"), "{help}");
     }
 
     #[test]

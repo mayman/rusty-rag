@@ -242,6 +242,7 @@ mod tests {
             code: "network_or_auth".to_owned(),
             message: "git: operation timed out".to_owned(),
             hint: None,
+            details: None,
         });
         let text = render_update_human(&updates(
             vec![
@@ -294,6 +295,7 @@ mod tests {
             code: "index_locked".to_owned(),
             message: "another rag process is running `add` on this source".to_owned(),
             hint: None,
+            details: None,
         });
         let text = render_update_human(&updates(vec![busy], None));
         assert_eq!(
@@ -316,6 +318,7 @@ mod tests {
                     code: "not_found".to_owned(),
                     message: "the source was removed while the command ran".to_owned(),
                     hint: None,
+                    details: None,
                 }),
             }],
             failed: 0,

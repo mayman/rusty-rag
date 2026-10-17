@@ -143,8 +143,8 @@ fn age(seconds: Option<u64>) -> String {
 /// An error as `error: <message>` and, when the code has one, `hint: <hint>`.
 pub fn render_error_human(error: &AppError) -> String {
     let mut out = format!("error: {}\n", cell(&error.to_string()));
-    if let Some(hint) = error.code().default_hint() {
-        out += &format!("hint: {hint}\n");
+    if let Some(hint) = error.hint() {
+        out += &format!("hint: {}\n", cell(&hint));
     }
     out
 }
@@ -358,7 +358,7 @@ x     github.com/o/x  cloning  -        -    0
     fn errors_show_the_message_and_the_hint() {
         assert_eq!(
             render_error_human(&AppError::Storage(StorageError::IndexMissing)),
-            "error: no index exists yet\nhint: run `rag add <url|path>` to index a repository\n"
+            "error: no index exists yet\nhint: ask the user to run `rag add <url|path>` to index a repository\n"
         );
     }
 

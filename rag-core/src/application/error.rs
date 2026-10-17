@@ -66,16 +66,6 @@ impl ErrorCode {
     pub fn parse(text: &str) -> Option<ErrorCode> {
         Self::ALL.into_iter().find(|code| code.as_str() == text)
     }
-
-    /// What the caller can do about it, when that is the same every time.
-    pub fn default_hint(&self) -> Option<&'static str> {
-        match self {
-            Self::IndexMissing => Some("run `rag add <url|path>` to index a repository"),
-            Self::IndexLocked => Some("another rag process is writing; wait a moment and retry"),
-            Self::ReindexRequired => Some("run `rag reindex` to rebuild the index"),
-            Self::Generic | Self::Usage | Self::NotFound | Self::NetworkOrAuth => None,
-        }
-    }
 }
 
 /// Message text made safe to show, at construction: credentials removed
@@ -177,6 +167,51 @@ pub enum GitError {
     Failed(Scrubbed),
 }
 
+/// Most names `UnknownSource` lists.
+pub const MAX_VALID_NAMES: usize = 20;
+
+/// A name or slug that matches no registered source, with the names that would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownSource {
+    wanted: Scrubbed,
+    valid: Vec<Scrubbed>,
+    /// Valid names beyond the `MAX_VALID_NAMES` kept.
+    more: usize,
+}
+
+impl UnknownSource {
+    /// `wanted` matched nothing; `valid` are the names of the registered sources (the
+    /// first `MAX_VALID_NAMES` are kept).
+    pub fn new(wanted: &str, valid: impl IntoIterator<Item = String>) -> Self {
+        let all: Vec<String> = valid.into_iter().collect();
+        let kept = all.len().min(MAX_VALID_NAMES);
+        Self {
+            wanted: Scrubbed::new(wanted),
+            valid: all[..kept].iter().map(|name| Scrubbed::new(name)).collect(),
+            more: all.len() - kept,
+        }
+    }
+}
+
+impl fmt::Display for UnknownSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no source named {:?}; run `rag list` to see the registered ones",
+            self.wanted.as_str()
+        )?;
+        if self.valid.is_empty() {
+            return f.write_str(" (no sources are registered)");
+        }
+        let names: Vec<&str> = self.valid.iter().map(Scrubbed::as_str).collect();
+        write!(f, " (valid: {}", names.join(", "))?;
+        if self.more > 0 {
+            write!(f, ", and {} more", self.more)?;
+        }
+        f.write_str(")")
+    }
+}
+
 /// What a use case returns on failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
@@ -184,11 +219,97 @@ pub enum AppError {
     Git(GitError),
     /// The named source, file, or lines do not exist.
     NotFound(Scrubbed),
+    /// The name or slug given matches no registered source.
+    UnknownSource(UnknownSource),
+    /// A source the command touches was indexed by other rules and needs
+    /// `rag reindex` first.
+    StaleIndex {
+        /// The (first) stale source, by name.
+        source: Scrubbed,
+        /// How many more stale sources the command touches.
+        also_stale: usize,
+    },
     /// The request itself is invalid.
     Usage(Scrubbed),
 }
 
+/// A word safe to paste into a shell as one argument: quoted unless it is plain.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/-:".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("{text:?}")
+    }
+}
+
+/// Shown for the errors that mean "someone else is working": the command did not do
+/// its work.
+const LOCKED_HINT: &str =
+    "your command was not done and nothing was changed by it; wait about 5 seconds, then retry";
+/// Shown for network and authentication failures.
+const NETWORK_HINT: &str = "check the network and the credentials; git must authenticate non-interactively (a configured credential helper or ssh key); if it persists, ask the user";
+
 impl AppError {
+    /// What to do about the error, when something general can be said: always a
+    /// string or none, and never an instruction the agent would run to change the
+    /// index of the user (those say "ask the user to run ...").
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            Self::Storage(StorageError::IndexMissing) => {
+                Some("ask the user to run `rag add <url|path>` to index a repository".to_owned())
+            }
+            Self::Storage(StorageError::ReindexRequired) => {
+                Some("ask the user to run `rag reindex` to rebuild the index".to_owned())
+            }
+            Self::StaleIndex {
+                source,
+                also_stale: 0,
+            } => Some(format!(
+                "ask the user to run `rag reindex {}`",
+                shell_word(source.as_str())
+            )),
+            Self::StaleIndex { .. } => {
+                Some("ask the user to run `rag reindex` to rebuild every stale source".to_owned())
+            }
+            Self::Storage(
+                StorageError::Busy | StorageError::LockedBy(_) | StorageError::Conflict,
+            )
+            | Self::Git(GitError::Busy) => Some(LOCKED_HINT.to_owned()),
+            Self::Git(GitError::NetworkOrAuth(_) | GitError::Timeout) => {
+                Some(NETWORK_HINT.to_owned())
+            }
+            Self::UnknownSource(_) => {
+                Some("use one of the names in details.valid_names, or run `rag list`".to_owned())
+            }
+            Self::Storage(StorageError::NameTaken(_) | StorageError::Failed(_))
+            | Self::Git(GitError::NotFound(_) | GitError::TooLarge(_) | GitError::Failed(_))
+            | Self::NotFound(_)
+            | Self::Usage(_) => None,
+        }
+    }
+
+    /// The names of the valid sources, for an unknown-source error.
+    pub fn valid_names(&self) -> Option<Vec<&str>> {
+        match self {
+            Self::UnknownSource(unknown) => {
+                Some(unknown.valid.iter().map(Scrubbed::as_str).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// The stale source, for a reindex-required error that names one.
+    pub fn stale_source(&self) -> Option<&str> {
+        match self {
+            Self::StaleIndex { source, .. } => Some(source.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Storage(StorageError::IndexMissing) => ErrorCode::IndexMissing,
@@ -196,8 +317,12 @@ impl AppError {
                 StorageError::Busy | StorageError::LockedBy(_) | StorageError::Conflict,
             )
             | Self::Git(GitError::Busy) => ErrorCode::IndexLocked,
-            Self::Storage(StorageError::ReindexRequired) => ErrorCode::ReindexRequired,
-            Self::Git(GitError::NotFound(_)) | Self::NotFound(_) => ErrorCode::NotFound,
+            Self::Storage(StorageError::ReindexRequired) | Self::StaleIndex { .. } => {
+                ErrorCode::ReindexRequired
+            }
+            Self::Git(GitError::NotFound(_)) | Self::NotFound(_) | Self::UnknownSource(_) => {
+                ErrorCode::NotFound
+            }
             Self::Git(GitError::NetworkOrAuth(_) | GitError::Timeout) => ErrorCode::NetworkOrAuth,
             Self::Usage(_) | Self::Storage(StorageError::NameTaken(_)) => ErrorCode::Usage,
             Self::Storage(StorageError::Failed(_))
@@ -251,6 +376,17 @@ impl fmt::Display for AppError {
             Self::Storage(error) => error.to_string(),
             Self::Git(error) => error.to_string(),
             Self::NotFound(what) => format!("not found: {what}"),
+            Self::UnknownSource(unknown) => unknown.to_string(),
+            Self::StaleIndex { source, also_stale } => {
+                let others = match also_stale {
+                    0 => String::new(),
+                    n => format!(" ({n} other stale sources)"),
+                };
+                format!(
+                    "the index of source {:?} was built by an older version{others}",
+                    source.as_str()
+                )
+            }
             Self::Usage(message) => message.to_string(),
         };
         f.write_str(&scrub_credentials(&text))
@@ -274,7 +410,7 @@ impl From<GitError> for AppError {
 }
 #[cfg(test)]
 mod tests {
-    use super::{AppError, ErrorCode, GitError, Scrubbed, StorageError};
+    use super::{AppError, ErrorCode, GitError, Scrubbed, StorageError, UnknownSource};
 
     #[test]
     fn exit_codes_are_one_to_seven_in_order() {
@@ -308,19 +444,154 @@ mod tests {
     }
 
     #[test]
-    fn index_errors_carry_a_hint_naming_the_command_to_run() {
-        assert!(ErrorCode::IndexMissing
-            .default_hint()
-            .unwrap()
-            .contains("rag add"));
-        assert!(ErrorCode::ReindexRequired
-            .default_hint()
-            .unwrap()
-            .contains("rag reindex"));
-        assert!(ErrorCode::IndexLocked
-            .default_hint()
-            .unwrap()
-            .contains("retry"));
+    fn missing_and_stale_index_hints_address_the_user_not_the_agent() {
+        let missing = AppError::from(StorageError::IndexMissing).hint().unwrap();
+        assert_eq!(
+            missing,
+            "ask the user to run `rag add <url|path>` to index a repository"
+        );
+        let stale = AppError::StaleIndex {
+            source: "docs".into(),
+            also_stale: 0,
+        };
+        assert_eq!(
+            stale.hint().unwrap(),
+            "ask the user to run `rag reindex docs`"
+        );
+        for hint in [missing, stale.hint().unwrap()] {
+            assert!(hint.starts_with("ask the user"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn a_stale_index_names_its_source_and_several_stale_sources_say_so() {
+        let one = AppError::StaleIndex {
+            source: "my docs".into(),
+            also_stale: 0,
+        };
+        assert_eq!(one.code(), ErrorCode::ReindexRequired);
+        assert_eq!(one.stale_source(), Some("my docs"));
+        assert_eq!(
+            one.hint().unwrap(),
+            "ask the user to run `rag reindex \"my docs\"`"
+        );
+        assert!(one.to_string().contains("\"my docs\""), "{one}");
+        let many = AppError::StaleIndex {
+            source: "a".into(),
+            also_stale: 2,
+        };
+        assert!(many.to_string().contains("2 other"), "{many}");
+        assert_eq!(
+            many.hint().unwrap(),
+            "ask the user to run `rag reindex` to rebuild every stale source"
+        );
+    }
+
+    #[test]
+    fn a_raw_stale_storage_error_still_has_a_user_addressed_hint() {
+        let hint = AppError::from(StorageError::ReindexRequired)
+            .hint()
+            .unwrap();
+        assert!(
+            hint.starts_with("ask the user to run `rag reindex`"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn network_failures_hint_at_credentials_and_the_user() {
+        for error in [
+            AppError::Git(GitError::NetworkOrAuth("x".into())),
+            AppError::Git(GitError::Timeout),
+        ] {
+            let hint = error.hint().unwrap();
+            assert!(
+                hint.contains("network") && hint.contains("credentials"),
+                "{hint}"
+            );
+            assert!(hint.contains("non-interactively"), "{hint}");
+            assert!(hint.contains("ask the user"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn a_locked_index_says_the_work_was_not_done_and_to_wait_about_five_seconds() {
+        for error in [
+            AppError::Storage(StorageError::Busy),
+            AppError::Storage(StorageError::Conflict),
+            AppError::Storage(StorageError::locked_by("update")),
+            AppError::Git(GitError::Busy),
+        ] {
+            let hint = error.hint().unwrap();
+            assert!(hint.contains("was not done"), "{hint}");
+            assert!(hint.contains("about 5 seconds"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn errors_with_nothing_general_to_suggest_have_no_hint() {
+        for error in [
+            AppError::Usage("x".into()),
+            AppError::NotFound("x".into()),
+            AppError::Storage(StorageError::Failed("x".into())),
+            AppError::Git(GitError::Failed("x".into())),
+        ] {
+            assert_eq!(error.hint(), None, "{error}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_source_says_run_rag_list_and_names_the_valid_ones() {
+        let error = AppError::UnknownSource(UnknownSource::new(
+            "nope",
+            ["docs".to_owned(), "other".to_owned()],
+        ));
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "no source named \"nope\"; run `rag list` to see the registered ones (valid: docs, other)"
+        );
+        assert_eq!(error.valid_names(), Some(vec!["docs", "other"]));
+        assert_eq!(
+            error.hint().unwrap(),
+            "use one of the names in details.valid_names, or run `rag list`"
+        );
+    }
+
+    #[test]
+    fn at_most_twenty_valid_names_are_listed() {
+        let names: Vec<String> = (0..30).map(|i| format!("s{i:02}")).collect();
+        let error = AppError::UnknownSource(UnknownSource::new("nope", names));
+        let listed = error.valid_names().unwrap();
+        assert_eq!(listed.len(), 20);
+        assert_eq!(listed[19], "s19");
+        assert!(error.to_string().contains("and 10 more"), "{error}");
+        assert!(!error.to_string().contains("s20"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_source_with_nothing_registered_says_so() {
+        let error = AppError::UnknownSource(UnknownSource::new("nope", Vec::new()));
+        assert!(
+            error.to_string().contains("no sources are registered"),
+            "{error}"
+        );
+        assert_eq!(error.valid_names(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn unknown_source_text_is_scrubbed_like_every_message() {
+        let error = AppError::UnknownSource(UnknownSource::new(
+            "https://user:tok3n@github.com/o/r\u{1b}[2J",
+            ["a\u{202e}b".to_owned()],
+        ));
+        let shown = error.to_string();
+        assert!(
+            !shown.contains("tok3n") && !shown.contains('\u{1b}'),
+            "{shown}"
+        );
+        assert!(!shown.contains('\u{202e}'), "{shown}");
+        assert!(!error.valid_names().unwrap()[0].contains('\u{202e}'));
     }
 
     #[test]

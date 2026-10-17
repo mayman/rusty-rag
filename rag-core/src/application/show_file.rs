@@ -15,7 +15,7 @@ use crate::application::dto::{
     ShowResponse, SCHEMA_VERSION, SHOW_AROUND_RADIUS, SHOW_MAX_CHARS, SHOW_MAX_LINES,
     SHOW_MIN_CHARS, UNTRUSTED_CONTENT,
 };
-use crate::application::error::{AppError, Scrubbed, StorageError};
+use crate::application::error::{AppError, Scrubbed};
 use crate::application::indexer::resolve_source;
 use crate::application::ports::{ChunkStore, GitClient, SourceRepository};
 use crate::domain::chunk_id::ChunkId;
@@ -160,7 +160,10 @@ fn revision_of(source: &Source) -> Result<&IndexedRevision, AppError> {
         )))
     })?;
     if !revision.versions.is_current() {
-        return Err(StorageError::ReindexRequired.into());
+        return Err(AppError::StaleIndex {
+            source: Scrubbed::new(source.name()),
+            also_stale: 0,
+        });
     }
     Ok(revision)
 }
@@ -403,6 +406,8 @@ mod tests {
         }
         let error = world.show(&request("nope", "a.rs")).unwrap_err();
         assert_eq!(error.code(), ErrorCode::NotFound);
+        assert!(error.to_string().contains("rag list"), "{error}");
+        assert_eq!(error.valid_names(), Some(vec!["docs"]));
     }
 
     #[test]
@@ -709,6 +714,7 @@ mod tests {
         ] {
             assert_eq!(error.code(), ErrorCode::ReindexRequired, "{error}");
             assert_eq!(error.code().exit_code(), 7);
+            assert_eq!(error.stale_source(), Some("docs"));
         }
     }
 

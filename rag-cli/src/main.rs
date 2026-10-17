@@ -29,19 +29,35 @@ use progress::{Sink, StderrProgress, HEARTBEAT};
 fn main() -> ExitCode {
     crash::install_hook();
     let args: Vec<OsString> = std::env::args_os().collect();
-    // Decided from the raw arguments so that a usage error is rendered in the
-    // mode the caller asked for.
-    let mode = if args.iter().any(|arg| arg == "--human") {
+    let parsed = Cli::try_parse_from(&args);
+    // Decided by the parser, so that a usage error is rendered in the mode the
+    // caller asked for.
+    let mode = output_mode(&parsed, &args);
+    // A panic anywhere below is reported as the generic error, exit code 1.
+    crash::guarded(|| execute(parsed, mode)).unwrap_or_else(|error| fail(&error, mode))
+}
+
+/// The output mode: the `--human` flag as clap parses it when the arguments parse, so
+/// a query that is literally `--human` (given after `--`) is just a query. When they
+/// do not parse, the error is still rendered in the mode asked for: `--human` counts
+/// when it stands before the `--` terminator.
+fn output_mode(parsed: &Result<Cli, clap::Error>, args: &[OsString]) -> Mode {
+    let human = match parsed {
+        Ok(cli) => cli.human,
+        Err(_) => args
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--human"),
+    };
+    if human {
         Mode::Human
     } else {
         Mode::Json
-    };
-    // A panic anywhere below is reported as the generic error, exit code 1.
-    crash::guarded(|| execute(&args, mode)).unwrap_or_else(|error| fail(&error, mode))
+    }
 }
 
-fn execute(args: &[OsString], mode: Mode) -> ExitCode {
-    let cli = match Cli::try_parse_from(args) {
+fn execute(parsed: Result<Cli, clap::Error>, mode: Mode) -> ExitCode {
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(error) => return finish_parse_error(&error, mode),
     };
@@ -77,12 +93,7 @@ fn finish_parse_error(error: &clap::Error, mode: Mode) -> ExitCode {
     let message = if missing_command {
         "a command is required; run `rag --help` to see them".to_owned()
     } else {
-        rendered
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim_start_matches("error: ")
-            .to_owned()
+        usage_error_message(&rendered)
     };
     let usage = AppError::Usage(Scrubbed::from(message));
     if mode == Mode::Json {
@@ -93,6 +104,25 @@ fn finish_parse_error(error: &clap::Error, mode: Mode) -> ExitCode {
     }
     write_stderr(&rendered);
     ExitCode::from(output::error::exit_code(&usage))
+}
+
+/// The message of a clap usage error: its first paragraph on one line (what is
+/// wrong), then `; usage: <the usage line of the subcommand>` so the caller can fix
+/// the command without another round trip.
+fn usage_error_message(rendered: &str) -> String {
+    let detail = rendered
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .map(|line| line.trim().trim_start_matches("error: "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match rendered
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("Usage: "))
+    {
+        Some(usage) => format!("{detail}; usage: {}", usage.trim()),
+        None => detail,
+    }
 }
 
 /// Text from outside, safe to print: credentials removed, control and invisible
@@ -130,7 +160,76 @@ fn write_stderr(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_text;
+    use super::{output_mode, safe_text, usage_error_message, Mode};
+    use crate::cli::Cli;
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        std::iter::once("rag")
+            .chain(list.iter().copied())
+            .map(OsString::from)
+            .collect()
+    }
+
+    fn mode_of(list: &[&str]) -> Mode {
+        let args = args(list);
+        output_mode(&Cli::try_parse_from(&args), &args)
+    }
+
+    fn rendered(list: &[&str]) -> String {
+        safe_text(&Cli::try_parse_from(args(list)).unwrap_err().to_string())
+    }
+
+    #[test]
+    fn the_human_flag_selects_human_output_anywhere_in_a_valid_command() {
+        assert_eq!(mode_of(&["list", "--human"]), Mode::Human);
+        assert_eq!(mode_of(&["--human", "list"]), Mode::Human);
+        assert_eq!(mode_of(&["list"]), Mode::Json);
+    }
+
+    #[test]
+    fn a_query_that_is_literally_the_human_flag_does_not_flip_the_mode() {
+        assert_eq!(mode_of(&["search", "--", "--human"]), Mode::Json);
+        assert_eq!(mode_of(&["search", "-k", "3", "--", "--human"]), Mode::Json);
+    }
+
+    #[test]
+    fn an_unparseable_command_still_reports_in_the_mode_asked_for() {
+        assert_eq!(mode_of(&["search", "--human"]), Mode::Human);
+        assert_eq!(
+            mode_of(&["search", "x", "-k", "many", "--human"]),
+            Mode::Human
+        );
+        assert_eq!(mode_of(&["frobnicate"]), Mode::Json);
+        assert_eq!(
+            mode_of(&["frobnicate", "--", "--human"]),
+            Mode::Json,
+            "after the terminator it is not a flag"
+        );
+    }
+
+    #[test]
+    fn a_usage_error_message_carries_its_detail_and_the_subcommand_usage_line() {
+        let message = usage_error_message(&rendered(&["search"]));
+        assert_eq!(
+            message,
+            "the following required arguments were not provided: <QUERY>; usage: rag search <QUERY>"
+        );
+        let show = usage_error_message(&rendered(&["show", "only-a-repo"]));
+        assert!(show.contains("; usage: rag show "), "{show}");
+        let unknown = usage_error_message(&rendered(&["frobnicate"]));
+        assert!(unknown.starts_with("unrecognized subcommand"), "{unknown}");
+        assert!(unknown.contains("; usage: rag "), "{unknown}");
+    }
+
+    #[test]
+    fn a_message_without_a_usage_line_is_just_the_detail() {
+        assert_eq!(
+            usage_error_message("error: plain problem\n"),
+            "plain problem"
+        );
+    }
 
     #[test]
     fn clap_text_loses_credentials_and_escape_sequences_but_keeps_its_layout() {

@@ -1,1 +1,1 @@
-{"error":{"code":"index_missing","message":"no index exists yet","hint":"run `rag add <url|path>` to index a repository"}}
+{"error":{"code":"index_missing","message":"no index exists yet","hint":"ask the user to run `rag add <url|path>` to index a repository"}}

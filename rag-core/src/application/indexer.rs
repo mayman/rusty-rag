@@ -51,7 +51,7 @@ pub fn resolve_source(sources: &dyn SourceRepository, key: &str) -> Result<Sourc
     let key = key.trim();
     let mut found = find_sources(sources, key)?;
     match found.len() {
-        0 => Err(unknown_source(key)),
+        0 => Err(unknown_source(sources, key)),
         1 => Ok(found.remove(0)),
         _ => {
             let candidates: Vec<String> = found
@@ -68,9 +68,7 @@ pub fn resolve_source(sources: &dyn SourceRepository, key: &str) -> Result<Sourc
 
 /// The JSON error object for a failure that was recorded instead of returned.
 pub fn error_body(error: &AppError) -> ErrorBody {
-    let mut body = ErrorBody::from(error.code());
-    body.message = error.to_string();
-    body
+    ErrorBody::from_error(error)
 }
 
 /// Whether a failure only says "someone else is working on this": the operation lock
@@ -314,7 +312,10 @@ impl<'a> Indexer<'a> {
             ))
         })?;
         if !revision.versions.is_current() {
-            return Err(StorageError::ReindexRequired.into());
+            return Err(AppError::StaleIndex {
+                source: Scrubbed::new(source.name()),
+                also_stale: 0,
+            });
         }
         if source.git_ref().is_none() {
             return Err(AppError::Storage(StorageError::Failed(

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::application::error::{AppError, ErrorCode};
+use crate::application::error::AppError;
 use crate::domain::indexed_at::IndexedAt;
 use crate::domain::source::Source;
 
@@ -232,15 +232,51 @@ pub struct ShowResponse {
     pub chunk: Option<String>,
     pub text: String,
 }
-/// The `error` object of a failed command.
+/// Machine-readable facts about an error, in `error.details`. Only the fields that
+/// apply are present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ErrorDetails {
+    /// `not_found` for an unknown source: the names that would work (at most 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_names: Option<Vec<String>>,
+    /// `reindex_required`: the stale source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// The `error` object of a failed command: `code`, `message`, `hint` (a string or
+/// null, always present), and `details` when there are any.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
     pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<ErrorDetails>,
 }
 
-/// Output of any failed command in JSON mode: `{"error":{"code","message","hint"}}`.
+impl ErrorBody {
+    /// The body that describes `error`.
+    pub fn from_error(error: &AppError) -> Self {
+        let details = match (error.valid_names(), error.stale_source()) {
+            (None, None) => None,
+            (valid_names, source) => Some(ErrorDetails {
+                valid_names: valid_names
+                    .map(|names| names.into_iter().map(str::to_owned).collect()),
+                source: source.map(str::to_owned),
+            }),
+        };
+        Self {
+            code: error.code().as_str().to_owned(),
+            message: error.to_string(),
+            hint: error.hint(),
+            details,
+        }
+    }
+}
+
+/// Output of any failed command in JSON mode:
+/// `{"error":{"code","message","hint"[,"details"]}}`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorBody,
@@ -248,24 +284,14 @@ pub struct ErrorResponse {
 
 impl ErrorResponse {
     pub fn from_error(error: &AppError) -> Self {
-        let mut body = ErrorBody::from(error.code());
-        body.message = error.to_string();
-        Self { error: body }
+        Self {
+            error: ErrorBody::from_error(error),
+        }
     }
 
     /// The process exit code that goes with this error.
     pub fn exit_code(error: &AppError) -> u8 {
         error.code().exit_code()
-    }
-}
-
-impl From<ErrorCode> for ErrorBody {
-    fn from(code: ErrorCode) -> Self {
-        Self {
-            code: code.as_str().to_owned(),
-            message: String::new(),
-            hint: code.default_hint().map(str::to_owned),
-        }
     }
 }
 
@@ -550,7 +576,13 @@ mod tests {
         let response = ErrorResponse::from_error(&AppError::Storage(StorageError::IndexMissing));
         assert_eq!(response.error.code, "index_missing");
         assert_eq!(response.error.message, "no index exists yet");
-        assert!(response.error.hint.as_deref().unwrap().contains("rag add"));
+        assert!(response
+            .error
+            .hint
+            .as_deref()
+            .unwrap()
+            .starts_with("ask the user to run `rag add"));
+        assert_eq!(response.error.details, None);
         assert_eq!(
             ErrorResponse::exit_code(&AppError::Storage(StorageError::IndexMissing)),
             5
@@ -564,6 +596,50 @@ mod tests {
             serde_json::to_string(&response).unwrap(),
             r#"{"error":{"code":"usage","message":"bad flag","hint":null}}"#
         );
+    }
+
+    #[test]
+    fn an_unknown_source_error_lists_the_valid_names_in_details() {
+        let error = AppError::UnknownSource(crate::application::error::UnknownSource::new(
+            "nope",
+            ["docs".to_owned(), "other".to_owned()],
+        ));
+        assert_eq!(
+            serde_json::to_string(&ErrorResponse::from_error(&error)).unwrap(),
+            concat!(
+                r#"{"error":{"code":"not_found","message":"no source named \"nope\"; run `rag list` to see the registered ones (valid: docs, other)","#,
+                r#""hint":"use one of the names in details.valid_names, or run `rag list`","#,
+                r#""details":{"valid_names":["docs","other"]}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_reindex_required_error_names_its_source_in_details() {
+        let error = AppError::StaleIndex {
+            source: "docs".into(),
+            also_stale: 0,
+        };
+        let json = serde_json::to_string(&ErrorResponse::from_error(&error)).unwrap();
+        assert!(
+            json.ends_with(
+                r#""hint":"ask the user to run `rag reindex docs`","details":{"source":"docs"}}}"#
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn the_hint_is_always_present_as_a_string_or_null() {
+        for error in [
+            AppError::Usage("x".into()),
+            AppError::NotFound("x".into()),
+            AppError::Storage(StorageError::IndexMissing),
+        ] {
+            let json = serde_json::to_string(&ErrorResponse::from_error(&error)).unwrap();
+            assert!(json.contains(r#""hint":"#), "{json}");
+            assert!(!json.contains("details"), "{json}");
+        }
     }
 
     #[test]

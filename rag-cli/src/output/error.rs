@@ -21,15 +21,42 @@ pub fn exit_code(error: &AppError) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{exit_code, render_error_json, EXIT_OK};
-    use rag_core::application::error::{AppError, GitError, Scrubbed, StorageError};
+    use rag_core::application::error::{AppError, GitError, Scrubbed, StorageError, UnknownSource};
 
     const GOLDEN_INDEX_MISSING: &str =
         include_str!("../../tests/golden/error_index_missing.json.golden");
+
+    const GOLDEN_UNKNOWN_SOURCE: &str =
+        include_str!("../../tests/golden/error_unknown_source.json.golden");
 
     #[test]
     fn index_missing_matches_the_golden_file() {
         let error = AppError::Storage(StorageError::IndexMissing);
         assert_eq!(render_error_json(&error), GOLDEN_INDEX_MISSING.trim_end());
+    }
+
+    #[test]
+    fn an_unknown_source_matches_the_golden_file_with_its_valid_names() {
+        let error = AppError::UnknownSource(UnknownSource::new(
+            "nope",
+            ["docs".to_owned(), "other".to_owned()],
+        ));
+        assert_eq!(render_error_json(&error), GOLDEN_UNKNOWN_SOURCE.trim_end());
+    }
+
+    #[test]
+    fn reindex_required_names_the_source_in_details() {
+        let error = AppError::StaleIndex {
+            source: "docs".into(),
+            also_stale: 0,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&render_error_json(&error)).unwrap();
+        assert_eq!(parsed["error"]["code"], "reindex_required");
+        assert_eq!(parsed["error"]["details"]["source"], "docs");
+        assert_eq!(
+            parsed["error"]["hint"],
+            "ask the user to run `rag reindex docs`"
+        );
     }
 
     #[test]

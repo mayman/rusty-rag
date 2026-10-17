@@ -342,7 +342,10 @@ fn a_search_without_an_index_exits_five_and_creates_nothing() {
     assert_eq!(output.status.code(), Some(5));
     let error = parse_json(&output.stdout, &["search"]);
     assert_eq!(error["error"]["code"], "index_missing");
-    assert!(error["error"]["hint"].as_str().unwrap().contains("rag add"));
+    assert!(error["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .starts_with("ask the user to run `rag add"));
     assert!(
         text(&output.stderr).contains("no index"),
         "plain line on stderr"
@@ -386,6 +389,24 @@ fn usage_errors_exit_two_and_still_print_the_json_error_shape() {
             "plain line on stderr"
         );
     }
+    for (args, usage) in [
+        (&["search"][..], "usage: rag search"),
+        (&["show", "only-a-repo"], "usage: rag show"),
+        (&["reindex", "r", "--all"], "usage: rag reindex"),
+    ] {
+        let message = rag.json(args, 2)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains(usage), "rag {args:?}: {message}");
+    }
+}
+
+#[test]
+fn a_query_equal_to_the_human_flag_does_not_switch_to_human_output() {
+    let rag = Rag::new();
+    let error = rag.json(&["search", "--", "--human"], 5);
+    assert_eq!(error["error"]["code"], "index_missing");
 }
 
 #[test]
@@ -400,7 +421,10 @@ fn a_usage_error_in_human_mode_writes_nothing_to_stdout() {
 #[test]
 fn an_unknown_source_exits_three_with_not_found() {
     let rag = Rag::new();
-    rag.add(&Upstream::with_sources());
+    let name = rag.add(&Upstream::with_sources())["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     for args in [
         &["search", "config", "--repo", "nope"][..],
         &["show", "nope", "src/config.rs"],
@@ -410,6 +434,17 @@ fn an_unknown_source_exits_three_with_not_found() {
     ] {
         let error = rag.json(args, 3);
         assert_eq!(error["error"]["code"], "not_found", "rag {args:?}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("rag list") && message.contains(&name),
+            "{message}"
+        );
+        assert_eq!(
+            error["error"]["details"]["valid_names"],
+            serde_json::json!([name]),
+            "rag {args:?}"
+        );
+        assert!(error["error"]["hint"].is_string());
     }
 }
 
@@ -442,6 +477,8 @@ fn a_query_with_nothing_to_find_succeeds_with_a_hint() {
     rag.add(&Upstream::with_sources());
     let found = rag.json(&["search", "qqqxyzzy"], 0);
     assert_eq!(found["returned"], 0);
+    assert_eq!(found["mode"], "none");
+    assert_eq!(found["sources"], serde_json::json!({}));
     assert_eq!(found["results"], serde_json::json!([]));
     assert!(found["hint"].is_string());
 }
@@ -538,7 +575,10 @@ fn human_errors_go_to_stderr_with_the_hint() {
     assert!(output.stdout.is_empty());
     let stderr = text(&output.stderr);
     assert!(stderr.contains("error: no index exists yet"), "{stderr}");
-    assert!(stderr.contains("hint: run `rag add"), "{stderr}");
+    assert!(
+        stderr.contains("hint: ask the user to run `rag add"),
+        "{stderr}"
+    );
 }
 
 #[test]

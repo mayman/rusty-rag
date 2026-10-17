@@ -1,0 +1,1 @@
+{"error":{"code":"not_found","message":"no source named \"nope\"; run `rag list` to see the registered ones (valid: docs, other)","hint":"use one of the names in details.valid_names, or run `rag list`","details":{"valid_names":["docs","other"]}}}

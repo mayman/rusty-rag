@@ -12,7 +12,7 @@ use crate::application::dto::{
     SearchRequest, SearchResponse, SearchResultDto, SourceInfoDto, SCHEMA_VERSION,
     UNTRUSTED_CONTENT,
 };
-use crate::application::error::{AppError, Scrubbed, StorageError};
+use crate::application::error::{AppError, Scrubbed, StorageError, UnknownSource};
 use crate::application::ports::{ChunkSearcher, Clock, SourceRepository, TOTAL_MATCHES_CAP};
 use crate::application::retrieval::{retrieve, Retrieval};
 use crate::application::snippet;
@@ -74,7 +74,8 @@ impl<'a> Search<'a> {
         let filters = self.filters(request)?;
         let k = request.k.clamp(1, MAX_K);
         let offset = request.offset.min(MAX_OFFSET);
-        let retrieval = retrieve(self.searcher, &query, &filters, offset, k)?;
+        let retrieval = retrieve(self.searcher, &query, &filters, offset, k)
+            .map_err(|error| name_stale_sources(error, &registered, &filters.sources))?;
         let notices = notices(&registered, &filters.sources);
         let page = Page {
             k,
@@ -90,7 +91,7 @@ impl<'a> Search<'a> {
         for wanted in &request.repos {
             let found = find_sources(self.sources, wanted)?;
             if found.is_empty() {
-                return Err(unknown_source(wanted));
+                return Err(unknown_source(self.sources, wanted));
             }
             sources.extend(found.iter().map(|source| source.id().clone()));
         }
@@ -127,10 +128,39 @@ impl<'a> Search<'a> {
     }
 }
 
-pub(crate) fn unknown_source(wanted: &str) -> AppError {
-    AppError::NotFound(Scrubbed::from(format!(
-        "no source named {wanted:?}; run `rag list` to see the registered ones"
-    )))
+/// A `ReindexRequired` from the searcher says that a source the query touches is
+/// stale but not which; this names it from the catalog (the sources `wanted`, or all
+/// of them when `wanted` is empty). Other errors pass through.
+fn name_stale_sources(error: StorageError, registered: &[Source], wanted: &[SourceId]) -> AppError {
+    if error != StorageError::ReindexRequired {
+        return error.into();
+    }
+    let mut stale = registered
+        .iter()
+        .filter(|source| wanted.is_empty() || wanted.contains(source.id()))
+        .filter(|source| {
+            source
+                .indexed()
+                .is_some_and(|revision| !revision.versions.is_current())
+        });
+    match stale.next() {
+        Some(first) => AppError::StaleIndex {
+            source: Scrubbed::new(first.name()),
+            also_stale: stale.count(),
+        },
+        None => error.into(),
+    }
+}
+
+/// The error for a name or slug that matches no source, listing the names that would.
+pub(crate) fn unknown_source(sources: &dyn SourceRepository, wanted: &str) -> AppError {
+    match sources.list() {
+        Ok(all) => AppError::UnknownSource(UnknownSource::new(
+            wanted,
+            all.iter().map(|source| source.name().to_owned()),
+        )),
+        Err(error) => error.into(),
+    }
 }
 
 /// The sources a user-typed `--repo` value names: the source with that name
@@ -664,6 +694,8 @@ mod tests {
         let error = run(&store(), &request).unwrap_err();
         assert_eq!(error.code(), ErrorCode::NotFound);
         assert!(error.to_string().contains("nope"));
+        assert!(error.to_string().contains("rag list"), "{error}");
+        assert_eq!(error.valid_names(), Some(vec!["Docs"]));
     }
 
     #[test]
@@ -712,6 +744,11 @@ mod tests {
         let error = run(&store, &SearchRequest::new("parse")).unwrap_err();
         assert_eq!(error.code(), ErrorCode::ReindexRequired);
         assert_eq!(error.code().exit_code(), 7);
+        assert_eq!(error.stale_source(), Some("old"), "{error}");
+        assert_eq!(
+            error.hint().as_deref(),
+            Some("ask the user to run `rag reindex old`")
+        );
         let mut request = SearchRequest::new("parse");
         request.repos = vec!["docs".to_owned()];
         assert!(

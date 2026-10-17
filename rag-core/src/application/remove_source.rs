@@ -6,6 +6,7 @@ use crate::application::dto::SCHEMA_VERSION;
 use crate::application::error::AppError;
 use crate::application::indexer::resolve_source;
 use crate::application::ports::{ChunkStore, GitClient, OperationLock, SourceRepository};
+use crate::application::search::unknown_source;
 
 /// Input of the remove use case.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +62,10 @@ impl<'a> RemoveSource<'a> {
         let id = resolve_source(self.sources, &request.name)?.id().clone();
         let _lock = self.locks.acquire(&id)?;
         // Look again under the lock: the source may have been removed meanwhile.
-        let source = self.sources.get(&id)?.ok_or_else(|| {
-            AppError::NotFound(format!("no source named {:?}", request.name).into())
-        })?;
+        let source = self
+            .sources
+            .get(&id)?
+            .ok_or_else(|| unknown_source(self.sources, &request.name))?;
         // The catalog and the index go first, in one transaction, so the source
         // stops appearing in results at once. The clone is only disk space: a
         // leftover is garbage-collected later.

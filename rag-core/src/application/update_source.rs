@@ -1,4 +1,4 @@
-﻿//! Update: fetch and re-index what changed.
+//! Update: fetch and re-index what changed.
 
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use crate::application::indexer::{
 };
 use crate::application::ports::{ChunkStore, Clock, GitClient, OperationLock, SourceRepository};
 use crate::application::progress::{Progress, NO_PROGRESS};
+use crate::application::search::unknown_source;
 use crate::domain::oid::CommitId;
 use crate::domain::source::Source;
 use crate::domain::source_id::SourceId;
@@ -123,7 +124,7 @@ impl<'a> UpdateSource<'a> {
             let source = resolve_source(self.sources, name)?;
             let entry = self
                 .update_one(source.id())?
-                .ok_or_else(|| AppError::NotFound(format!("no source named {name:?}").into()))?;
+                .ok_or_else(|| unknown_source(self.sources, name))?;
             return Ok(Self::response(vec![entry], None));
         }
         let all = self.sources.list()?;
@@ -737,6 +738,7 @@ mod tests {
             code: code.to_owned(),
             message: String::new(),
             hint: None,
+            details: None,
         }
     }
 
@@ -1061,7 +1063,11 @@ mod tests {
             .execute(&UpdateRequest::named("example.com/o/r"))
             .unwrap_err();
 
-        assert_eq!(error, AppError::Storage(StorageError::ReindexRequired));
+        assert_eq!(
+            error.code(),
+            crate::application::error::ErrorCode::ReindexRequired
+        );
+        assert!(error.stale_source().is_some(), "{error}");
         assert_eq!(error.code().exit_code(), 7);
     }
 
