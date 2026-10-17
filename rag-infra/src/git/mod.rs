@@ -55,6 +55,9 @@ const HOOKS_DIR_NAME: &str = "no-hooks";
 /// Attempts to delete or rename a directory that antivirus or an indexer may be
 /// holding open for a moment.
 const FILESYSTEM_ATTEMPTS: u32 = 5;
+/// A git lock file older than this belongs to a git that was killed: no live process
+/// holds a lock for ten minutes.
+const STALE_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
 /// The ref that pins the last fetched commit.
 const PIN_REF: &str = "refs/rag/head";
 
@@ -289,6 +292,45 @@ impl SystemGitClient {
         Ok(origin.as_deref() == Some(location.as_str()))
     }
 
+    /// Deletes the `*.lock` files of the checkout at `dir` (`shallow.lock`,
+    /// `index.lock`, ref and config locks) that are older than `STALE_LOCK_AGE`. The
+    /// caller holds the operation lock of the source, so no `rag` git of this source
+    /// is running; a lock that is old can only be left by a killed git, and a fresh
+    /// one is left alone (another tool may be working in the directory). Best effort.
+    fn remove_stale_locks(&self, dir: &Path) {
+        let Some(limit) = std::time::SystemTime::now().checked_sub(STALE_LOCK_AGE) else {
+            return;
+        };
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    // Object files are large in number and never locked this way.
+                    if entry.file_name() != "objects" {
+                        pending.push(path);
+                    }
+                } else if kind.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "lock")
+                    && entry
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .is_ok_and(|modified| modified <= limit)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
     /// Shallow-fetches `git_ref` from origin into the repository at `dir`, peels it
     /// to a commit, and pins that commit.
     fn fetch_into(&self, dir: &Path, git_ref: &GitRef) -> Result<CommitId, GitError> {
@@ -355,6 +397,16 @@ impl SystemGitClient {
             None,
             self.local_timeout,
         )?;
+        // Fetched objects stay in one pack instead of thousands of loose files: far
+        // fewer files for antivirus and the filesystem to touch, especially on Windows.
+        for key in ["fetch.unpackLimit", "transfer.unpackLimit"] {
+            self.run_ok(
+                Some(staging),
+                ["config", key, "1"],
+                None,
+                self.local_timeout,
+            )?;
+        }
         self.fetch_into(staging, git_ref)
     }
 
@@ -482,6 +534,7 @@ impl GitClient for SystemGitClient {
         let dest = self.checkout_dir(source);
         // A probe that cannot be answered is an error, never a reason to replace.
         if dest.exists() && self.is_reusable(&dest, location)? {
+            self.remove_stale_locks(&dest);
             return self.fetch_into(&dest, git_ref);
         }
         let io_failure = |error: std::io::Error| {
@@ -505,6 +558,7 @@ impl GitClient for SystemGitClient {
 
     fn fetch_update(&self, source: &SourceId, git_ref: &GitRef) -> Result<CommitId, GitError> {
         let dir = self.existing_checkout(source)?;
+        self.remove_stale_locks(&dir);
         self.fetch_into(&dir, git_ref)
     }
 

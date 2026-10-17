@@ -212,6 +212,21 @@ impl SqliteStore {
         let _ = connection.busy_timeout(self.writer_busy_timeout);
     }
 
+    /// `PRAGMA optimize` on the write connection, without waiting for any lock: lets
+    /// SQLite refresh its statistics where queries have shown they are stale. Best
+    /// effort; returns whether it ran (`false` for a read-only store or when the
+    /// connection is busy). Runs when a writer store is dropped.
+    pub fn optimize(&self) -> bool {
+        let Some(writer) = &self.writer else {
+            return false;
+        };
+        let Ok(connection) = writer.try_lock() else {
+            return false;
+        };
+        let _ = connection.busy_timeout(Duration::ZERO);
+        connection.execute_batch("PRAGMA optimize;").is_ok()
+    }
+
     /// Runs `work` on the read connection (each statement sees committed data).
     fn read<T>(
         &self,
@@ -230,6 +245,12 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(storage_error)?;
         work(&tx)
+    }
+}
+
+impl Drop for SqliteStore {
+    fn drop(&mut self) {
+        self.optimize();
     }
 }
 

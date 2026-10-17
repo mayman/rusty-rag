@@ -106,6 +106,29 @@ fn the_database_runs_in_wal_mode() {
 }
 
 #[test]
+fn a_writer_store_optimizes_the_database_and_a_reader_has_nothing_to_optimize() {
+    let dir = TempDir::new().unwrap();
+    let writer = open(&dir);
+    index(
+        &writer,
+        "a",
+        vec![file(&source_id("a"), "a.rs", "fn alpha() {}", 1)],
+    );
+    assert!(
+        writer.optimize(),
+        "PRAGMA optimize ran on the write connection"
+    );
+    let reader = SqliteStore::open_for_read(dir.path()).unwrap();
+    assert!(!reader.optimize());
+    drop(writer);
+    assert_eq!(
+        find(&reader, "alpha").len(),
+        1,
+        "dropping the writer loses nothing"
+    );
+}
+
+#[test]
 fn open_creates_a_missing_data_directory() {
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("a").join("b");

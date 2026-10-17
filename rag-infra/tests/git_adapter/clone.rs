@@ -422,6 +422,22 @@ fn credentials_are_not_stored_in_the_clone_configuration() {
 }
 
 #[test]
+fn a_clone_keeps_fetched_objects_packed() {
+    let upstream = Upstream::with_files(&[("a.txt", b"1")]);
+    let sandbox = Sandbox::new();
+    let id = upstream.source_id();
+    sandbox
+        .client
+        .clone_shallow(&id, &upstream.location(), &main_ref())
+        .unwrap();
+    let config = std::fs::read_to_string(sandbox.checkout_dir(&id).join("config"))
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(config.contains("unpacklimit = 1"), "{config}");
+    assert_eq!(config.matches("unpacklimit = 1").count(), 2, "{config}");
+}
+
+#[test]
 fn a_slow_git_operation_times_out() {
     let upstream = Upstream::with_files(&[("a.txt", b"1")]);
     let sandbox = Sandbox::new();

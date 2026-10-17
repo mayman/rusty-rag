@@ -156,3 +156,80 @@ fn an_unreachable_origin_is_a_network_error_not_a_panic() {
     assert!(matches!(error, GitError::NotFound(_)), "{error:?}");
     std::fs::rename(&moved, &upstream.path).unwrap();
 }
+
+/// Plants the lock file a killed git leaves behind, last touched `age` ago.
+fn plant_lock(checkout: &std::path::Path, relative: &str, age: std::time::Duration) {
+    let path = checkout.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[test]
+fn stale_lock_files_of_a_killed_git_are_removed_before_a_fetch() {
+    let (upstream, sandbox, _) = cloned(&[("a.txt", b"1")]);
+    let id = upstream.source_id();
+    let checkout = sandbox.checkout_dir(&id);
+    plant_lock(&checkout, "shallow.lock", HOUR);
+    plant_lock(&checkout, "refs/rag/head.lock", HOUR);
+    plant_lock(&checkout, "config.lock", HOUR);
+    upstream.write("b.txt", b"2");
+    let newer = upstream.commit("two");
+
+    let fetched = sandbox.client.fetch_update(&id, &main_ref()).unwrap();
+
+    assert_eq!(fetched.as_str(), newer);
+    for lock in ["shallow.lock", "refs/rag/head.lock", "config.lock"] {
+        assert!(!checkout.join(lock).exists(), "{lock} should be gone");
+    }
+}
+
+#[test]
+fn a_fresh_lock_file_is_left_alone_and_the_fetch_is_busy() {
+    let (upstream, sandbox, _) = cloned(&[("a.txt", b"1")]);
+    let id = upstream.source_id();
+    let checkout = sandbox.checkout_dir(&id);
+    plant_lock(&checkout, "shallow.lock", std::time::Duration::ZERO);
+    upstream.write("b.txt", b"2");
+    upstream.commit("two");
+
+    let error = sandbox.client.fetch_update(&id, &main_ref()).unwrap_err();
+
+    assert_eq!(error, GitError::Busy);
+    assert!(checkout.join("shallow.lock").exists());
+}
+
+#[test]
+fn a_reused_checkout_is_cleared_of_stale_locks_by_clone_shallow_too() {
+    let (upstream, sandbox, _) = cloned(&[("a.txt", b"1")]);
+    let id = upstream.source_id();
+    let checkout = sandbox.checkout_dir(&id);
+    plant_lock(&checkout, "shallow.lock", HOUR);
+    upstream.write("b.txt", b"2");
+    let newer = upstream.commit("two");
+
+    let fetched = sandbox
+        .client
+        .clone_shallow(&id, &upstream.location(), &main_ref())
+        .unwrap();
+
+    assert_eq!(fetched.as_str(), newer);
+    assert!(!checkout.join("shallow.lock").exists());
+}
+
+#[test]
+fn only_lock_files_are_ever_removed() {
+    let (upstream, sandbox, _) = cloned(&[("a.txt", b"1")]);
+    let id = upstream.source_id();
+    let checkout = sandbox.checkout_dir(&id);
+    plant_lock(&checkout, "refs/rag/keep.txt", HOUR);
+    plant_lock(&checkout, "objects/keep.lockfile", HOUR);
+
+    sandbox.client.fetch_update(&id, &main_ref()).unwrap();
+
+    assert!(checkout.join("refs/rag/keep.txt").exists());
+    assert!(checkout.join("objects/keep.lockfile").exists());
+}
