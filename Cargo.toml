@@ -5,14 +5,22 @@ members = ["rag-core", "rag-infra", "rag-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Declared MSRV only; NOT tested in CI. The pinned toolchain (rust-toolchain.toml) is what actually builds.
 rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+proptest = "1"
+tempfile = "3"
+syn = { version = "2", features = ["full", "visit"] }
 
-# rag-cli is the presentation layer and may print and exit, so it does not opt in.
+# Every crate opts in with `[lints] workspace = true` (scripts/check.ps1 verifies it).
+# The print/exit denies apply workspace-wide; rag-cli (the presentation layer)
+# relaxes them with a crate-level allow in its main.rs, which cannot affect core/infra.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

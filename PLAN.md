@@ -31,7 +31,17 @@ Updated as work lands. `[x]` = done and verified, `[~]` = done but not yet indep
 - [x] `scripts/check.ps1` quality gate
 - [x] Slim architecture test (dependency-list check via `cargo metadata`, source tripwire, `rag-core/clippy.toml` bans proven with a planted violation)
 - [x] Re-run the gate myself and enable the guard hook
-- [ ] First commit (waiting for your approval)
+- [x] First commit `ff93efd`; reviewed by `architect` (findings below)
+
+**Review fixes after commit ff93efd** (privileged agent on Sonnet 5.5; verified by my own `check.ps1` and `test-guard.ps1` runs)
+- [x] Dependency allowlist updated (`blake3`; dev-deps `proptest`, `tempfile`, `serde_json`, `syn`); `testkit` feature; `rag-cli` opts into workspace lints
+- [x] Architecture test rewritten on `syn` (19 tests: groups, aliases, inline paths, strings/comments, vacuous-pass guards, dev-dep allowlist)
+- [x] `scripts/check.ps1` hardened (stderr-safe, PATH append, `--locked`, architecture-test-ran check, lints check, deleted-test check, protected-file hash manifest)
+- [x] Guard script hardened and covered by `scripts/test-guard.ps1` (103 cases, 0 failed); fail-closed hook command applied
+- [x] README.md, SETUP.md, CONTRIBUTING.md added
+- [x] Guard fails closed on empty/unparseable/tool-less hook input (3 new cases, 106 total, 0 failed); manifest regenerated after the approved change; gate rejected the stale manifest first, passes after
+- [x] Committed (see git log)
+- [ ] Live-fire test: confirm the hook blocks a protected edit inside a real `rust-engineer` run (needs a session reload to load the agent's hook)
 
 **Build order (section 8)**
 - [ ] 2. Tokenizer and chunker (Haiku)
@@ -65,7 +75,9 @@ Updated as work lands. `[x]` = done and verified, `[~]` = done but not yet indep
 | Crates | Three crates: `rag-core` (domain + application, depends only on serde and one pure hashing crate), `rag-infra` (SQLite, git, filesystem, lock, clock, `ignore`, `dirs`), `rag-cli` (binary, composition root). MCP wrapper becomes a second binary using core + infra |
 | Data directory | Overridable with the `RUSTY_RAG_HOME` environment variable; defaults per OS. All tests use it with per-test temp dirs |
 | Time | `IndexedAt` is an epoch-seconds domain type; the domain never reads the clock (a `Clock` port in application supplies it) |
-| Hashing | Chunk and source ids use a pure hashing crate (sha2 or blake3) allowed in `rag-core`; never `DefaultHasher` (unstable across releases) |
+| Hashing | Chunk and source ids use `blake3` (pure Rust, allowed in `rag-core`); never `DefaultHasher` (unstable across releases) |
+| Dependency allowlist | `rag-core` normal deps: `serde`, `blake3`. `rag-core` dev-deps: `proptest`, `tempfile`. `rag-infra`: `rusqlite` (bundled), `ignore`, `dirs`, `thiserror`, `serde_json` as needed. `rag-cli`: `clap`, `serde_json`, plus rag-core/rag-infra. Architecture test dev-dep: `syn`. Golden files via `include_str!`, no `insta` for now. Anything else needs user approval |
+| Test locations | Domain/application tests in `rag-core`. Adapter, contract, and relevance tests (they need SQLite/git) in `rag-infra/tests`. End-to-end CLI tests in `rag-cli/tests`. Never make rag-core dev-depend on rag-infra |
 | Local paths | `rag add <local path>` indexes only the committed HEAD of a git repo (so every hit has a commit and blob oid); uncommitted files are ignored |
 | Platforms | Windows first; code kept portable for macOS and Linux (CI builds in v1.x) |
 | Skill | `~/.claude/skills/rag/SKILL.md`, then MCP wrapper later |

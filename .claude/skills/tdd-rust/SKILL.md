@@ -27,10 +27,12 @@ Rules:
 |---|---|---|---|
 | Domain | Fast unit tests, no I/O | Plain values, table-driven cases, property tests for invariants | `#[cfg(test)]` module next to the code |
 | Application | Use-case tests | In-memory fakes of every port; assert on responses and recorded calls | `#[cfg(test)]` module or `rag-core/tests/` |
-| Infrastructure | Adapter contract/integration tests | Real SQLite (in-memory or temp dir), real `git` against local temp repos (`file://`), real filesystem in temp dirs | `rag-core/tests/` |
-| Presentation | CLI end-to-end | Spawn the built binary with a temp data dir (env override); assert JSON, exit codes, stderr | `rag-cli/tests/` |
-| Architecture | Dependency rule | Test that scans `domain/` and `application/` sources for forbidden imports | `rag-core/tests/architecture.rs` |
-| Relevance | Search quality | About 20 queries over a fixed corpus asserting expected hits appear in the top k | `rag-core/tests/relevance.rs` |
+| Infrastructure | Adapter contract/integration tests | Real SQLite (in-memory or temp dir), real `git` against local temp repos (`file://`), real filesystem in temp dirs. rag-core must never dev-depend on rag-infra | `rag-infra/tests/` |
+| Presentation | CLI end-to-end | Spawn the built binary with a temp data dir (`RUSTY_RAG_HOME`); assert JSON, exit codes, stderr | `rag-cli/tests/` |
+| Architecture | Dependency rule | Protected test: `cargo metadata` allowlist plus a syntax-tree check of `domain/` and `application/`. Do not edit it | `rag-core/tests/architecture.rs` |
+| Relevance | Search quality | About 20 queries over a fixed corpus asserting expected hits appear in the top k (needs SQLite, so it lives with the adapter) | `rag-infra/tests/relevance.rs` |
+
+Golden files are loaded with `include_str!` (rag-core bans `std::fs` through clippy, and you must not add `#[allow]`). Fakes live behind a `testkit` feature of rag-core so `rag-infra` and `rag-cli` tests can use them.
 
 Keep most tests at the domain and application level. Few slow tests at the edges.
 

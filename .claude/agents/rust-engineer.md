@@ -12,7 +12,7 @@ hooks:
       hooks:
         - type: command
           shell: powershell
-          command: 'powershell -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PROJECT_DIR\scripts\guard-protected.ps1"; exit $LASTEXITCODE'
+          command: 'powershell -NoProfile -ExecutionPolicy Bypass -File "$env:CLAUDE_PROJECT_DIR\scripts\guard-protected.ps1"; if ($LASTEXITCODE -ne 0) { exit 2 }'
           onFailure: block
           statusMessage: Checking protected paths
 ---
