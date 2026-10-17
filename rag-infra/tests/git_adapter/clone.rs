@@ -190,9 +190,11 @@ fn a_probe_that_fails_never_replaces_the_existing_clone() {
         .unwrap();
 
     // Every local git call times out, including the one that inspects the checkout.
+    // A zero timeout expires at the first check, so the outcome does not depend on how
+    // fast git starts (a 1 ms timeout let a quick git finish first on fast Linux runners).
     let impatient = sandbox
         .another_client()
-        .with_timeouts(Duration::from_secs(300), Duration::from_millis(1));
+        .with_timeouts(Duration::from_secs(300), Duration::ZERO);
     let error = impatient
         .clone_shallow(&id, &upstream.location(), &main_ref())
         .unwrap_err();
@@ -442,7 +444,7 @@ fn a_slow_git_operation_times_out() {
     let upstream = Upstream::with_files(&[("a.txt", b"1")]);
     let sandbox = Sandbox::new();
     let client = SystemGitClient::new(sandbox.layout.repos_dir(), sandbox.layout.tmp_dir())
-        .with_timeouts(Duration::from_millis(1), Duration::from_millis(1));
+        .with_timeouts(Duration::ZERO, Duration::ZERO);
     let id = upstream.source_id();
 
     let error = client
