@@ -105,8 +105,15 @@ impl DataLayout {
     /// makes), which fails across volumes. Both directories must exist
     /// (`ensure_dirs`). Leaves nothing behind.
     pub fn verify_same_volume(&self) -> Result<(), ConfigError> {
-        let from = self.tmp_dir().join(".volume-probe");
-        let to = self.repos_dir().join(".volume-probe");
+        // Unique per process and call, so concurrent `rag` processes never share a probe file.
+        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            ".volume-probe-{}-{}",
+            std::process::id(),
+            PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let from = self.tmp_dir().join(&name);
+        let to = self.repos_dir().join(&name);
         let failure = |message: String| ConfigError::CannotMoveBetweenDirs {
             from: self.tmp_dir().display().to_string(),
             to: self.repos_dir().display().to_string(),

@@ -156,11 +156,7 @@ impl SqliteStore {
 
         let mut writer = Connection::open(&file).map_err(storage_error)?;
         writer.busy_timeout(busy_timeout).map_err(storage_error)?;
-        writer
-            .query_row("PRAGMA journal_mode = WAL", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(storage_error)?;
+        enable_wal(&writer, busy_timeout)?;
         writer
             .execute_batch(&format!(
                 "PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};"
@@ -256,6 +252,28 @@ fn lock(connection: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
 }
 
 /// Opens the read connection on `file` and verifies the schema with plain `SELECT`s.
+/// Switches a database to WAL. When several processes do this to a brand-new file at
+/// once, SQLite can answer `BUSY` straight away without consulting the busy handler,
+/// so the switch is retried (it is idempotent) until `wait` has passed.
+fn enable_wal(connection: &Connection, wait: Duration) -> Result<(), StorageError> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let switched = connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        });
+        match switched {
+            Ok(_) => return Ok(()),
+            Err(error) => match storage_error(error) {
+                StorageError::Busy if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return Err(other),
+            },
+        }
+    }
+}
+
+/// Opens the read connection.
 ///
 /// A WAL database normally needs write access to its directory even to be read (the
 /// shared-memory file). When the directory cannot be written and no write-ahead log

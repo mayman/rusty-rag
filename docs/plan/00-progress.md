@@ -35,18 +35,22 @@ Updated as work lands. `[x]` = done and verified, `[~]` = done but not yet indep
 - [x] README.md, SETUP.md, CONTRIBUTING.md added
 - [x] Guard fails closed on empty/unparseable/tool-less hook input (3 new cases, 106 total, 0 failed); manifest regenerated after the approved change; gate rejected the stale manifest first, passes after
 - [x] Committed (see git log)
-- [ ] Live-fire test: confirm the hook blocks a protected edit inside a real `rust-engineer` run (needs a session reload to load the agent's hook)
+- [x] Live-fire test: the hook fired in real `rust-engineer` runs (it blocked `check.ps1` variants, script runs and a delete); it does not guard git worktrees, so worktree lanes are reviewed by diff
 
-**Build order (section 8)**
-- [ ] 2. Tokenizer and chunker (Haiku)
-- [ ] 3. SQLite store, FTS5, local-folder indexing, query escaping, AND/OR (Sonnet 5.5)
-- [ ] 4. Output layer: JSON schema, `--human`, error and exit codes 0 to 7, output caps (Haiku)
-- [ ] 5. Git: add, update (manifest diff), remove, locking, timeouts, progress, search-during-update test (Sonnet 5.5)
-- [ ] 6. `show` with path safety, `reindex`, `list` (Sonnet 5.5)
-- [ ] 7. Relevance set (about 20 queries), git integration tests, concurrency test (Haiku)
-- [ ] 8. Skill `~/.claude/skills/rag/SKILL.md` (Haiku)
-- [ ] 9. Real-world test on 2 to 3 of your repos, tune chunking and weights
-
+**Build order (section 8)** (each step reviewed by architect and system-design, plus ux-reviewer for the CLI)
+- [x] 2. Tokenizer and chunker (domain; reworked after review; commit e08e0c3)
+- [x] 2b/2c/2d. Ports, DTOs, domain value objects, fakes and shared contract tests (three review rounds; doc 12)
+- [x] 3. SQLite/FTS5 store (lane/sqlite), hardened after review (read-only open, query shape, unique chunk ids, per-source versions)
+- [x] 4. Output layer (rendering only after the CLI wiring)
+- [x] 5a. Git adapter, operation lock, config, clock (lane/git), hardened after review
+- [x] 5b. Indexing use cases: add, update, remove, reindex (lane/usecases-index)
+- [x] 6. Query use cases: search, show, list (lane/usecases-query)
+- [x] CLI wiring and composition root; end-to-end tests run the real binary (commit 3f905c4)
+- [x] Review round 3 round 1: safety and behaviour fixes (doc 12.2; commits 0f9d031, ee3640b, a192e95)
+- [~] Review round 3 round 2: output schema and UX fixes (in progress)
+- [ ] SKILL.md rewrite to match the final CLI, then install to `~/.claude/skills/rag/` (step 8)
+- [ ] 7. Relevance set (about 20 queries), git integration tests, concurrency test
+- [ ] 9. Real-world test on 2 to 3 of your repos, tune chunking and weights, measure (see the system-design lists)
 **Open items (section 10)**
 - [ ] Sensitive-repo exclusion setting, if needed
 - [ ] macOS/Linux CI builds in v1 or later

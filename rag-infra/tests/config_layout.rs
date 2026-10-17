@@ -114,3 +114,33 @@ fn a_rename_from_tmp_into_repos_is_verified_to_work() {
         "{error:?}"
     );
 }
+
+#[test]
+fn many_callers_verifying_at_once_do_not_trip_over_each_other() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(temp.path().join("data"));
+    layout.ensure_dirs().unwrap();
+    for _ in 0..20 {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| layout.verify_same_volume()))
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+    }
+}
+
+#[test]
+fn a_missing_repos_directory_is_still_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(temp.path().join("data"));
+    layout.ensure_dirs().unwrap();
+    std::fs::remove_dir(layout.repos_dir()).unwrap();
+    let error = layout.verify_same_volume().unwrap_err();
+    assert!(
+        matches!(error, ConfigError::CannotMoveBetweenDirs { .. }),
+        "{error:?}"
+    );
+}

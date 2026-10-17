@@ -753,3 +753,23 @@ fn a_checkpoint_never_waits_for_a_reader() {
     reader.execute_batch("ROLLBACK").unwrap();
     assert_eq!(find(&store, "beta"), ["b.md"]);
 }
+
+#[test]
+fn many_writers_opening_a_fresh_database_at_once_all_succeed() {
+    use rag_infra::sqlite::SqliteStore;
+    for _ in 0..30 {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("data");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| scope.spawn(|| SqliteStore::open_for_write(&directory).map(|_| ())))
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .unwrap()
+                    .expect("a concurrent first open succeeds");
+            }
+        });
+    }
+}
