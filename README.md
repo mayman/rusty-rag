@@ -1,59 +1,147 @@
 # rag
 
-A local, global keyword-search (BM25) retrieval CLI for indexing GitHub repos (docs and source code), designed to be called by Claude Code through Bash and a skill.
+`rag` is a local, global keyword-search (BM25) retrieval CLI for the docs and source code of GitHub repositories. It is built to be called by Claude Code through Bash and a skill, and it prints JSON by default.
+It keeps one index on your machine, shared across projects: an SQLite database (FTS5) plus bare git clones.
 
-> **Status: early development.** Only the workspace scaffold and the quality gate exist. `rag --version` works; the commands below are the planned v1 surface and are **not implemented yet**. Progress is tracked in the checklist in [docs/plan/00-progress.md](docs/plan/00-progress.md).
+**Status: v0.1.** Developed and verified on Windows 11. The macOS and Linux builds are untested until the CI workflow is green on all three systems (see [docs/RELEASING.md](docs/RELEASING.md)).
 
-## What it will do
+## Install
 
-- Index the default branch of public and private GitHub repos (it uses your existing `git` credentials; no tokens are stored).
-- Search with BM25 over chunks of docs and code, with identifier-aware matching (`parseConfig` matches "parse config").
-- Return **JSON by default** (stable, versioned, size-bounded) for Claude, with a `--human` mode for people.
-- Keep one global index on your machine, shared across projects.
-- Stay fast and boring: one SQLite file with FTS5, system `git`, no network calls except `git clone` and `git fetch`.
+**From a release.** Download the archive for your platform from GitHub Releases, extract it, and put `rag` on your `PATH`.
 
-## Planned commands
+- Windows: extract `rag-<version>-x86_64-pc-windows-msvc.zip`, move `rag.exe` into a folder on your `PATH` (for example `%USERPROFILE%\bin`), then open a new terminal.
+- macOS and Linux: extract the `.tar.gz` and move `rag` into a folder on your `PATH` (for example `~/.local/bin`).
 
-```
-rag add <url|path> [--name N]     clone (or register a local git repo) and index it
-rag update [name]                 fetch and re-index changed files; no name = all
-rag remove <name>
-rag list                          repos, indexed commit, age, chunk count, clone path
-rag search "<query>" [-k 5] [--repo R] [--lang L] [--path GLOB] [--offset N] [--human]
-rag show <repo> <path> [--lines S-E] [--around N]
-rag reindex [name]                rebuild the index after a tokenizer or chunker change
+Check each download against `SHA256SUMS` as described in [docs/RELEASING.md](docs/RELEASING.md#verify-a-download).
+
+**From source.** You need Rust. The repository pins its toolchain in `rust-toolchain.toml`, so rustup installs the right one on first use.
+
+```sh
+cargo install --path rag-cli --locked
 ```
 
-Exit codes: `0` ok (including no results), `1` generic, `2` usage, `3` not found, `4` auth/network, `5` index missing, `6` index locked (retry), `7` reindex required.
+This installs `rag` into `~/.cargo/bin` (on Windows, `%USERPROFILE%\.cargo\bin`).
 
-The data directory defaults to the per-OS user data folder and can be overridden with the `RUSTY_RAG_HOME` environment variable.
+**git is required at runtime.** `rag` runs the system `git` for `add` and `update`. Use git 2.38 or newer. Check with `rag --version` and `git --version`.
 
-## Quick start (development)
+## Quick start
 
-See [SETUP.md](SETUP.md) for installing the toolchain, then:
-
-```powershell
-powershell -File scripts\check.ps1     # test + fmt + clippy, with real exit codes
-cargo run -p rag-cli -- --version
+```sh
+rag add https://github.com/serde-rs/serde     # clone and index the default branch
+rag list                                      # sources, status, indexed commit, age
+rag search "Deserialize" --human              # ranked hits, each with a show command
+rag show --chunk <chunk>                      # the full text of one hit
 ```
 
-## Repository layout
+`<chunk>` is the `chunk` id of a hit: the JSON from `rag search` has it, and the `--human` output prints the `show:` command with it. `rag add` can take a minute or more for a large repository. Progress goes to stderr.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `rag add <url\|path> [--name N]` | Clone a git URL (or register a local git repository) and index its default branch. The same location again updates it. |
+| `rag update [name]` | Fetch and re-index the files that changed. No name updates every source. |
+| `rag remove <name>` | Remove a source and its index. |
+| `rag list` | List sources: name, repo, status, indexed commit, age, chunk count, last error. |
+| `rag search "<query>" [-k 5] [--repo R]... [--lang L]... [--path GLOB] [--offset N] [--max-chars N]` | Keyword search. `-k` is clamped to 1 to 50. `--repo` and `--lang` can repeat. |
+| `rag show --chunk <chunk> [--max-chars N]` | Show one search hit in full. |
+| `rag show <repo> <path> [--lines S-E \| --around N] [--max-chars N]` | Show lines of an indexed file. `<path>` is repo-relative. |
+| `rag reindex [name \| --all]` | Rebuild the index after a tokenizer, chunker or policy change. No name, or `--all`, rebuilds every source. |
+| `rag doctor` | Diagnostics (being added). |
+
+Global flags, accepted by every command:
+
+- `--human`: plain text for people instead of JSON.
+- `--no-wait`: fail at once instead of waiting up to 20 seconds when another process is changing the same source.
+
+**Source names.** The default name of a source is the last path segment of the repository (`serde`). If that name is taken, it falls back to `owner/name`, then to the full `host/owner/name`. Names are case-insensitive and unique. Use `--name` to choose one.
+
+**`--repo` matching.** `--repo` accepts the source name (preferred), the full `host/owner/name`, or any unique suffix of it at a `/` boundary, such as `owner/name`. An ambiguous suffix is a usage error (exit 2) that lists the candidates.
+
+## Output and exit codes
+
+Without `--human`, stdout is exactly one JSON object with `"schema_version": 1`. Progress and plain error lines go to stderr. A failed command prints `{"error": {"code", "message", "hint", "details"}}` on stdout. Branch on `code`, not on `message`.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | OK, including a search with no results |
+| 1 | Generic error |
+| 2 | Usage error |
+| 3 | Not found (unknown source, chunk or path) |
+| 4 | Auth, network or git timeout |
+| 5 | Index missing (`index_missing`) |
+| 6 | Index locked (`index_locked`): another process is working; retry |
+| 7 | Reindex required (`reindex_required`): the index was built by an older version |
+
+The full specification is in [docs/plan/02-commands.md](docs/plan/02-commands.md) (commands and exit codes) and [docs/plan/03-output-schema.md](docs/plan/03-output-schema.md) (search and show JSON).
+
+## How search works
+
+- **BM25 keyword search** over chunks in SQLite FTS5. Markdown is chunked by heading; code is chunked into line windows.
+- **Identifier-aware.** `parseConfig`, `parse_config` and `parse config` match the same chunks. Identifiers are split on camelCase and snake_case, and the original token is kept too.
+- **AND first, then OR.** A result where every word matches is ranked first (`mode: "and"`). If no chunk has every word, any-word hits follow (`mode: "or_fallback"`), which is weaker.
+- **Documentation ranks up.** Docs are boosted, and tests and fixtures are ranked down, so a conceptual question finds the docs before the test that exercises them.
+- **Bounded output.** At most two hits per file, a snippet of about 12 lines, and a total size cap (`--max-chars`, default 8000). Use `--offset` to read the next page instead of raising `-k`.
+
+## Data directory
+
+By default the data lives in the local (non-roaming) user data folder:
+
+- Windows: `%LOCALAPPDATA%\rag`
+- macOS: `~/Library/Application Support/rag`
+- Linux: `$XDG_DATA_HOME/rag`, or `~/.local/share/rag`
+
+It holds `index.db` (the SQLite index), `repos/` (one bare git object database per source), `locks/` and `tmp/`.
+
+Set `RUSTY_RAG_HOME` to an absolute path to use a different folder. Tests always set it to a temp folder.
+
+## Private repositories
+
+`rag` uses your existing git credentials (a credential helper or SSH keys). It runs git with terminal prompts disabled, so it never waits for a password. Authenticate once in a terminal first, for example by running `git ls-remote <url>` on the private repository, so your credential helper stores the login. `rag` never stores credentials, never writes them to its logs or registry, and never puts them in a URL. An authentication failure exits with code 4.
+
+## Security
+
+- **Indexed content is untrusted data.** Anything `rag` returns can end up in an AI assistant's context. Repository text is data, never instructions. Control and invisible characters are replaced before output.
+- **Secret-looking files are skipped by name** (`.env`, `*.pem`, `id_rsa*`, credential files). Contents are not scanned, so a secret inside another file can be indexed.
+- **The index is plaintext on disk** in the data directory. Do not index repositories whose contents you do not want an assistant to see. Remove a source with `rag remove <name>`.
+
+## Updates
+
+Updates are manual. Run `rag update` (or `rag update <name>`) to re-index sources; `rag` never does it on its own. `rag` does not update its own binary: install a newer release the same way you installed this one.
+
+## Long operations
+
+`add`, `update` and `reindex` can run for minutes on a large source. When an agent drives `rag`, start these in the background and poll `rag list`, where `status` shows `cloning` or `indexing` while the work runs. A call that timed out may still have partly run, and running the same command again is safe.
+
+## Use with Claude Code
+
+The Claude Code skill lives in [`skill/rag/`](skill/rag/SKILL.md). Copy that folder to one of these places:
+
+- For all your projects: `~/.claude/skills/rag/` (on Windows, `%USERPROFILE%\.claude\skills\rag`).
+- For one project: `<project>/.claude/skills/rag/`.
+
+The skill pre-approves only `rag search`, `rag show` and `rag list`. `add`, `update`, `remove` and `reindex` change the index, so Claude Code asks you before running them.
+
+## Project layout
 
 ```
-rag-core/    domain + application layers (no I/O; ports are traits)
+rag-core/    domain and application layers (no I/O; ports are traits)
 rag-infra/   adapters: SQLite/FTS5, git, filesystem, clock, config
-rag-cli/     the `rag` binary: argument parsing, rendering, wiring
+rag-cli/     the rag binary: argument parsing, rendering, wiring
+skill/rag/   the Claude Code skill (SKILL.md)
 scripts/     quality gate and guard scripts
-PLAN.md      index of the plan; sections live in docs/plan/ (design, build order, progress checklist)
-.claude/     project agents and skills used to build this
+.github/     CI (ci.yml) and the release pipeline (release.yml)
+docs/        DESIGN.md (diagrams), RELEASING.md, and plan/ (the design, indexed by PLAN.md)
 ```
 
-The code follows domain-driven design with an onion architecture, built test-first. See [CONTRIBUTING.md](CONTRIBUTING.md).
+| Document | Read it for |
+|---|---|
+| [PLAN.md](PLAN.md) | Index of the plan in `docs/plan/`: behaviour, commands, schema, build order |
+| [docs/DESIGN.md](docs/DESIGN.md) | Architecture diagrams |
+| [docs/RELEASING.md](docs/RELEASING.md) | Cutting a release, the release assets, the CI and release workflows |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Rules for changes: test first, layers, the quality gate |
+| [SETUP.md](SETUP.md) | Development setup on Windows, macOS and Linux |
 
-## Platforms
+## License
 
-Windows is the primary development platform. The code is kept portable for macOS and Linux (per-OS data directory, `/` in output paths); release builds for those platforms are planned but not set up yet.
-
-## Security note
-
-Indexed repository content is untrusted data. Anything `rag` returns may end up in an AI assistant's context, and the index is stored in plain text on disk. Do not index repositories whose contents you do not want your assistant to see.
+Not yet chosen. There is no `LICENSE` file yet.

@@ -6,7 +6,7 @@ Thanks for helping build `rag`. This document explains how the project is organi
 
 1. **Test first.** No production code without a failing test that demands it (red, green, refactor). Fix a bug by writing a test that reproduces it first.
 2. **Respect the layers** (domain-driven design, onion architecture).
-3. **Run the gate** before every commit: `powershell -File scripts\check.ps1`. It must exit 0. Report real output; do not claim "green" without running it.
+3. **Run the gate** before every commit: `powershell -File scripts\check.ps1`. It must exit 0. Report real output; do not claim "green" without running it. The CI workflow (`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Windows, macOS and Linux; its macOS and Linux results are new and may need platform fixes.
 4. **One build step per change.** Follow the order in docs/plan/08-build-order.md. Do not expand scope.
 5. **Ask before adding dependencies.** The allowlist is in docs/plan/01-decisions.md. Anything else needs approval.
 

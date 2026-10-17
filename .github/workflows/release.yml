@@ -1,9 +1,10 @@
-# Release pipeline for the `rag` CLI.
+# Release pipeline for the `rag` CLI. Read docs/RELEASING.md for the full procedure.
 #
-# - Push of a tag `v*` (for example v0.1.0 or v0.2.0-rc.1): builds every target and
-#   publishes a GitHub Release with the archives and SHA256SUMS.
-# - workflow_dispatch: builds every target and uploads the archives as workflow
-#   artifacts only (dry run, no release).
+# - Push of a tag `v*` (for example v0.1.0 or v0.2.0-rc.1): runs the CI workflow, builds
+#   every target, creates a DRAFT GitHub Release, uploads the archives and SHA256SUMS,
+#   checks the asset list, and then publishes the release.
+# - workflow_dispatch: a dry run. Runs the CI workflow and builds every target, and uploads
+#   the archives as workflow artifacts only. It never creates or changes a release.
 #
 # Action pins: the actions below are official GitHub actions at their current major
 # version. The maintainer may pin each one to a full commit SHA (see docs/RELEASING.md).
@@ -16,7 +17,8 @@ on:
       - "v*"
   workflow_dispatch:
 
-# Least privilege by default. Only the release job gets write access.
+# Least privilege by default. Only the release job gets write access. GH_TOKEN is set only
+# on the steps that call gh.
 permissions:
   contents: read
 
@@ -76,9 +78,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  ci:
+    # The same checks as ci.yml (fmt, clippy, tests on Windows, macOS and Linux).
+    # Runs on tag pushes and on dry runs; build waits for it.
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs: [verify, ci]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -101,11 +109,13 @@ jobs:
             archive: tar.gz
             exe_suffix: ""
             native: false
+          # Built on glibc 2.35: runs on glibc 2.35 or newer.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
             exe_suffix: ""
             native: true
+          # Built on glibc 2.39 (Ubuntu 24.04): runs on glibc 2.39 or newer only.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
@@ -127,17 +137,6 @@ jobs:
           set -euo pipefail
           rustup show
           rustup target add "$TARGET"
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4 # maintainer may pin to a full commit SHA
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Build release binary
         run: cargo build --release --locked -p rag-cli --target "$TARGET"
@@ -218,7 +217,6 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
@@ -239,18 +237,81 @@ jobs:
           sha256sum rag-*.zip rag-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create the release, or upload to the existing one
+      - name: Check for an existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cd dist
-          assets=(rag-*.zip rag-*.tar.gz SHA256SUMS)
+          err="$RUNNER_TEMP/gh-release-view.err"
+          # Only a draft from an earlier run may be resumed. A published release is never changed.
+          if view="$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>"$err")"; then
+            if [ "$view" = "true" ]; then
+              echo "Release $TAG is a draft from an earlier run; it will be resumed."
+              echo "state=draft" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Release $TAG is already published. This workflow never changes a published release. Cut the next version instead (see docs/RELEASING.md)." >&2
+              exit 1
+            fi
+          elif grep -qi 'not found' "$err"; then
+            echo "No release $TAG yet; a draft will be created."
+            echo "state=new" >> "$GITHUB_OUTPUT"
+          else
+            cat "$err" >&2
+            echo "::error::Could not check whether release $TAG exists." >&2
+            exit 1
+          fi
+
+      - name: Create the draft release
+        if: steps.existing.outputs.state == 'new'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           prerelease=()
           if [[ "$TAG" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; uploading assets with --clobber."
-            gh release upload "$TAG" "${assets[@]}" --clobber
-          else
-            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes "${prerelease[@]}"
+          gh release create "$TAG" --draft --title "$TAG" --generate-notes "${prerelease[@]}"
+
+      - name: Upload assets to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ steps.existing.outputs.state }}
+        run: |
+          set -euo pipefail
+          cd dist
+          assets=(rag-*.zip rag-*.tar.gz SHA256SUMS)
+          # --clobber is allowed only when resuming a draft; it never applies to a published release.
+          clobber=()
+          if [ "$STATE" = "draft" ]; then
+            clobber=(--clobber)
           fi
+          gh release upload "$TAG" "${assets[@]}" "${clobber[@]}"
+
+      - name: Verify the draft's asset list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected="$(cd dist && printf '%s\n' rag-*.zip rag-*.tar.gz SHA256SUMS | sort)"
+          actual="$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::The assets on the draft $TAG do not match the build outputs." >&2
+            echo "Expected:" >&2
+            echo "$expected" >&2
+            echo "Found:" >&2
+            echo "$actual" >&2
+            echo "Delete the draft (gh release delete $TAG --yes, which keeps the tag) and re-run the workflow." >&2
+            exit 1
+          fi
+          echo "Assets on $TAG:"
+          echo "$actual"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false
+          echo "Published $TAG."

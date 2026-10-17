@@ -1,0 +1,77 @@
+# CI for the `rag` CLI: rustfmt, clippy and the test suite on Windows, macOS and Linux.
+#
+# Read this first:
+# - The project's local quality gate is scripts\check.ps1 (Windows PowerShell). It also
+#   checks protected files and the lint blocks. This workflow runs the cargo steps only.
+# - The macOS and Linux test runs are NEW. They may reveal platform-specific test failures
+#   that need fixing: the tests were developed on Windows only, and some use taskkill, .exe
+#   names or Windows paths. Until this workflow is green on all three systems, the macOS and
+#   Linux archives are untested.
+#
+# Triggers: push to main, pull requests, manual runs (workflow_dispatch), and workflow_call,
+# which lets release.yml run this workflow as a gate before it builds.
+#
+# Only official GitHub actions are used. The toolchain is the one pinned in
+# rust-toolchain.toml, which rustup reads. target/ is never cached.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per ref at a time. Pull request runs replace older runs of the same pull request.
+# Runs on main and runs called from release.yml are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    env:
+      # rag runs git itself with prompts disabled; this keeps test git calls from hanging.
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4 # maintainer may pin to a full commit SHA
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Set a git identity for tests
+        # Tests that create commits set their own identity. This only covers a runner
+        # without a global identity.
+        run: |
+          set -euo pipefail
+          git config --global user.name "rag CI"
+          git config --global user.email "rag-ci@users.noreply.github.com"
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
