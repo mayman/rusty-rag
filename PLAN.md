@@ -20,5 +20,6 @@ Status: design agreed through review by the `architect`, `system-design`, and `u
 | [09-later.md](docs/plan/09-later.md) | 9. Later (not v1) | scope questions |
 | [10-open-items.md](docs/plan/10-open-items.md) | 10. Open items | unresolved decisions |
 | [11-scaffold-fixes.md](docs/plan/11-scaffold-fixes.md) | 11. Scaffold review fixes | history only |
+| [12-contract-decisions.md](docs/plan/12-contract-decisions.md) | 12. Port contract decisions | any port, store, git or search work (overrides sections 2 to 5 where they differ) |
 
 Section numbers are stable: other documents say "PLAN section 8" meaning `docs/plan/08-build-order.md`.

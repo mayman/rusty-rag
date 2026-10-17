@@ -1,0 +1,40 @@
+## 12. Port contract decisions (from the step 2b reviews)
+
+These decisions revise the 2b ports before the phase B lanes start. They override earlier text in sections 2 to 5 where they differ.
+
+**Atomicity and concurrency**
+- One transactional write: `commit_index(source_with_new_revision, expected_base: Option<&CommitId>, &IndexChanges)` writes the source row (commit, indexed_at, index versions, status) and the file/chunk/FTS changes in a single transaction. A mismatched `expected_base` fails with `StorageError::Conflict`. `remove_source` removes chunks and the source row in one transaction. A source must be registered (saved) before its first `commit_index`.
+- An `OperationLock` port (`acquire(&SourceId) -> Guard`, released on drop, OS file lock) is held by a use case for a whole add/update/remove/reindex of one source, never by search. Contention maps to `GitError`/`StorageError::Busy` and exit 6 (`index_locked`).
+- A source has an optional indexed revision and a separate lifecycle (`Cloning | Indexing | Ready | Failed | Removing`). Searchability means "has an indexed revision", so an update in progress or a failed update keeps serving the old index with the old commit.
+
+**Search**
+- `ChunkSearcher::search` runs in one read transaction and returns `SearchOutcome { hits: Vec<ScoredChunk>, revisions: BTreeMap<SourceId, IndexedRevision>, total_matches: usize }`. Only sources with an indexed revision are searched.
+- `total_hits` in schema v1 means matching chunks before the per-file cap. `offset` is supported: `retrieve` takes `offset` and `k`, selects `offset + k + 1` hits after the cap to compute `has_more`, and widens the candidate limit (doubling, up to a ceiling) while the cap leaves the page short and the searcher is not exhausted.
+- Filters (sources, languages, path glob) apply before the limit. Scores are higher-is-better (the adapter negates bm25). Ordering guarantees in contracts: determinism and the tie-break only, not "more matched words always wins". Word parts may match across columns. Diacritics are not folded. Contracts must include FTS5-hostile queries (`AND OR NOT NEAR "x" -y a:b * (`).
+- An empty registry (no sources) makes the `search` use case return `IndexMissing` (exit 5); a missing database file does the same.
+
+**Reindex and versions**
+- Index versions (tokenizer, chunker) are stored per source and stamped inside `commit_index`. A source with stale versions is skipped by search with a `ReindexRequired` outcome only when the query touches it. The store exposes `chunks(source)` and `rewrite_index_fields(source, ...)` plus `stored_versions`, usable in the stale state, so `rag reindex` can run. A chunker-version change re-reads blobs from git and applies one `commit_index` with upserts for every file.
+
+**Git**
+- Clones use `--no-checkout` (object database only). `show` and indexing read blobs through `git cat-file`; there is no working tree. Consequence: `rag list` no longer exposes a browsable clone path, and the `WorkTreeWalker` port becomes a pure domain/application policy applied to `ls_tree` entries. This supersedes the "plain shallow clone" row in section 1.
+- `ls_tree` uses `-z` and returns `TreeEntry { path, blob, size }` plus a count of paths skipped as unsafe. Blob reads are keyed by `BlobOid` with a batch form (`read_blobs`, implemented with `git cat-file --batch`).
+- `GitLocation` (userinfo stripped at construction, no leading `-`, allowed transports only: https, ssh, scp-like, file, local path) and `GitRef` (no leading `-`, whitespace, `..`, control characters) are validated domain types used by `GitClient` and `Source`. Error messages are scrubbed of credentials. `clone_shallow` is idempotent on an existing or half-cloned directory. A retryable/busy variant exists. `git` runs under `LC_ALL=C` so stderr classification is stable.
+- Local paths are a snapshot of committed HEAD (section 1, unchanged).
+
+**Paths, ids, output safety**
+- `RepoPath::parse` (user input, normalises `\`) and `RepoPath::from_git` (strict, rejects `\`). Both reject trailing `.` or space, Windows device names, any `.git` component, bidi/zero-width/line-separator characters, and paths over 1024 bytes.
+- `SourceId::parse` validates every slug segment (no `.`/`..`, empty, leading `/`, reserved names); checkout directories derive from the hash only. Hash width is 12 hex characters. Host and path are not lowercased beyond the host.
+- The search result `show` field is `rag show --chunk <chunk_id>` (hex only, so it is shell-safe); path-based `rag show <repo> <path>` stays for humans and must quote.
+- `Source.name` is unique, compared case-insensitively; `--repo` resolves by name or slug. `StorageError::NameTaken` exists.
+- All port traits are `Send + Sync`.
+
+**Contract tests to add**: failed `commit_index` leaves source row and manifest unchanged; conflict on stale `expected_base`; foreign/duplicate-path changes rejected; `remove_source` empties search; heading round trip with ` > `, empty elements, non-ASCII, CRLF, long lines; filter-before-limit with a small limit; one file with many matching chunks; name uniqueness; hostile queries.
+
+### 12.1 Second review round (architect, after 2c)
+
+Decisions: (1) a `Removing` source is NOT searchable; `rag remove` deletes the catalog row and chunks in one transaction first, the git directory after (leftovers are garbage-collected). (2) `RepoPath::from_git` drops the Windows materialisation rules (device names, trailing dot/space, `:`), because nothing is checked out; it keeps traversal, empty components, control/format characters (Unicode Cf, Zl, Zp, tag characters U+E0000-E007F, and default-ignorable joiners) and the length cap. `RepoPath::parse` (user input) keeps all rules. (3) A stale source makes an unfiltered search fail with exit 7; `rag reindex --all` must work without network, falling back to re-fetch + full index when old blobs are gone. (4) `IndexPolicy` gets a minimal content scan (PEM private-key headers, obvious token prefixes), Git LFS pointer detection, invalid UTF-8 as an explicit skip reason, markdown/text exempt from the minified heuristic, more secret names (`.envrc`, `*.tfvars`, `terraform.tfstate`, `.pgpass`, `.git-credentials`, `kubeconfig`, `*.kdbx`) and `.svg`/`.ipynb` as generated. (5) v1 caps files and chunks per source with a clear error; staged/resumable indexing is deferred.
+
+Port changes required: `SourceRepository::save` never writes or changes `indexed`; `IndexVersions` gains `policy`; `commit_index` rejects a version change unless the change set covers every stored file; `rewrite_index_fields` rejects a changed chunker/policy version; a chunk-by-id read `chunk(&ChunkId)`; `show <repo> <path>` resolves through the manifest, never `ls_tree`; a two-thread `commit_index` race contract; `Conflict` maps to exit 6; `retrieve` takes hits by value and sets `has_more` correctly at the candidate ceiling; errors are scrubbed at construction and in every `AppError` display; scp-like `user:pw@host` and URL query tokens are rejected or stripped; `SourceId::from_location` takes `&GitLocation`; stored locations are restored leniently.
+
+Adapter acceptance items (lanes): SQLite: name key computed in Rust with a UNIQUE index, `remove_diacritics 0`, path glob applied in SQL before the limit through a registered scalar function calling `PathGlob`, `BEGIN IMMEDIATE` for `commit_index`, separate read connections, no score-magnitude assertions. Git: clone by `init` + `fetch --depth 1 origin <ref>` into a temp dir then rename, peel annotated tags, read `ls-tree -z` as bytes, verify origin on reuse, reject SHA-256 repos, set `GCM_INTERACTIVE=never`, `GIT_TERMINAL_PROMPT=0`, stdin null, ssh `BatchMode=yes`, `-c protocol.allow=never` plus an allow list, timeouts, `LC_ALL=C`, tolerate leftover directories on remove. Batch `read_blobs` by count and bytes.

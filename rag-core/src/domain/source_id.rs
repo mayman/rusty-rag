@@ -1,0 +1,390 @@
+//! SourceId: the identity of a registered source (repository).
+//!
+//! The id is a readable slug plus a short hash of the canonical location, written
+//! `host/owner/name-1a2b3c4d5e6f`. The slug is what people see (`repo` in search
+//! output). Ids are host aware (`github.com/o/r` and `gitlab.com/o/r` differ) and
+//! the transport is irrelevant (`https://host/o/r.git` and `git@host:o/r.git` give
+//! the same id). Only the host is lowercased: owner and name keep their case, since
+//! most hosts treat them as case-sensitive. Credentials in a URL never reach the id.
+//! A local path becomes `local/<dirname>` with a hash of the normalised path.
+//!
+//! Every slug segment is validated (`parse` re-checks stored ids): no empty, dot-only
+//! or `.git` segments. The checkout directory of a source is named by the hash alone
+//! (`checkout_dir_name`), never by the slug, so slugs never touch the file system.
+
+use std::fmt;
+
+use crate::domain::git_location::GitLocation;
+
+/// Length of the hash suffix, in hex characters.
+const HASH_CHARS: usize = 12;
+
+/// Slug plus short hash. Always valid; construct with `from_location` or `parse`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceId {
+    /// `slug-hash`.
+    full: String,
+    /// Byte length of the slug at the start of `full`.
+    slug_len: usize,
+}
+
+/// Why a location or stored id is not a valid `SourceId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIdError {
+    MissingRepositoryPath,
+    InvalidHost,
+    InvalidSegment,
+    Malformed,
+}
+
+impl SourceId {
+    /// Derives the id from a validated location: a git URL (https, ssh, scp-like,
+    /// `file://`) or a local filesystem path. Credentials, queries and the like were
+    /// already removed by `GitLocation`, so they cannot reach the id.
+    pub fn from_location(location: &GitLocation) -> Result<Self, SourceIdError> {
+        let location = location.as_str();
+        match split_remote(location) {
+            Some((host, path)) => Self::remote(host, path),
+            None => Self::local(location),
+        }
+    }
+
+    fn remote(host: &str, path: &str) -> Result<Self, SourceIdError> {
+        let host = host.to_ascii_lowercase();
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(SourceIdError::InvalidHost);
+        }
+        let path = path.replace('\\', "/");
+        let path = path.trim_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Err(SourceIdError::MissingRepositoryPath);
+        }
+        let mut slug = host.clone();
+        for segment in &segments {
+            slug.push('/');
+            slug.push_str(&sanitise_segment(segment)?);
+        }
+        let canonical = format!("https://{host}/{}", segments.join("/"));
+        Ok(Self::from_parts(&slug, &short_hash(&canonical)))
+    }
+
+    fn local(path: &str) -> Result<Self, SourceIdError> {
+        let path = path.strip_prefix("file://").unwrap_or(path);
+        let normalised = path.replace('\\', "/");
+        let normalised = normalised.trim_end_matches('/');
+        let name = normalised
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .ok_or(SourceIdError::MissingRepositoryPath)?;
+        let name = sanitise_segment(name)?;
+        Ok(Self::from_parts(
+            &format!("local/{name}"),
+            &short_hash(&format!("local:{normalised}")),
+        ))
+    }
+
+    /// Reads back an id produced by `as_str` (for example from storage).
+    pub fn parse(text: &str) -> Result<Self, SourceIdError> {
+        let (slug, hash) = text.rsplit_once('-').ok_or(SourceIdError::Malformed)?;
+        let hash_ok = hash.len() == HASH_CHARS
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let slug_ok = slug.split('/').all(|segment| {
+            segment_is_valid(segment)
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        });
+        if hash_ok && slug_ok {
+            Ok(Self::from_parts(slug, hash))
+        } else {
+            Err(SourceIdError::Malformed)
+        }
+    }
+
+    /// The readable part, `host/owner/name`.
+    pub fn slug(&self) -> &str {
+        &self.full[..self.slug_len]
+    }
+
+    /// The full id, `slug-hash`.
+    pub fn as_str(&self) -> &str {
+        &self.full
+    }
+
+    /// The name of this source's checkout directory: the 12-character hash alone,
+    /// so no part of the slug (or of a hostile URL) reaches the file system.
+    pub fn checkout_dir_name(&self) -> &str {
+        &self.full[self.slug_len + 1..]
+    }
+
+    fn from_parts(slug: &str, hash: &str) -> Self {
+        Self {
+            full: format!("{slug}-{hash}"),
+            slug_len: slug.len(),
+        }
+    }
+}
+
+/// `(host, path)` of a remote URL or scp-like address, with credentials and port
+/// removed. `None` for local paths (including `file://` URLs and drive letters).
+fn split_remote(location: &str) -> Option<(&str, &str)> {
+    if let Some((scheme, rest)) = location.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host_port.split(':').next().unwrap_or(host_port);
+        return Some((host, path));
+    }
+    let (address, path) = location.split_once(':')?;
+    let looks_like_path = address.contains('/') || address.contains('\\');
+    // A single letter before ':' is a Windows drive, not a host.
+    if looks_like_path || address.len() < 2 {
+        return None;
+    }
+    Some((address.rsplit('@').next().unwrap_or(address), path))
+}
+
+/// ASCII letters (case kept), digits, `.`, `_`, `-`; anything else becomes `-`.
+/// Rejects segments that are empty, only dots (`.`, `..`), or `.git`.
+fn sanitise_segment(segment: &str) -> Result<String, SourceIdError> {
+    let cleaned: String = segment
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if segment_is_valid(&cleaned) {
+        Ok(cleaned)
+    } else {
+        Err(SourceIdError::InvalidSegment)
+    }
+}
+
+/// A slug segment is non-empty, not made of dots only, and not `.git`.
+fn segment_is_valid(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.chars().all(|c| c == '.')
+        && !segment.eq_ignore_ascii_case(".git")
+}
+
+fn short_hash(canonical: &str) -> String {
+    blake3::hash(canonical.as_bytes()).to_hex()[..HASH_CHARS].to_owned()
+}
+
+impl fmt::Display for SourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.full)
+    }
+}
+
+impl fmt::Display for SourceIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::MissingRepositoryPath => "repository location has no owner/name path",
+            Self::InvalidHost => "repository host is not valid",
+            Self::InvalidSegment => "repository path has an unusable segment",
+            Self::Malformed => "not a source id",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for SourceIdError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{SourceId, SourceIdError};
+    use crate::domain::git_location::GitLocation;
+
+    fn from(location: &str) -> Result<SourceId, SourceIdError> {
+        SourceId::from_location(&GitLocation::parse(location).expect(location))
+    }
+
+    fn id(location: &str) -> SourceId {
+        from(location).expect(location)
+    }
+
+    #[test]
+    fn https_url_gives_a_host_owner_name_slug_lowercasing_only_the_host() {
+        assert_eq!(
+            id("https://GitHub.com/Owner/Repo.git").slug(),
+            "github.com/Owner/Repo"
+        );
+    }
+
+    #[test]
+    fn owner_and_name_are_case_sensitive() {
+        assert_ne!(id("https://github.com/O/R"), id("https://github.com/o/r"));
+    }
+
+    #[test]
+    fn checkout_dir_name_is_the_hash_alone() {
+        let one = id("https://github.com/o/r");
+        let name = one.checkout_dir_name();
+        assert_eq!(name.len(), 12);
+        assert!(one.as_str().ends_with(&format!("-{name}")));
+        assert!(!name.contains('/') && !name.contains('.'));
+        assert_ne!(name, id("https://github.com/o/other").checkout_dir_name());
+    }
+
+    #[test]
+    fn parse_validates_every_slug_segment() {
+        for bad in [
+            "github.com/../r-1a2b3c4d5e6f",
+            "/github.com/o/r-1a2b3c4d5e6f",
+            "github.com//r-1a2b3c4d5e6f",
+            "github.com/o/./r-1a2b3c4d5e6f",
+            "github.com/o/r/-1a2b3c4d5e6f",
+            "github.com/o/.git-1a2b3c4d5e6f",
+            "github.com/o/...-1a2b3c4d5e6f",
+            "github.com/o/r s-1a2b3c4d5e6f",
+            "github.com/o\\r-1a2b3c4d5e6f",
+            "github.com/o/r-1a2b3c4d5e6f/",
+        ] {
+            assert_eq!(SourceId::parse(bad), Err(SourceIdError::Malformed), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_mixed_case_slugs_it_produced() {
+        let original = id("https://github.com/Owner/Repo");
+        assert_eq!(SourceId::parse(original.as_str()), Ok(original));
+    }
+
+    #[test]
+    fn dot_git_segments_inside_a_url_are_rejected() {
+        assert_eq!(
+            from("https://github.com/o/.git/x"),
+            Err(SourceIdError::InvalidSegment)
+        );
+    }
+
+    #[test]
+    fn https_and_ssh_forms_of_one_repository_share_an_id() {
+        let https = id("https://github.com/o/r.git");
+        for other in [
+            "https://github.com/o/r",
+            "https://github.com/o/r/",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+            "ssh://git@github.com:2222/o/r",
+            "HTTPS://GitHub.com/o/r.git",
+        ] {
+            assert_eq!(id(other), https, "{other}");
+        }
+    }
+
+    #[test]
+    fn same_owner_and_name_on_different_hosts_differ() {
+        assert_ne!(id("https://github.com/o/r"), id("https://gitlab.com/o/r"));
+    }
+
+    #[test]
+    fn credentials_never_reach_the_id() {
+        let with = id("https://user:s3cret-token@github.com/o/r.git");
+        assert_eq!(with, id("https://github.com/o/r.git"));
+        assert!(!with.to_string().contains("s3cret"));
+    }
+
+    #[test]
+    fn nested_group_paths_are_kept() {
+        assert_eq!(
+            id("https://gitlab.com/g/sub/proj.git").slug(),
+            "gitlab.com/g/sub/proj"
+        );
+    }
+
+    #[test]
+    fn as_str_is_slug_dash_twelve_lowercase_hex_characters() {
+        let text = id("https://github.com/o/r").to_string();
+        let (slug, hash) = text.rsplit_once('-').unwrap();
+        assert_eq!(slug, "github.com/o/r");
+        assert_eq!(hash.len(), 12);
+        assert!(hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+
+    #[test]
+    fn parse_round_trips_as_str() {
+        let original = id("git@github.com:o/r.git");
+        assert_eq!(SourceId::parse(original.as_str()), Ok(original.clone()));
+    }
+
+    #[test]
+    fn parse_rejects_text_that_is_not_an_id() {
+        for bad in [
+            "",
+            "no-hash-here",
+            "github.com/o/r",
+            "x-1234567",
+            "x-1a2b3c4d",
+            "x-GGGGGGGGGGGG",
+            "-1a2b3c4d5e6f",
+        ] {
+            assert_eq!(SourceId::parse(bad), Err(SourceIdError::Malformed), "{bad}");
+        }
+    }
+
+    #[test]
+    fn local_paths_become_local_slugs_by_directory_name() {
+        assert_eq!(id("/home/me/My Proj/").slug(), "local/My-Proj");
+        assert_eq!(id("C:\\Users\\me\\proj").slug(), "local/proj");
+        assert_eq!(id("file:///home/me/proj").slug(), "local/proj");
+    }
+
+    #[test]
+    fn different_local_paths_with_one_name_differ() {
+        assert_ne!(id("/a/proj"), id("/b/proj"));
+    }
+
+    #[test]
+    fn backslash_and_slash_local_paths_agree() {
+        assert_eq!(id("C:\\Users\\me\\proj"), id("C:/Users/me/proj"));
+    }
+
+    #[test]
+    fn rejects_pathless_locations_and_unusable_hosts() {
+        assert_eq!(
+            from("https://github.com"),
+            Err(SourceIdError::MissingRepositoryPath)
+        );
+        assert_eq!(
+            from("https://under_score.example/o/r"),
+            Err(SourceIdError::InvalidHost)
+        );
+    }
+
+    #[test]
+    fn query_tokens_in_a_location_never_reach_the_id() {
+        assert_eq!(
+            id("https://github.com/o/r?token=abc123"),
+            id("https://github.com/o/r")
+        );
+        assert!(!id("https://github.com/o/r?token=abc123")
+            .to_string()
+            .contains("abc123"));
+    }
+
+    #[test]
+    fn rejects_traversal_segments_in_a_url() {
+        assert_eq!(
+            from("https://github.com/../r"),
+            Err(SourceIdError::InvalidSegment)
+        );
+    }
+}

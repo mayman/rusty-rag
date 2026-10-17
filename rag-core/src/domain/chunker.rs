@@ -2,9 +2,9 @@
 //!
 //! Markdown is split at ATX headings and each chunk records its heading path.
 //! Headings inside fenced code (CommonMark fence rules) and inside YAML front
-//! matter do not count. Markdown sections shorter than 200 characters, or with no
-//! text below their heading, merge into the following section and keep the heading
-//! path of the first heading in the merged chunk.
+//! matter do not count. Heading-only sections (no body text) merge into the
+//! following section and keep the heading path of the first heading in the merged
+//! chunk; a section with any body text is its own chunk, however short.
 //! Other text, and any section over 60 lines or 4000 characters, is split into line
 //! windows of at most 60 lines and 4000 characters, with a 5-line overlap, breaking
 //! after the last blank line in range when one exists. A single line longer than
@@ -15,8 +15,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::chunk::Chunk;
 use crate::domain::chunk_id::ChunkId;
+use crate::domain::language::{DocumentKind, Language};
 use crate::domain::line_range::LineRange;
+use crate::domain::repo_path::RepoPath;
+use crate::domain::source_id::SourceId;
 
 /// Version of the chunking rules. Bump whenever chunk boundaries, text, or id
 /// inputs change; an index built with another version must be reindexed. Nothing
@@ -29,43 +33,27 @@ const MIN_WINDOW: usize = 40;
 const MAX_WINDOW: usize = 60;
 /// Lines shared by consecutive windows.
 const OVERLAP: usize = 5;
-/// Markdown sections with less text than this (characters) merge into the next one.
-const MIN_SECTION_CHARS: usize = 200;
 /// Hard cap on a chunk's text, in characters. Longer lines are split at character
 /// boundaries.
 pub const MAX_CHUNK_CHARS: usize = 4000;
-
-/// Which splitting strategy applies to a document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocumentKind {
-    Markdown,
-    Code,
-}
-
-/// A searchable slice of one document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
-    pub id: ChunkId,
-    pub lines: LineRange,
-    /// Headings from the outermost to the innermost enclosing one. Empty for code
-    /// and for markdown text before the first heading.
-    pub heading_path: Vec<String>,
-    /// The chunk's lines joined with `\n`.
-    pub text: String,
-}
 
 /// Domain service that splits documents into chunks.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Chunker;
 
 impl Chunker {
-    /// Splits `text` (a document at `path` in repository `repo_id`) into chunks
-    /// in document order. Windows or sections with only blank lines are dropped.
-    pub fn chunk(repo_id: &str, path: &str, kind: DocumentKind, text: &str) -> Vec<Chunk> {
+    /// Splits `text` (the document at `path` in `source`) into chunks in document
+    /// order. The language, and with it the strategy (markdown by heading, code and
+    /// plain text in line windows), comes from the path. Windows or sections with
+    /// only blank lines are dropped.
+    pub fn chunk(source: &SourceId, path: &RepoPath, text: &str) -> Vec<Chunk> {
+        let language = Language::from_path(path);
+        let kind = language.document_kind();
+        let source_key = source.as_str();
         let lines = split_lines(text);
         let spans: Vec<(LineRange, Vec<String>)> = match kind {
             DocumentKind::Markdown => markdown_sections(&lines),
-            DocumentKind::Code => LineRange::new(1, lines.len())
+            DocumentKind::Code | DocumentKind::Text => LineRange::new(1, lines.len())
                 .map(|whole| {
                     line_windows(&lines, whole)
                         .into_iter()
@@ -96,11 +84,14 @@ impl Chunker {
                         occurrence,
                     }
                 }
-                DocumentKind::Code => Locator::Ordinal(ordinal),
+                DocumentKind::Code | DocumentKind::Text => Locator::Ordinal(ordinal),
             };
-            let id = chunk_id(repo_id, path, &locator, &body);
+            let id = chunk_id(source_key, path.as_str(), &locator, &body);
             chunks.push(Chunk {
                 id,
+                source: source.clone(),
+                path: path.clone(),
+                language,
                 lines: range,
                 heading_path,
                 text: body,
@@ -187,8 +178,8 @@ fn has_content(lines: &[&str], range: LineRange) -> bool {
 
 /// Markdown sections: each heading starts a section that runs to the next
 /// heading. Text before the first heading forms a section with an empty path.
-/// Headings inside fenced code blocks and YAML front matter do not count. Short
-/// sections merge into the following one, and sections too long for one chunk
+/// Headings inside fenced code blocks and YAML front matter do not count.
+/// Heading-only sections merge into the following one, and sections too long for one chunk
 /// are split into line windows that keep the section's heading path.
 fn markdown_sections(lines: &[&str]) -> Vec<(LineRange, Vec<String>)> {
     // (first line, heading path) for every section start, in order.
@@ -231,7 +222,7 @@ fn markdown_sections(lines: &[&str]) -> Vec<(LineRange, Vec<String>)> {
     }
 
     let mut spans = Vec::with_capacity(sections.len());
-    for (range, path) in merge_short_sections(lines, sections) {
+    for (range, path) in merge_heading_only_sections(lines, sections) {
         if is_oversized(lines, range) {
             spans.extend(
                 line_windows(lines, range)
@@ -260,10 +251,11 @@ fn front_matter_len(lines: &[&str]) -> usize {
         .map_or(0, |(closing, _)| closing + 1)
 }
 
-/// Merges each section shorter than `MIN_SECTION_CHARS`, or with no text below its
-/// heading, into the following section. The merged section keeps the heading path
-/// of its first heading. A short final section stays as it is.
-fn merge_short_sections(
+/// Merges each heading-only section (headings and blank lines, no body text) into
+/// the following section. The merged section keeps the heading path of its first
+/// heading. A heading-only final section stays as it is. Sections with any body
+/// text are never merged, however short.
+fn merge_heading_only_sections(
     lines: &[&str],
     sections: Vec<(LineRange, Vec<String>)>,
 ) -> Vec<(LineRange, Vec<String>)> {
@@ -282,7 +274,7 @@ fn merge_short_sections(
             }
             None => (range, path),
         };
-        if is_short(lines, current.0) {
+        if is_heading_only(lines, current.0) {
             pending = Some(current);
         } else {
             merged.push(current);
@@ -292,13 +284,12 @@ fn merge_short_sections(
     merged
 }
 
-/// A section is short when its text is under `MIN_SECTION_CHARS` characters, or
-/// when it is a heading with nothing below it.
-fn is_short(lines: &[&str], range: LineRange) -> bool {
-    let heading_only = atx_heading(lines[range.start() - 1]).is_some()
-        && !LineRange::new(range.start() + 1, range.end())
-            .is_some_and(|body| has_content(lines, body));
-    heading_only || span_chars(lines, range) < MIN_SECTION_CHARS
+/// A section is heading-only when every non-blank line is an ATX heading.
+fn is_heading_only(lines: &[&str], range: LineRange) -> bool {
+    (range.start()..=range.end())
+        .map(|line| lines[line - 1])
+        .filter(|text| !text.trim().is_empty())
+        .all(|text| atx_heading(text).is_some())
 }
 
 /// True when a section is too long for one chunk, in lines or characters.
@@ -458,7 +449,18 @@ fn push_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Chunk, Chunker, DocumentKind};
+    use super::{Chunk, Chunker};
+    use crate::domain::git_location::GitLocation;
+    use crate::domain::repo_path::RepoPath;
+    use crate::domain::source_id::SourceId;
+
+    fn source(location: &str) -> SourceId {
+        SourceId::from_location(&GitLocation::parse(location).unwrap()).unwrap()
+    }
+
+    fn chunk_at(source: &SourceId, path: &str, text: &str) -> Vec<Chunk> {
+        Chunker::chunk(source, &RepoPath::parse(path).unwrap(), text)
+    }
 
     /// Body text above the 200-character minimum, so a section is not merged away.
     const LONG: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
@@ -471,11 +473,11 @@ mod tests {
     }
 
     fn markdown(text: &str) -> Vec<Chunk> {
-        Chunker::chunk("repo", "README.md", DocumentKind::Markdown, text)
+        chunk_at(&source("https://github.com/o/repo"), "README.md", text)
     }
 
     fn code(text: &str) -> Vec<Chunk> {
-        Chunker::chunk("repo", "src/lib.rs", DocumentKind::Code, text)
+        chunk_at(&source("https://github.com/o/repo"), "src/lib.rs", text)
     }
 
     /// `count` non-blank lines, `line 1` .. `line N`.
@@ -515,10 +517,11 @@ mod tests {
     }
 
     #[test]
-    fn short_preamble_merges_into_the_first_heading_section() {
+    fn short_preamble_with_text_stays_its_own_chunk() {
         let chunks = markdown("intro\n# A\nbody");
-        assert_eq!(lines_of(&chunks), [(1, 3)]);
-        assert_eq!(chunks[0].heading_path, ["A"]);
+        assert_eq!(lines_of(&chunks), [(1, 1), (2, 3)]);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(chunks[1].heading_path, ["A"]);
     }
 
     #[test]
@@ -537,15 +540,35 @@ mod tests {
     }
 
     #[test]
-    fn short_section_merges_into_the_following_section_keeping_the_first_heading_path() {
+    fn short_section_with_body_text_stays_its_own_chunk() {
         let chunks = markdown(&format!("# A\nshort\n## B\n{LONG}\n# C\n{LONG}"));
-        assert_eq!(lines_of(&chunks), [(1, 4), (5, 6)]);
+        assert_eq!(lines_of(&chunks), [(1, 2), (3, 4), (5, 6)]);
         assert_eq!(chunks[0].heading_path, ["A"]);
-        assert_eq!(chunks[1].heading_path, ["C"]);
+        assert_eq!(chunks[1].heading_path, ["A", "B"]);
     }
 
     #[test]
-    fn short_final_section_is_not_merged_backwards() {
+    fn consecutive_heading_only_sections_all_merge_into_the_next_section_with_text() {
+        let chunks = markdown("# A\n## B\n### C\nbody\n# D\nmore");
+        assert_eq!(lines_of(&chunks), [(1, 4), (5, 6)]);
+        assert_eq!(chunks[0].heading_path, ["A"]);
+    }
+
+    #[test]
+    fn heading_only_final_section_stays_its_own_chunk() {
+        let chunks = markdown("# A\nbody\n# Z");
+        assert_eq!(lines_of(&chunks), [(1, 2), (3, 3)]);
+        assert_eq!(chunks[1].heading_path, ["Z"]);
+    }
+
+    #[test]
+    fn a_hashtag_line_is_body_text_not_a_heading_only_section() {
+        let chunks = markdown("# A\n#todo\n# B\nbody");
+        assert_eq!(lines_of(&chunks), [(1, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn short_final_section_with_text_is_not_merged_backwards() {
         let chunks = markdown(&format!("# A\n{LONG}\n# Z\nx"));
         assert_eq!(lines_of(&chunks), [(1, 2), (3, 4)]);
         assert_eq!(chunks[1].heading_path, ["Z"]);
@@ -600,13 +623,15 @@ mod tests {
     #[test]
     fn backtick_fence_info_string_may_not_contain_a_backtick() {
         let chunks = markdown(&format!("```a`b\n# H\n{LONG}"));
-        assert_eq!(chunks[0].heading_path, ["H"]);
+        assert_eq!(lines_of(&chunks), [(1, 1), (2, 3)]);
+        assert_eq!(chunks[1].heading_path, ["H"]);
     }
 
     #[test]
     fn fence_indented_four_spaces_is_not_a_fence() {
         let chunks = markdown(&format!("    ```\n# H\n{LONG}"));
-        assert_eq!(chunks[0].heading_path, ["H"]);
+        assert_eq!(lines_of(&chunks), [(1, 1), (2, 3)]);
+        assert_eq!(chunks[1].heading_path, ["H"]);
     }
 
     #[test]
@@ -750,15 +775,15 @@ mod tests {
 
     #[test]
     fn chunk_id_changes_when_the_path_changes() {
-        let a = Chunker::chunk("repo", "a.md", DocumentKind::Markdown, "# A\nx");
-        let b = Chunker::chunk("repo", "b.md", DocumentKind::Markdown, "# A\nx");
+        let a = chunk_at(&source("https://github.com/o/repo"), "a.md", "# A\nx");
+        let b = chunk_at(&source("https://github.com/o/repo"), "b.md", "# A\nx");
         assert_ne!(a[0].id, b[0].id);
     }
 
     #[test]
     fn chunk_id_changes_when_the_repo_changes() {
-        let a = Chunker::chunk("host/o/one", "a.md", DocumentKind::Markdown, "# A\nx");
-        let b = Chunker::chunk("host/o/two", "a.md", DocumentKind::Markdown, "# A\nx");
+        let a = chunk_at(&source("https://host/o/one"), "a.md", "# A\nx");
+        let b = chunk_at(&source("https://host/o/two"), "a.md", "# A\nx");
         assert_ne!(a[0].id, b[0].id);
     }
 
@@ -771,7 +796,24 @@ mod tests {
 
 #[cfg(test)]
 mod properties {
-    use super::{split_lines, Chunker, DocumentKind, MAX_CHUNK_CHARS, MAX_WINDOW, OVERLAP};
+    use super::{split_lines, Chunk, Chunker, MAX_CHUNK_CHARS, MAX_WINDOW, OVERLAP};
+    use crate::domain::git_location::GitLocation;
+    use crate::domain::language::DocumentKind;
+    use crate::domain::repo_path::RepoPath;
+    use crate::domain::source_id::SourceId;
+
+    /// Chunks `text` as a path that selects `kind`'s strategy.
+    fn chunk_as(kind: DocumentKind, text: &str) -> Vec<Chunk> {
+        let name = match kind {
+            DocumentKind::Markdown => "f.md",
+            DocumentKind::Code => "f.rs",
+            DocumentKind::Text => "f.txt",
+        };
+        let source =
+            SourceId::from_location(&GitLocation::parse("https://github.com/o/r").unwrap())
+                .unwrap();
+        Chunker::chunk(&source, &RepoPath::parse(name).unwrap(), text)
+    }
     use proptest::prelude::*;
 
     /// Structured documents: blank lines, headings, fences, LF or CRLF, and arbitrary text.
@@ -794,19 +836,23 @@ mod properties {
     }
 
     fn kinds() -> impl Strategy<Value = DocumentKind> {
-        prop_oneof![Just(DocumentKind::Markdown), Just(DocumentKind::Code)]
+        prop_oneof![
+            Just(DocumentKind::Markdown),
+            Just(DocumentKind::Code),
+            Just(DocumentKind::Text)
+        ]
     }
 
     proptest! {
         #[test]
         fn chunking_never_panics_on_arbitrary_text(text in any::<String>(), kind in kinds()) {
-            let _ = Chunker::chunk("repo", "f", kind, &text);
+            let _ = chunk_as(kind, &text);
         }
 
         #[test]
         fn ranges_are_ordered_and_inside_the_document(text in document(), kind in kinds()) {
             let line_count = split_lines(&text).len();
-            for chunk in Chunker::chunk("repo", "f", kind, &text) {
+            for chunk in chunk_as(kind, &text) {
                 prop_assert!(chunk.lines.start() >= 1);
                 prop_assert!(chunk.lines.start() <= chunk.lines.end());
                 prop_assert!(chunk.lines.end() <= line_count);
@@ -816,7 +862,7 @@ mod properties {
         #[test]
         fn every_non_blank_line_is_covered_by_a_chunk(text in document(), kind in kinds()) {
             let lines = split_lines(&text);
-            let chunks = Chunker::chunk("repo", "f", kind, &text);
+            let chunks = chunk_as(kind, &text);
             for (index, line) in lines.iter().enumerate() {
                 if line.trim().is_empty() {
                     continue;
@@ -831,7 +877,7 @@ mod properties {
 
         #[test]
         fn chunks_start_in_non_decreasing_order(text in document(), kind in kinds()) {
-            let chunks = Chunker::chunk("repo", "f", kind, &text);
+            let chunks = chunk_as(kind, &text);
             for pair in chunks.windows(2) {
                 prop_assert!(pair[0].lines.start() <= pair[1].lines.start());
             }
@@ -839,14 +885,14 @@ mod properties {
 
         #[test]
         fn no_chunk_exceeds_the_character_cap(text in document(), kind in kinds()) {
-            for chunk in Chunker::chunk("repo", "f", kind, &text) {
+            for chunk in chunk_as(kind, &text) {
                 prop_assert!(chunk.text.chars().count() <= MAX_CHUNK_CHARS);
             }
         }
 
         #[test]
         fn code_windows_stay_within_limits(text in document()) {
-            let chunks = Chunker::chunk("repo", "f", DocumentKind::Code, &text);
+            let chunks = chunk_as(DocumentKind::Code, &text);
             for chunk in &chunks {
                 let length = chunk.lines.end() - chunk.lines.start() + 1;
                 prop_assert!(length <= MAX_WINDOW);
@@ -862,14 +908,14 @@ mod properties {
         #[test]
         fn chunking_is_deterministic(text in document(), kind in kinds()) {
             prop_assert_eq!(
-                Chunker::chunk("r", "f", kind, &text),
-                Chunker::chunk("r", "f", kind, &text)
+                chunk_as(kind, &text),
+                chunk_as(kind, &text)
             );
         }
 
         #[test]
         fn chunk_text_never_contains_carriage_returns(text in document(), kind in kinds()) {
-            for chunk in Chunker::chunk("r", "f", kind, &text) {
+            for chunk in chunk_as(kind, &text) {
                 prop_assert!(!chunk.text.contains('\r'));
             }
         }
@@ -879,8 +925,8 @@ mod properties {
             let lf = text.replace("\r\n", "\n").replace('\r', "\n");
             let crlf = lf.replace('\n', "\r\n");
             prop_assert_eq!(
-                Chunker::chunk("r", "f", kind, &lf),
-                Chunker::chunk("r", "f", kind, &crlf)
+                chunk_as(kind, &lf),
+                chunk_as(kind, &crlf)
             );
         }
     }
