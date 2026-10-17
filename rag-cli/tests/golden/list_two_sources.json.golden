@@ -1,0 +1,1 @@
+{"schema_version":1,"sources":[{"repo":"github.com/o/r","name":"r","status":"ready","commit":"abababababababababababababababababababab","indexed_at":"2023-11-14T22:13:20Z","age_seconds":90,"chunks":2},{"repo":"github.com/o/x","name":"x","status":"cloning","commit":null,"indexed_at":null,"age_seconds":null,"chunks":0}]}
