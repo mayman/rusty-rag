@@ -39,9 +39,25 @@ mod tests {
             "x",
             GitLocation::parse("https://github.com/o/x").unwrap(),
         );
+        let failed_location = GitLocation::parse("https://github.com/o/y").unwrap();
+        let mut failed = Source::register(
+            SourceId::from_location(&failed_location).unwrap(),
+            "y",
+            failed_location,
+        );
+        failed.mark_ready(
+            CommitId::parse(&"ab".repeat(20)).unwrap(),
+            IndexedAt::from_epoch_seconds(INDEXED_AT),
+        );
+        failed.record_failure(
+            "network_or_auth",
+            "git: operation timed out",
+            IndexedAt::from_epoch_seconds(INDEXED_AT + 60),
+        );
         vec![
             SourceSummary::new(&ready, 2, now),
             SourceSummary::new(&cloning, 0, now),
+            SourceSummary::new(&failed, 4, now),
         ]
     }
 

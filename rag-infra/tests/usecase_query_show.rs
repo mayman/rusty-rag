@@ -140,6 +140,7 @@ impl World {
             path: path.to_owned(),
             lines: None,
             around: None,
+            max_chars: None,
         }
     }
 
@@ -199,7 +200,10 @@ fn a_chunk_id_from_the_store_is_shown_with_its_lines() {
     let world = world(&[("docs/guide.md", "# Guide\n\nSome words here.\n")]);
     let source = world.store.list().unwrap().remove(0);
     let chunk = world.store.chunks(source.id()).unwrap().remove(0);
-    let shown = world.use_case().execute_chunk(chunk.id.as_str()).unwrap();
+    let shown = world
+        .use_case()
+        .execute_chunk(chunk.id.as_str(), None)
+        .unwrap();
     assert_eq!(shown.path, "docs/guide.md");
     assert_eq!(shown.text, "# Guide\n\nSome words here.");
     assert_eq!(shown.chunk.as_deref(), Some(chunk.id.as_str()));
@@ -211,7 +215,7 @@ fn an_unknown_chunk_id_points_back_to_search() {
     let world = world(&[("src/lib.rs", LIB)]);
     let error = world
         .use_case()
-        .execute_chunk(&"cd".repeat(32))
+        .execute_chunk(&"cd".repeat(32), None)
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::NotFound);
     assert!(error.to_string().contains("rag search"));

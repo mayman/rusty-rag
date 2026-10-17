@@ -261,7 +261,7 @@ fn list_reports_the_indexed_source_with_its_chunk_count() {
     };
     assert_eq!(summary.name, "widgets");
     assert_eq!(summary.status, "ready");
-    assert_eq!(summary.commit.as_deref(), Some(COMMIT));
+    assert_eq!(summary.commit.as_deref(), Some(&COMMIT[..7]));
     assert_eq!(summary.age_seconds, Some(120));
     assert_eq!(
         summary.chunks,

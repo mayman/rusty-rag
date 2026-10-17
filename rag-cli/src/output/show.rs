@@ -35,10 +35,17 @@ pub fn render_show_human(response: &ShowResponse) -> String {
         }
     }
     if response.truncated {
-        out += &format!(
-            "output cut at line {last}: ask for the rest with --lines {}-<end>\n",
-            last + 1
-        );
+        match &response.next_lines {
+            Some(next) => {
+                out += &format!(
+                    "output cut at line {last}: ask for the rest with --lines {}\n",
+                    cell(next)
+                );
+            }
+            None => {
+                out += &format!("output cut at line {last}: the rest of that line is not shown\n");
+            }
+        }
     }
     out
 }
@@ -60,6 +67,7 @@ mod tests {
             lines: [9, 11],
             total_lines: Some(40),
             truncated: false,
+            next_lines: None,
             chunk: None,
             text: "fn a() {\n    b()\n}".to_owned(),
         }
@@ -95,12 +103,39 @@ github.com/o/r src/a.rs:9-11 @ abababa (40 lines in the file)
         chunk.total_lines = None;
         chunk.chunk = Some("ab".repeat(32));
         chunk.truncated = true;
+        chunk.next_lines = Some("12-40".to_owned());
         let text = render_show_human(&chunk);
         assert!(
             text.contains(&format!("(chunk {})", "ab".repeat(32))),
             "{text}"
         );
-        assert!(text.contains("--lines 12-<end>"), "{text}");
+        assert!(text.contains("--lines 12-40"), "{text}");
+        assert!(
+            !text.contains("<end>"),
+            "a concrete range, never a placeholder"
+        );
+    }
+
+    #[test]
+    fn a_cut_without_a_next_range_says_the_line_itself_was_cut() {
+        let mut cut = file_slice();
+        cut.truncated = true;
+        let text = render_show_human(&cut);
+        assert!(text.contains("output cut at line 11"), "{text}");
+        assert!(!text.contains("--lines"), "{text}");
+        assert!(!text.contains("<end>"), "{text}");
+    }
+
+    #[test]
+    fn next_lines_is_part_of_the_json_between_truncated_and_text() {
+        let mut cut = file_slice();
+        cut.truncated = true;
+        cut.next_lines = Some("12-211".to_owned());
+        let json = render_show_json(&cut);
+        assert!(
+            json.contains(r#""truncated":true,"next_lines":"12-211","text":"#),
+            "{json}"
+        );
     }
 
     #[test]

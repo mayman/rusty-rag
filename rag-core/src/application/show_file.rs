@@ -13,7 +13,7 @@
 
 use crate::application::dto::{
     ShowResponse, SCHEMA_VERSION, SHOW_AROUND_RADIUS, SHOW_MAX_CHARS, SHOW_MAX_LINES,
-    UNTRUSTED_CONTENT,
+    SHOW_MIN_CHARS, UNTRUSTED_CONTENT,
 };
 use crate::application::error::{AppError, Scrubbed, StorageError};
 use crate::application::indexer::resolve_source;
@@ -35,6 +35,9 @@ pub struct ShowFileRequest {
     pub lines: Option<(usize, usize)>,
     /// `--around N`: the lines near line N.
     pub around: Option<usize>,
+    /// `--max-chars`: a lower character cap than `SHOW_MAX_CHARS`, clamped to
+    /// `SHOW_MIN_CHARS..=SHOW_MAX_CHARS`.
+    pub max_chars: Option<usize>,
 }
 
 /// `rag show`.
@@ -85,7 +88,11 @@ impl<'a> ShowFile<'a> {
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let (first, last) = select(lines.len(), request)?;
-        let clipped = clip(&lines[first.saturating_sub(1)..last], first.max(1));
+        let clipped = clip(
+            &lines[first.saturating_sub(1)..last],
+            first.max(1),
+            char_cap(request.max_chars),
+        );
         Ok(ShowResponse {
             schema_version: SCHEMA_VERSION,
             content: UNTRUSTED_CONTENT,
@@ -97,13 +104,18 @@ impl<'a> ShowFile<'a> {
             lines: clipped.lines,
             total_lines: Some(lines.len()),
             truncated: clipped.truncated,
+            next_lines: clipped.next_lines,
             chunk: None,
             text: sanitize_untrusted(&clipped.text),
         })
     }
 
     /// The stored chunk with this id.
-    pub fn execute_chunk(&self, id: &str) -> Result<ShowResponse, AppError> {
+    pub fn execute_chunk(
+        &self,
+        id: &str,
+        max_chars: Option<usize>,
+    ) -> Result<ShowResponse, AppError> {
         let id = ChunkId::parse(id).ok_or_else(|| {
             AppError::Usage(Scrubbed::from(
                 "a chunk id is 64 hexadecimal characters, as printed by `rag search`",
@@ -119,7 +131,7 @@ impl<'a> ShowFile<'a> {
         let revision = revision_of(&source)?;
         refuse_by_name(&chunk.path)?;
         let lines: Vec<&str> = chunk.text.lines().collect();
-        let clipped = clip(&lines, chunk.lines.start());
+        let clipped = clip(&lines, chunk.lines.start(), char_cap(max_chars));
         Ok(ShowResponse {
             schema_version: SCHEMA_VERSION,
             content: UNTRUSTED_CONTENT,
@@ -131,6 +143,7 @@ impl<'a> ShowFile<'a> {
             lines: clipped.lines,
             total_lines: None,
             truncated: clipped.truncated,
+            next_lines: clipped.next_lines,
             chunk: Some(chunk.id.as_str().to_owned()),
             text: sanitize_untrusted(&clipped.text),
         })
@@ -195,22 +208,33 @@ fn select(total: usize, request: &ShowFileRequest) -> Result<(usize, usize), App
     }
 }
 
+/// The character cap of a response: the requested one, clamped to
+/// `SHOW_MIN_CHARS..=SHOW_MAX_CHARS`; the fixed cap when none was asked for.
+fn char_cap(requested: Option<usize>) -> usize {
+    requested.map_or(SHOW_MAX_CHARS, |chars| {
+        chars.clamp(SHOW_MIN_CHARS, SHOW_MAX_CHARS)
+    })
+}
+
 /// Text shown, with where it starts and ends and whether a cap cut it.
 struct Clipped {
     text: String,
     lines: [usize; 2],
     truncated: bool,
+    /// `N-M`: the next lines of the selection, when a cap cut it short of its end.
+    next_lines: Option<String>,
 }
 
-/// Joins `lines` (the first of which is file line `first_line`) under the line and
-/// character caps. Whole lines are kept; a first line longer than the character cap
-/// is cut at a character boundary.
-fn clip(lines: &[&str], first_line: usize) -> Clipped {
+/// Joins `lines` (the first of which is file line `first_line`) under the line cap
+/// and the character cap `max_chars`. Whole lines are kept; a first line longer than
+/// the character cap is cut at a character boundary.
+fn clip(lines: &[&str], first_line: usize, max_chars: usize) -> Clipped {
     if lines.is_empty() {
         return Clipped {
             text: String::new(),
             lines: [0, 0],
             truncated: false,
+            next_lines: None,
         };
     }
     let mut text = String::new();
@@ -218,7 +242,7 @@ fn clip(lines: &[&str], first_line: usize) -> Clipped {
     let mut shown = 0;
     for line in lines.iter().take(SHOW_MAX_LINES) {
         let width = line.chars().count() + usize::from(shown > 0);
-        if chars + width > SHOW_MAX_CHARS {
+        if chars + width > max_chars {
             break;
         }
         if shown > 0 {
@@ -229,21 +253,24 @@ fn clip(lines: &[&str], first_line: usize) -> Clipped {
         shown += 1;
     }
     if shown == 0 {
-        text = lines[0].chars().take(SHOW_MAX_CHARS).collect();
+        text = lines[0].chars().take(max_chars).collect();
         shown = 1;
     }
-    let cut_inside_a_line = shown == 1 && lines[0].chars().count() > SHOW_MAX_CHARS;
+    let cut_inside_a_line = shown == 1 && lines[0].chars().count() > max_chars;
+    let next_first = first_line + shown;
+    let next_last = next_first + (lines.len() - shown).min(SHOW_MAX_LINES);
     Clipped {
         text,
-        lines: [first_line, first_line + shown - 1],
+        lines: [first_line, next_first - 1],
         truncated: shown < lines.len() || cut_inside_a_line,
+        next_lines: (shown < lines.len()).then(|| format!("{next_first}-{}", next_last - 1)),
     }
 }
 #[cfg(test)]
 mod tests {
     use super::{ShowFile, ShowFileRequest};
     use crate::application::dto::{
-        ShowResponse, SHOW_AROUND_RADIUS, SHOW_MAX_CHARS, SHOW_MAX_LINES,
+        ShowResponse, SHOW_AROUND_RADIUS, SHOW_MAX_CHARS, SHOW_MAX_LINES, SHOW_MIN_CHARS,
     };
     use crate::application::error::{AppError, ErrorCode};
     use crate::application::ports::{
@@ -332,7 +359,7 @@ mod tests {
         }
 
         fn show_chunk(&self, id: &str) -> Result<ShowResponse, AppError> {
-            ShowFile::new(&self.store, &self.store, &self.git).execute_chunk(id)
+            ShowFile::new(&self.store, &self.store, &self.git).execute_chunk(id, None)
         }
     }
 
@@ -342,6 +369,7 @@ mod tests {
             path: path.to_owned(),
             lines: None,
             around: None,
+            max_chars: None,
         }
     }
 
@@ -467,6 +495,83 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_names_the_next_range_to_ask_for() {
+        let world = World::new(&[
+            ("a.txt", &numbered(SHOW_MAX_LINES + 50)),
+            ("b.txt", &numbered(500)),
+        ]);
+        let shown = world.show(&request("docs", "a.txt")).unwrap();
+        assert_eq!(shown.next_lines.as_deref(), Some("201-250"));
+        let long = world.show(&request("docs", "b.txt")).unwrap();
+        assert_eq!(long.next_lines.as_deref(), Some("201-400"));
+        let mut tail = request("docs", "b.txt");
+        tail.lines = Some((201, 400));
+        let second = world.show(&tail).unwrap();
+        assert_eq!(second.lines, [201, 400]);
+        assert_eq!(second.next_lines, None, "this range was not cut");
+    }
+
+    #[test]
+    fn an_uncut_response_has_no_next_lines() {
+        let world = World::new(&[("a.txt", &numbered(10))]);
+        let shown = world.show(&request("docs", "a.txt")).unwrap();
+        assert!(!shown.truncated);
+        assert_eq!(shown.next_lines, None);
+        assert!(!serde_json::to_string(&shown)
+            .unwrap()
+            .contains("next_lines"));
+    }
+
+    #[test]
+    fn a_cut_inside_one_enormous_line_points_at_the_next_whole_line() {
+        let world = World::new(&[(
+            "a.txt",
+            &format!("{}\nsecond", "x".repeat(SHOW_MAX_CHARS * 2)),
+        )]);
+        let shown = world.show(&request("docs", "a.txt")).unwrap();
+        assert!(shown.truncated);
+        assert_eq!(shown.lines, [1, 1]);
+        assert_eq!(
+            shown.next_lines.as_deref(),
+            Some("2-2"),
+            "the next whole line"
+        );
+    }
+
+    #[test]
+    fn max_chars_lowers_the_character_cap_and_is_clamped() {
+        let line = "y".repeat(49);
+        let text = vec![line.as_str(); 100].join("\n");
+        let world = World::new(&[("a.txt", &text)]);
+        let mut req = request("docs", "a.txt");
+        req.max_chars = Some(500);
+        let shown = world.show(&req).unwrap();
+        assert!(shown.truncated && shown.text.chars().count() <= 500);
+        assert_eq!(shown.lines, [1, 10]);
+        assert_eq!(shown.next_lines.as_deref(), Some("11-100"));
+        req.max_chars = Some(0);
+        let tiny = world.show(&req).unwrap();
+        assert!(tiny.text.chars().count() <= SHOW_MIN_CHARS && !tiny.text.is_empty());
+        req.max_chars = Some(usize::MAX);
+        let huge = world.show(&req).unwrap();
+        assert!(
+            huge.text.chars().count() <= SHOW_MAX_CHARS,
+            "never above the fixed cap"
+        );
+    }
+
+    #[test]
+    fn max_chars_applies_to_a_chunk_too() {
+        let world = World::new(&[("a.rs", &"fn a() {}\n".repeat(60))]);
+        let id = first_chunk_id(&world, "a.rs");
+        let shown = ShowFile::new(&world.store, &world.store, &world.git)
+            .execute_chunk(&id, Some(100))
+            .unwrap();
+        assert!(shown.truncated && shown.text.chars().count() <= 100);
+        assert!(shown.next_lines.is_some());
+    }
+
+    #[test]
     fn wide_files_are_cut_at_the_character_cap_on_a_line_boundary() {
         let line = "é".repeat(99);
         let text = vec![line.as_str(); 150].join("\n");
@@ -489,6 +594,7 @@ mod tests {
         assert!(shown.truncated);
         assert_eq!(shown.text.chars().count(), SHOW_MAX_CHARS);
         assert_eq!(shown.lines, [1, 1]);
+        assert_eq!(shown.next_lines, None, "nothing follows the cut line");
     }
 
     #[test]

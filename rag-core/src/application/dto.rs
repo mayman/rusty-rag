@@ -139,9 +139,13 @@ pub struct SearchResponse {
 /// clone path to show.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SourceSummary {
-    pub repo: String,
+    /// The unique name of the source: the handle `rag update`, `remove`, `reindex`,
+    /// `show` and `search --repo` accept.
     pub name: String,
+    /// The slug, `host/owner/name`.
+    pub repo: String,
     pub status: String,
+    /// The short indexed commit.
     pub commit: Option<String>,
     pub indexed_at: Option<String>,
     pub age_seconds: Option<u64>,
@@ -165,10 +169,10 @@ impl SourceSummary {
     pub fn new(source: &Source, chunks: usize, now: IndexedAt) -> Self {
         let indexed = source.indexed();
         Self {
-            repo: source.id().slug().to_owned(),
             name: source.name().to_owned(),
+            repo: source.id().slug().to_owned(),
             status: source.status().as_str().to_owned(),
-            commit: indexed.map(|revision| revision.commit.to_string()),
+            commit: indexed.map(|revision| revision.commit.short().to_owned()),
             indexed_at: indexed.map(|revision| revision.at.to_rfc3339()),
             age_seconds: indexed.map(|revision| revision.at.age_seconds(now)),
             chunks,
@@ -193,6 +197,8 @@ pub struct ListResponse {
 pub const SHOW_MAX_LINES: usize = 200;
 /// Most characters of file text one `rag show` response carries.
 pub const SHOW_MAX_CHARS: usize = 8000;
+/// Fewest characters `rag show --max-chars` may ask for.
+pub const SHOW_MIN_CHARS: usize = 100;
 /// Lines shown on each side of the line named by `--around`.
 pub const SHOW_AROUND_RADIUS: usize = 20;
 
@@ -216,6 +222,11 @@ pub struct ShowResponse {
     /// The text was cut by the line or character cap (`SHOW_MAX_LINES`,
     /// `SHOW_MAX_CHARS`): `lines` says where it ends.
     pub truncated: bool,
+    /// `N-M`: the next lines to ask for (`rag show <repo> <path> --lines N-M`) when
+    /// the cut left lines of the selection unshown. Absent when nothing was cut, or
+    /// nothing follows the cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_lines: Option<String>,
     /// The chunk id, when showing a chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk: Option<String>,
@@ -371,6 +382,7 @@ mod tests {
             lines: [1, 1],
             total_lines: Some(1),
             truncated: false,
+            next_lines: None,
             chunk: None,
             text: "x".into(),
         };
@@ -462,8 +474,13 @@ mod tests {
         let now = IndexedAt::from_epoch_seconds(1_700_000_090);
         let summary = SourceSummary::new(&ready_source(), 12, now);
         assert_eq!(summary.repo, "github.com/o/r");
+        assert_eq!(summary.name, "r");
         assert_eq!(summary.status, "ready");
-        assert_eq!(summary.commit.as_deref(), Some(&*"ab".repeat(20)));
+        assert_eq!(
+            summary.commit.as_deref(),
+            Some("abababa"),
+            "the short commit"
+        );
         assert_eq!(summary.indexed_at.as_deref(), Some("2023-11-14T22:13:20Z"));
         assert_eq!(summary.age_seconds, Some(90));
         assert_eq!(summary.chunks, 12);
@@ -525,7 +542,7 @@ mod tests {
         source.mark_failed();
         let summary = SourceSummary::new(&source, 3, IndexedAt::from_epoch_seconds(1_700_000_010));
         assert_eq!(summary.status, "failed");
-        assert_eq!(summary.commit.as_deref(), Some(&*"ab".repeat(20)));
+        assert_eq!(summary.commit.as_deref(), Some("abababa"));
         assert_eq!(summary.age_seconds, Some(10));
     }
     #[test]
@@ -564,8 +581,8 @@ mod tests {
         assert_eq!(
             json,
             concat!(
-                r#"{"schema_version":1,"sources":[{"repo":"github.com/o/r","name":"r","#,
-                r#""status":"ready","commit":"abababababababababababababababababababab","#,
+                r#"{"schema_version":1,"sources":[{"name":"r","repo":"github.com/o/r","#,
+                r#""status":"ready","commit":"abababa","#,
                 r#""indexed_at":"2023-11-14T22:13:20Z","age_seconds":0,"chunks":1}]}"#
             ),
             "no clone path: clones have no working tree to browse"

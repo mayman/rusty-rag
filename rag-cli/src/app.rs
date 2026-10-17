@@ -105,17 +105,19 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
             path,
             lines,
             around,
+            max_chars,
         } => {
             let store = SqliteStore::open_for_read(layout.root())?;
             let git = git_client(&layout);
             let show_file = ShowFile::new(&store, &store, &git);
             let response = match (chunk, repo, path) {
-                (Some(id), _, _) => show_file.execute_chunk(&id)?,
+                (Some(id), _, _) => show_file.execute_chunk(&id, max_chars)?,
                 (None, Some(repo), Some(path)) => show_file.execute(&ShowFileRequest {
                     repo,
                     path,
                     lines,
                     around,
+                    max_chars,
                 })?,
                 _ => return Err(usage("show needs --chunk <id> or <repo> <path>")),
             };

@@ -80,6 +80,9 @@ pub enum Command {
         /// Lines around this one.
         #[arg(long)]
         around: Option<usize>,
+        /// Cap on the characters of text shown (at most 8000, at least 100).
+        #[arg(long)]
+        max_chars: Option<usize>,
     },
     /// Rebuild the index of one source, or all, after a tokenizer or chunker change.
     Reindex {
@@ -194,6 +197,22 @@ mod tests {
         };
         assert_eq!(lines, Some((3, 9)));
         assert!(parse(&["show", "r", "a.rs", "--around", "4"]).is_ok());
+    }
+
+    #[test]
+    fn show_takes_max_chars_with_either_form() {
+        let Command::Show { max_chars, .. } = parse(&["show", "r", "a.rs", "--max-chars", "300"])
+            .unwrap()
+            .command
+        else {
+            panic!("not a show");
+        };
+        assert_eq!(max_chars, Some(300));
+        assert!(parse(&["show", "--chunk", "ab", "--max-chars", "300"]).is_ok());
+        let Command::Show { max_chars, .. } = parse(&["show", "r", "a.rs"]).unwrap().command else {
+            panic!("not a show");
+        };
+        assert_eq!(max_chars, None);
     }
 
     #[test]

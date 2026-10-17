@@ -501,6 +501,36 @@ fn human_output_is_plain_text_without_ansi() {
 }
 
 #[test]
+fn a_long_file_is_cut_with_a_concrete_next_range_and_list_shows_the_short_commit() {
+    let rag = Rag::new();
+    let upstream = Upstream::with_sources();
+    let numbered: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+    upstream.write("notes/big.txt", &numbered);
+    upstream.commit("big");
+    let name = rag.add(&upstream)["name"].as_str().unwrap().to_owned();
+
+    let cut = rag.json(&["show", &name, "notes/big.txt"], 0);
+    assert_eq!(cut["truncated"], true);
+    assert_eq!(cut["lines"], serde_json::json!([1, 200]));
+    assert_eq!(cut["next_lines"], "201-300");
+    let rest = rag.json(&["show", &name, "notes/big.txt", "--lines", "201-300"], 0);
+    assert_eq!(rest["truncated"], false);
+    assert!(rest.get("next_lines").is_none());
+
+    let small = rag.json(&["show", &name, "notes/big.txt", "--max-chars", "50"], 0);
+    assert_eq!(small["truncated"], true);
+    assert!(small["text"].as_str().unwrap().chars().count() <= 100);
+    let human = rag.run(&["show", &name, "notes/big.txt", "--human"]);
+    let human = text(&human.stdout);
+    assert!(human.contains("--lines 201-300"), "{human}");
+    assert!(!human.contains("<end>"), "{human}");
+
+    let listed = rag.json(&["list"], 0);
+    assert_eq!(listed["sources"][0]["commit"].as_str().unwrap().len(), 7);
+    assert_eq!(listed["sources"][0]["name"], name.as_str());
+}
+
+#[test]
 fn human_errors_go_to_stderr_with_the_hint() {
     let rag = Rag::new();
     let output = rag.run(&["search", "x", "--human"]);

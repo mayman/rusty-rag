@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(summary.repo, "github.com/o/r");
         assert_eq!(summary.name, "docs");
         assert_eq!(summary.status, "ready");
-        assert_eq!(summary.commit.as_deref(), Some(COMMIT));
+        assert_eq!(summary.commit.as_deref(), Some(&COMMIT[..7]));
         assert_eq!(summary.indexed_at.as_deref(), Some("2023-11-14T22:13:20Z"));
         assert_eq!(summary.age_seconds, Some(3600));
         assert_eq!(summary.chunks, 2);
