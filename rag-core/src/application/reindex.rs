@@ -6,13 +6,15 @@ use crate::application::dto::{ErrorBody, SCHEMA_VERSION};
 use crate::application::error::AppError;
 use crate::application::index_pipeline::IndexReport;
 use crate::application::indexer::{
-    error_body, exit_code_of_failures, is_contention, resolve_source, Indexer, NO_SOURCES_MESSAGE,
+    error_body, exit_code_of_failures, is_contention, resolve_source, Indexer, DEFAULT_LOCK_WAIT,
+    NO_SOURCES_MESSAGE,
 };
 use crate::application::ports::{ChunkStore, Clock, GitClient, OperationLock, SourceRepository};
 use crate::application::progress::{Progress, NO_PROGRESS};
 use crate::application::search::unknown_source;
 use crate::domain::source::Source;
 use crate::domain::source_id::SourceId;
+use std::time::Duration;
 
 /// Input of the reindex use case.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -81,6 +83,7 @@ pub struct Reindex<'a> {
     locks: &'a dyn OperationLock,
     clock: &'a dyn Clock,
     progress: &'a dyn Progress,
+    lock_wait: Duration,
 }
 
 impl<'a> Reindex<'a> {
@@ -98,7 +101,15 @@ impl<'a> Reindex<'a> {
             locks,
             clock,
             progress: &NO_PROGRESS,
+            lock_wait: DEFAULT_LOCK_WAIT,
         }
+    }
+
+    /// How long to wait for the operation lock of each source (default
+    /// `DEFAULT_LOCK_WAIT`); `Duration::ZERO` skips a busy source at once (`--no-wait`).
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     /// Reports the phases of the rebuild to `progress`.
@@ -165,7 +176,7 @@ impl<'a> Reindex<'a> {
     /// Reindexes one source under its operation lock. `None` when the source was
     /// removed after it was listed.
     fn reindex_one(&self, id: &SourceId) -> Result<Option<ReindexEntry>, AppError> {
-        let _lock = self.locks.acquire(id)?;
+        let _lock = self.locks.acquire_waiting(id, "reindex", self.lock_wait)?;
         let Some(source) = self.sources.get(id)? else {
             return Ok(None);
         };
@@ -205,6 +216,31 @@ mod tests {
 
     fn stored_versions(w: &World) -> IndexVersions {
         w.store.stored_versions(&w.id()).unwrap().unwrap()
+    }
+
+    #[test]
+    fn reindex_waits_for_the_operation_lock_as_long_as_it_is_told_to() {
+        use crate::application::indexer::DEFAULT_LOCK_WAIT;
+        use crate::application::indexer_test_support::RecordingLock;
+        use std::time::Duration;
+        let (w, _) = indexed_world();
+        let locks = RecordingLock::new(&w.locks);
+
+        w.reindex_locked(&locks)
+            .execute(&ReindexRequest::all())
+            .unwrap();
+        w.reindex_locked(&locks)
+            .with_lock_wait(Duration::ZERO)
+            .execute(&ReindexRequest::all())
+            .unwrap();
+
+        assert_eq!(
+            locks.waits(),
+            [
+                ("reindex".to_owned(), DEFAULT_LOCK_WAIT),
+                ("reindex".to_owned(), Duration::ZERO)
+            ]
+        );
     }
 
     #[test]
@@ -384,6 +420,7 @@ mod tests {
         let _held = w.locks.acquire(&w.id()).unwrap();
         let error = w
             .reindex()
+            .with_lock_wait(std::time::Duration::ZERO)
             .execute(&ReindexRequest::named(NAME))
             .unwrap_err();
         assert_eq!(error.code().exit_code(), 6);
@@ -405,7 +442,11 @@ mod tests {
         let other = second_source(&w);
         let _held = w.locks.acquire(&other).unwrap();
 
-        let response = w.reindex().execute(&ReindexRequest::all()).unwrap();
+        let response = w
+            .reindex()
+            .with_lock_wait(std::time::Duration::ZERO)
+            .execute(&ReindexRequest::all())
+            .unwrap();
 
         let results: Vec<&str> = response.sources.iter().map(|e| e.result.as_str()).collect();
         assert_eq!(results, ["skipped_busy", "up_to_date"]);

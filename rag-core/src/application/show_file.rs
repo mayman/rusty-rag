@@ -121,13 +121,11 @@ impl<'a> ShowFile<'a> {
                 "a chunk id is 64 hexadecimal characters, as printed by `rag search`",
             ))
         })?;
-        let gone = || {
-            AppError::NotFound(Scrubbed::from(
-                "that chunk is not in the index; an update may have replaced it, so run `rag search` again",
-            ))
-        };
-        let chunk = self.chunks.chunk(&id)?.ok_or_else(gone)?;
-        let source = self.sources.get(&chunk.source)?.ok_or_else(gone)?;
+        let chunk = self.chunks.chunk(&id)?.ok_or(AppError::ChunkGone)?;
+        let source = self
+            .sources
+            .get(&chunk.source)?
+            .ok_or(AppError::ChunkGone)?;
         let revision = revision_of(&source)?;
         refuse_by_name(&chunk.path)?;
         let lines: Vec<&str> = chunk.text.lines().collect();
@@ -799,6 +797,7 @@ mod tests {
         let error = world.show_chunk(&"ab".repeat(32)).unwrap_err();
         assert_eq!(error.code(), ErrorCode::NotFound);
         assert!(error.to_string().contains("rag search"), "{error}");
+        assert_eq!(error.hint().as_deref(), Some("run `rag search` again"));
     }
 
     #[test]

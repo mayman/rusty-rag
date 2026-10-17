@@ -115,6 +115,10 @@ impl World {
         Reindex::new(&self.store, &self.store, git, &self.locks, &self.clock)
     }
 
+    pub fn reindex_locked<'a>(&'a self, locks: &'a dyn OperationLock) -> Reindex<'a> {
+        Reindex::new(&self.store, &self.store, &self.git, locks, &self.clock)
+    }
+
     /// Adds `REMOTE` under its default name.
     pub fn add(&self) -> Result<AddResponse, AppError> {
         self.add_source().execute(&AddRequest::new(REMOTE))

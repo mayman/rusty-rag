@@ -191,6 +191,23 @@ impl SourceSummary {
 pub struct ListResponse {
     pub schema_version: u32,
     pub sources: Vec<SourceSummary>,
+    /// Present when no source is registered: what to do about it (for the user).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl ListResponse {
+    /// The response for `sources`; an empty list carries the hint.
+    pub fn of(sources: Vec<SourceSummary>) -> Self {
+        let hint = sources
+            .is_empty()
+            .then(|| "no sources are indexed; ask the user to run `rag add <url|path>`".to_owned());
+        Self {
+            schema_version: SCHEMA_VERSION,
+            sources,
+            hint,
+        }
+    }
 }
 
 /// Most lines one `rag show` response carries.
@@ -649,11 +666,7 @@ mod tests {
             1,
             IndexedAt::from_epoch_seconds(1_700_000_000),
         );
-        let json = serde_json::to_string(&ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: vec![summary],
-        })
-        .unwrap();
+        let json = serde_json::to_string(&ListResponse::of(vec![summary])).unwrap();
         assert_eq!(
             json,
             concat!(
@@ -662,6 +675,18 @@ mod tests {
                 r#""indexed_at":"2023-11-14T22:13:20Z","age_seconds":0,"chunks":1}]}"#
             ),
             "no clone path: clones have no working tree to browse"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_carries_a_hint_for_the_user_and_a_filled_one_does_not() {
+        let json = serde_json::to_string(&ListResponse::of(Vec::new())).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"schema_version":1,"sources":[],"#,
+                r#""hint":"no sources are indexed; ask the user to run `rag add <url|path>`"}"#
+            )
         );
     }
 }

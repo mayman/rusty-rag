@@ -17,7 +17,13 @@ pub fn classify(stderr: &str) -> GitError {
     // split a URL and leave a credential that no scrubber recognises.
     let message = summary(&scrub_credentials(stderr));
 
-    if has(&["index.lock", "shallow.lock", "another git process"]) {
+    if has(&[
+        "index.lock",
+        "shallow.lock",
+        "another git process",
+        ".lock': file exists.",
+    ]) || (lower.contains("could not lock") && lower.contains("file exists"))
+    {
         GitError::Busy
     } else if has(&["dubious ownership", "safe.directory"]) {
         GitError::Failed(
@@ -40,12 +46,17 @@ pub fn classify(stderr: &str) -> GitError {
     ]) {
         GitError::NotFound(message.into())
     } else if has(&[
-        "could not resolve host",
         "could not read username",
         "could not read password",
         "authentication failed",
         "terminal prompts disabled",
         "permission denied",
+        "returned error: 401",
+        "returned error: 403",
+    ]) {
+        GitError::AuthRequired(message.into())
+    } else if has(&[
+        "could not resolve host",
         "host key verification failed",
         "unable to access",
         "connection refused",
@@ -55,8 +66,6 @@ pub fn classify(stderr: &str) -> GitError {
         "operation timed out",
         "ssl",
         "tls",
-        "returned error: 401",
-        "returned error: 403",
         "returned error: 5",
         "could not read from remote repository",
         "the remote end hung up",
@@ -97,6 +106,8 @@ mod tests {
             GitError::NetworkOrAuth(_) => "network",
             GitError::Timeout => "timeout",
             GitError::Busy => "busy",
+            GitError::AuthRequired(_) => "auth",
+            GitError::DeadlineExceeded => "deadline",
             GitError::TooLarge(_) => "too_large",
             GitError::Failed(_) => "failed",
         }
@@ -129,18 +140,27 @@ mod tests {
     }
 
     #[test]
-    fn auth_and_network_failures_are_network_or_auth() {
+    fn network_failures_are_network_or_auth() {
         for stderr in [
             "fatal: unable to access 'https://h/r/': Could not resolve host: h",
-            "fatal: could not read Username for 'https://h': terminal prompts disabled",
-            "git@h: Permission denied (publickey).\nfatal: Could not read from remote repository.",
-            "fatal: Authentication failed for 'https://h/r/'",
             "fatal: unable to access 'https://h/r/': Failed to connect: Connection refused",
             "ssh: connect to host h port 22: Connection timed out",
             "Host key verification failed.",
-            "The requested URL returned error: 403",
         ] {
             assert_eq!(kind(stderr), "network", "{stderr}");
+        }
+    }
+
+    #[test]
+    fn credential_refusals_are_auth_required_so_the_hint_can_tell_the_user_to_sign_in() {
+        for stderr in [
+            "fatal: could not read Username for 'https://h': terminal prompts disabled",
+            "git@h: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+            "fatal: Authentication failed for 'https://h/r/'",
+            "The requested URL returned error: 403",
+            "fatal: unable to access 'https://h/r/': The requested URL returned error: 401",
+        ] {
+            assert_eq!(kind(stderr), "auth", "{stderr}");
         }
     }
 
@@ -150,6 +170,9 @@ mod tests {
             "fatal: Unable to create '/r/.git/index.lock': File exists.\n\nAnother git process seems to be running",
             "fatal: Unable to create '/r/shallow.lock': File exists.",
             "fatal: another git process seems to be running in this repository",
+            "error: cannot lock ref 'refs/rag/head': Unable to create '/r/refs/rag/head.lock': File exists.",
+            "fatal: Unable to create '/r/objects/pack/tmp.lock': File exists.",
+            "error: could not lock config file /r/config: File exists",
         ] {
             assert_eq!(kind(stderr), "busy", "{stderr}");
         }

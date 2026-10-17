@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use rag_core::application::add_source::{AddRequest, AddSource};
-use rag_core::application::dto::{ListResponse, SearchRequest, SCHEMA_VERSION};
+use rag_core::application::dto::{ListResponse, SearchRequest};
 use rag_core::application::error::{AppError, Scrubbed, StorageError};
 use rag_core::application::indexer::DEFAULT_LOCK_WAIT;
 use rag_core::application::list_sources::ListSources;
@@ -195,6 +195,7 @@ pub fn run(command: Command, mode: Mode, options: &RunOptions) -> Result<Execute
                 &SystemClock,
             )
             .with_progress(progress)
+            .with_lock_wait(options.lock_wait())
             .execute(&request)?;
             Ok(Executed::with_code(
                 match mode {
@@ -228,10 +229,7 @@ fn run_list(layout: &DataLayout, mode: Mode) -> Result<Executed, AppError> {
     let response = match SqliteStore::open_for_read(layout.root()) {
         Ok(store) => ListSources::new(&store, &store, &SystemClock).execute()?,
         // Nothing added yet is an empty list, not a failure.
-        Err(StorageError::IndexMissing) => ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: Vec::new(),
-        },
+        Err(StorageError::IndexMissing) => ListResponse::of(Vec::new()),
         Err(error) => return Err(error.into()),
     };
     Ok(Executed::ok(match mode {

@@ -1,7 +1,7 @@
 //! The list use case: every registered source with its status, indexed commit, age,
 //! and chunk count. Clones have no working tree, so no clone path is reported.
 
-use crate::application::dto::{ListResponse, SourceSummary, SCHEMA_VERSION};
+use crate::application::dto::{ListResponse, SourceSummary};
 use crate::application::error::AppError;
 use crate::application::ports::{ChunkStore, Clock, SourceRepository};
 
@@ -36,10 +36,7 @@ impl<'a> ListSources<'a> {
                 Ok(SourceSummary::new(source, chunks, now))
             })
             .collect::<Result<Vec<_>, AppError>>()?;
-        Ok(ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources,
-        })
+        Ok(ListResponse::of(sources))
     }
 }
 
@@ -67,6 +64,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.schema_version, SCHEMA_VERSION);
         assert!(response.sources.is_empty());
+        assert!(response.hint.unwrap().contains("rag add"));
     }
 
     #[test]

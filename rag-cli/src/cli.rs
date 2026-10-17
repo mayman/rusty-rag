@@ -6,18 +6,45 @@ use rag_core::application::dto::{DEFAULT_K, DEFAULT_MAX_CHARS};
 /// Local-first keyword search over git repositories. Output is JSON unless
 /// `--human` is given.
 #[derive(Debug, Parser)]
-#[command(name = "rag", bin_name = "rag", version, about)]
+#[command(
+    name = "rag",
+    bin_name = "rag",
+    version,
+    about,
+    after_long_help = LONG_OPERATIONS_NOTE
+)]
 pub struct Cli {
     /// Plain text for people instead of JSON.
     #[arg(long, global = true)]
     pub human: bool,
     /// Fail at once, instead of waiting up to 20 seconds, when another process is
-    /// adding or updating the same source.
+    /// adding, updating, removing or reindexing the same source.
     #[arg(long, global = true)]
     pub no_wait: bool,
+    /// Wall-clock budget for add, update and reindex, in seconds (default 100; 0 = no
+    /// limit). When it runs out the command stops with the error `deadline_exceeded`
+    /// and nothing is marked failed; re-run the same command to resume, the fetched
+    /// data is kept.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_DEADLINE_SECONDS
+    )]
+    pub deadline: u64,
     #[command(subcommand)]
     pub command: Command,
 }
+
+/// The default of `--deadline`, in seconds.
+pub const DEFAULT_DEADLINE_SECONDS: u64 = 100;
+
+/// Shown at the end of `rag --help`.
+const LONG_OPERATIONS_NOTE: &str =
+    "Long operations: add, update and reindex can take minutes on a large repository \
+and may exceed the timeout of the tool that runs rag (an agent, a CI step). Run them in the \
+background and read the result when they finish. They stop by themselves after --deadline \
+seconds; it is safe to re-run a command that was interrupted or timed out.";
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -229,6 +256,41 @@ mod tests {
             "{help}"
         );
         assert!(help.contains("same as giving no name"), "{help}");
+    }
+
+    fn root_help() -> String {
+        use clap::CommandFactory;
+        Cli::command().render_long_help().to_string()
+    }
+
+    #[test]
+    fn the_root_help_warns_that_long_operations_may_outlast_a_tool_timeout() {
+        let help = root_help();
+        for needle in ["add, update and reindex", "background", "safe to re-run"] {
+            assert!(help.contains(needle), "{needle}: {help}");
+        }
+    }
+
+    #[test]
+    fn no_wait_help_names_every_operation_that_waits_for_the_source() {
+        let help = root_help();
+        assert!(
+            help.contains("adding, updating, removing or reindexing"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn the_deadline_defaults_to_100_seconds_and_zero_means_none() {
+        assert_eq!(parse(&["add", "x"]).unwrap().deadline, 100);
+        assert_eq!(parse(&["update", "--deadline", "30"]).unwrap().deadline, 30);
+        assert_eq!(parse(&["--deadline", "0", "reindex"]).unwrap().deadline, 0);
+        assert!(parse(&["update", "--deadline", "soon"]).is_err());
+        let help = root_help();
+        assert!(help.contains("--deadline <SECONDS>"), "{help}");
+        assert!(help.contains("default 100"), "{help}");
+        assert!(help.contains("0 = no limit"), "{help}");
+        assert!(help.contains("re-run"), "{help}");
     }
 
     #[test]

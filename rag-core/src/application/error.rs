@@ -21,11 +21,14 @@ pub enum ErrorCode {
     IndexMissing,
     IndexLocked,
     ReindexRequired,
+    /// The `--deadline` of an indexing command ran out.
+    DeadlineExceeded,
 }
 
 impl ErrorCode {
-    /// Every code, in exit-code order.
-    pub const ALL: [ErrorCode; 7] = [
+    /// Every code, in exit-code order (the deadline shares the generic exit code, so
+    /// it comes last).
+    pub const ALL: [ErrorCode; 8] = [
         ErrorCode::Generic,
         ErrorCode::Usage,
         ErrorCode::NotFound,
@@ -33,13 +36,15 @@ impl ErrorCode {
         ErrorCode::IndexMissing,
         ErrorCode::IndexLocked,
         ErrorCode::ReindexRequired,
+        ErrorCode::DeadlineExceeded,
     ];
 
     /// The process exit code: 1 generic, 2 usage, 3 not found, 4 auth/network,
-    /// 5 index missing, 6 index locked, 7 reindex required (0 is success).
+    /// 5 index missing, 6 index locked, 7 reindex required (0 is success). A deadline
+    /// is neither a network problem nor a lock: it exits 1 under its own code string.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Generic => 1,
+            Self::Generic | Self::DeadlineExceeded => 1,
             Self::Usage => 2,
             Self::NotFound => 3,
             Self::NetworkOrAuth => 4,
@@ -59,6 +64,7 @@ impl ErrorCode {
             Self::IndexMissing => "index_missing",
             Self::IndexLocked => "index_locked",
             Self::ReindexRequired => "reindex_required",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 
@@ -158,6 +164,11 @@ pub enum GitError {
     NetworkOrAuth(Scrubbed),
     /// A git operation exceeded its time limit.
     Timeout,
+    /// The overall `--deadline` of the command ran out while git was working.
+    DeadlineExceeded,
+    /// The remote refused the credentials, or asked for some that git cannot give
+    /// non-interactively. A retry cannot help until the user signs in.
+    AuthRequired(Scrubbed),
     /// The repository is in use by another operation; retry later.
     Busy,
     /// A blob, or a batch of blobs, is larger than the adapter will read into
@@ -231,6 +242,12 @@ pub enum AppError {
     },
     /// The request itself is invalid.
     Usage(Scrubbed),
+    /// The overall `--deadline` ran out between two steps of an indexing command.
+    /// It is not recorded as a failure of a source: the old index is intact.
+    DeadlineExceeded,
+    /// The chunk asked for by id is not stored (an update replaced it, or its source
+    /// was removed).
+    ChunkGone,
 }
 
 /// A word safe to paste into a shell as one argument: quoted unless it is plain.
@@ -250,6 +267,16 @@ fn shell_word(text: &str) -> String {
 /// its work.
 const LOCKED_HINT: &str =
     "your command was not done and nothing was changed by it; wait about 5 seconds, then retry";
+/// Shown when git's own lock files are taken, possibly by a git that was killed.
+const GIT_LOCK_HINT: &str = "another git process or a killed one holds a lock; retry in a minute";
+/// Shown when the time limit of the command ran out.
+const DEADLINE_HINT: &str = "re-run the same command to resume; the fetched data is kept";
+/// What a deadline error says.
+const DEADLINE_MESSAGE: &str =
+    "the time limit of this command (--deadline) ran out before it finished";
+/// Shown for an authentication failure. Addressed to the user: signing in changes
+/// their credentials, which an agent must not do.
+const AUTH_HINT: &str = "authenticate once in a terminal (for example `git ls-remote <url>` or `gh auth login`), then retry; never put tokens in a URL";
 /// Shown for network and authentication failures.
 const NETWORK_HINT: &str = "check the network and the credentials; git must authenticate non-interactively (a configured credential helper or ssh key); if it persists, ask the user";
 
@@ -277,8 +304,13 @@ impl AppError {
             }
             Self::Storage(
                 StorageError::Busy | StorageError::LockedBy(_) | StorageError::Conflict,
-            )
-            | Self::Git(GitError::Busy) => Some(LOCKED_HINT.to_owned()),
+            ) => Some(LOCKED_HINT.to_owned()),
+            Self::Git(GitError::Busy) => Some(GIT_LOCK_HINT.to_owned()),
+            Self::Git(GitError::DeadlineExceeded) | Self::DeadlineExceeded => {
+                Some(DEADLINE_HINT.to_owned())
+            }
+            Self::Git(GitError::AuthRequired(_)) => Some(AUTH_HINT.to_owned()),
+            Self::ChunkGone => Some("run `rag search` again".to_owned()),
             Self::Git(GitError::NetworkOrAuth(_) | GitError::Timeout) => {
                 Some(NETWORK_HINT.to_owned())
             }
@@ -320,10 +352,16 @@ impl AppError {
             Self::Storage(StorageError::ReindexRequired) | Self::StaleIndex { .. } => {
                 ErrorCode::ReindexRequired
             }
-            Self::Git(GitError::NotFound(_)) | Self::NotFound(_) | Self::UnknownSource(_) => {
-                ErrorCode::NotFound
+            Self::Git(GitError::NotFound(_))
+            | Self::NotFound(_)
+            | Self::UnknownSource(_)
+            | Self::ChunkGone => ErrorCode::NotFound,
+            Self::Git(
+                GitError::NetworkOrAuth(_) | GitError::Timeout | GitError::AuthRequired(_),
+            ) => ErrorCode::NetworkOrAuth,
+            Self::DeadlineExceeded | Self::Git(GitError::DeadlineExceeded) => {
+                ErrorCode::DeadlineExceeded
             }
-            Self::Git(GitError::NetworkOrAuth(_) | GitError::Timeout) => ErrorCode::NetworkOrAuth,
             Self::Usage(_) | Self::Storage(StorageError::NameTaken(_)) => ErrorCode::Usage,
             Self::Storage(StorageError::Failed(_))
             | Self::Git(GitError::Failed(_) | GitError::TooLarge(_)) => ErrorCode::Generic,
@@ -361,6 +399,10 @@ impl fmt::Display for GitError {
                 write!(f, "git: network or authentication failure: {message}")
             }
             Self::Timeout => f.write_str("git: operation timed out"),
+            Self::DeadlineExceeded => f.write_str(DEADLINE_MESSAGE),
+            Self::AuthRequired(message) => {
+                write!(f, "git: authentication failure: {message}")
+            }
             Self::Busy => f.write_str("git: the repository is busy; retry shortly"),
             Self::TooLarge(what) => write!(f, "git: too large to read: {what}"),
             Self::Failed(message) => write!(f, "git failure: {message}"),
@@ -388,6 +430,8 @@ impl fmt::Display for AppError {
                 )
             }
             Self::Usage(message) => message.to_string(),
+            Self::DeadlineExceeded => DEADLINE_MESSAGE.to_owned(),
+            Self::ChunkGone => "that chunk is not in the index; an update may have replaced it, so run `rag search` again".to_owned(),
         };
         f.write_str(&scrub_credentials(&text))
     }
@@ -413,9 +457,57 @@ mod tests {
     use super::{AppError, ErrorCode, GitError, Scrubbed, StorageError, UnknownSource};
 
     #[test]
-    fn exit_codes_are_one_to_seven_in_order() {
+    fn exit_codes_are_one_to_seven_in_order_then_the_deadline_shares_the_generic_one() {
         let codes: Vec<u8> = ErrorCode::ALL.iter().map(ErrorCode::exit_code).collect();
-        assert_eq!(codes, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(codes, [1, 2, 3, 4, 5, 6, 7, 1]);
+    }
+
+    #[test]
+    fn a_deadline_is_its_own_code_with_exit_one_and_a_resume_hint() {
+        for error in [
+            AppError::DeadlineExceeded,
+            AppError::Git(GitError::DeadlineExceeded),
+        ] {
+            assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+            assert_eq!(error.code().as_str(), "deadline_exceeded");
+            assert_eq!(error.code().exit_code(), 1);
+            assert_eq!(
+                error.hint().unwrap(),
+                "re-run the same command to resume; the fetched data is kept"
+            );
+            assert!(error.to_string().contains("--deadline"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_git_lock_says_another_git_process_or_a_killed_one_holds_it() {
+        let error = AppError::Git(GitError::Busy);
+        assert_eq!(error.code().exit_code(), 6);
+        assert_eq!(
+            error.hint().unwrap(),
+            "another git process or a killed one holds a lock; retry in a minute"
+        );
+    }
+
+    #[test]
+    fn an_authentication_failure_tells_the_user_to_sign_in_once_and_never_to_use_a_token_url() {
+        let error = AppError::Git(GitError::AuthRequired("denied".into()));
+        assert_eq!(error.code(), ErrorCode::NetworkOrAuth);
+        assert_eq!(error.code().exit_code(), 4);
+        let hint = error.hint().unwrap();
+        assert_eq!(
+            hint,
+            "authenticate once in a terminal (for example `git ls-remote <url>` or `gh auth login`), then retry; never put tokens in a URL"
+        );
+        assert!(error.to_string().contains("denied"), "{error}");
+    }
+
+    #[test]
+    fn a_vanished_chunk_hints_to_search_again() {
+        let error = AppError::ChunkGone;
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        assert_eq!(error.hint().unwrap(), "run `rag search` again");
+        assert!(error.to_string().contains("rag search"), "{error}");
     }
 
     #[test]
@@ -438,7 +530,8 @@ mod tests {
                 "network_or_auth",
                 "index_missing",
                 "index_locked",
-                "reindex_required"
+                "reindex_required",
+                "deadline_exceeded"
             ]
         );
     }
@@ -520,7 +613,6 @@ mod tests {
             AppError::Storage(StorageError::Busy),
             AppError::Storage(StorageError::Conflict),
             AppError::Storage(StorageError::locked_by("update")),
-            AppError::Git(GitError::Busy),
         ] {
             let hint = error.hint().unwrap();
             assert!(hint.contains("was not done"), "{hint}");

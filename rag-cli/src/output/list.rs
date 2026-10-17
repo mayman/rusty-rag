@@ -11,7 +11,7 @@ pub fn render_list_json(response: &ListResponse) -> String {
 mod tests {
     use super::render_list_json;
     use crate::output::test_support::INDEXED_AT;
-    use rag_core::application::dto::{ListResponse, SourceSummary, SCHEMA_VERSION};
+    use rag_core::application::dto::{ListResponse, SourceSummary};
     use rag_core::domain::git_location::GitLocation;
     use rag_core::domain::indexed_at::IndexedAt;
     use rag_core::domain::oid::CommitId;
@@ -63,21 +63,18 @@ mod tests {
 
     #[test]
     fn list_output_matches_the_golden_file() {
-        let json = render_list_json(&ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: sources(),
-        });
+        let json = render_list_json(&ListResponse::of(sources()));
         assert_eq!(json, GOLDEN.trim_end());
     }
 
     #[test]
-    fn an_empty_registry_is_an_empty_list_not_an_error() {
+    fn an_empty_registry_is_an_empty_list_with_a_hint_not_an_error() {
         assert_eq!(
-            render_list_json(&ListResponse {
-                schema_version: SCHEMA_VERSION,
-                sources: vec![],
-            }),
-            r#"{"schema_version":1,"sources":[]}"#
+            render_list_json(&ListResponse::of(vec![])),
+            concat!(
+                r#"{"schema_version":1,"sources":[],"#,
+                r#""hint":"no sources are indexed; ask the user to run `rag add <url|path>`"}"#
+            )
         );
     }
 }

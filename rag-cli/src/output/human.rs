@@ -30,11 +30,11 @@ pub fn render_search_human(response: &SearchResponse) -> String {
         "at least "
     };
     let mut out = format!(
-        "query \"{}\": {} of {at_least}{} matches (mode {})\n",
+        "query \"{}\": {} of {at_least}{} matches ({})\n",
         cell(&response.query),
         response.returned,
         response.total_matches,
-        response.mode
+        mode_in_words(&response.mode)
     );
     for result in &response.results {
         out += &format!(
@@ -54,11 +54,14 @@ pub fn render_search_human(response: &SearchResponse) -> String {
         }
         out += &format!("{INDENT}show: rag show --chunk {}\n", cell(&result.chunk));
     }
-    if let Some(next) = response.next_offset {
-        out += &format!("next page: --offset {next}\n");
-    }
-    if response.truncated {
-        out += "output cut to the size budget: narrow the query or raise --max-chars\n";
+    match (response.truncated, response.next_offset) {
+        (true, Some(next)) => {
+            out +=
+                &format!("output cut to the size budget: use --offset {next} for the next page\n");
+        }
+        (true, None) => out += "output cut to the size budget: narrow the query\n",
+        (false, Some(next)) => out += &format!("next page: --offset {next}\n"),
+        (false, None) => {}
     }
     for notice in &response.notices {
         out += &format!("notice: {}\n", cell(notice));
@@ -67,6 +70,16 @@ pub fn render_search_human(response: &SearchResponse) -> String {
         out += &format!("hint: {}\n", cell(hint));
     }
     out
+}
+
+/// How the words of the query matched, for a person (`and` is the JSON mode).
+fn mode_in_words(mode: &str) -> &str {
+    match mode {
+        "and" => "all words matched",
+        "or_fallback" => "any word matched",
+        "none" => "nothing matched",
+        other => other,
+    }
 }
 
 const NO_SOURCES: &str = "no sources yet; run `rag add <url|path>` to index a repository\n";
@@ -153,9 +166,7 @@ pub fn render_error_human(error: &AppError) -> String {
 mod tests {
     use super::{render_error_human, render_list_human, render_search_human, terminal_safe};
     use crate::output::test_support::{response, result, INDEXED_AT};
-    use rag_core::application::dto::{
-        LastErrorDto, ListResponse, SearchResponse, SourceSummary, SCHEMA_VERSION,
-    };
+    use rag_core::application::dto::{LastErrorDto, ListResponse, SearchResponse, SourceSummary};
     use rag_core::application::error::{AppError, StorageError};
     use rag_core::application::search::NO_MATCH_HINT;
     use rag_core::domain::git_location::GitLocation;
@@ -192,7 +203,7 @@ mod tests {
         let id1 = format!("{:064x}", 1);
         let id2 = format!("{:064x}", 2);
         let expected = format!(
-            "query \"parse config\": 2 of 2 matches (mode and)\n\
+            "query \"parse config\": 2 of 2 matches (all words matched)\n\
              1. github.com/o/r src/parse.rs:10-12  score_rel 1.00\n\
              \x20   fn parse_config() {{\n\
              \x20       load()\n\
@@ -219,7 +230,9 @@ mod tests {
         empty.hint = Some(NO_MATCH_HINT.to_owned());
         assert_eq!(
             render_search_human(&empty),
-            format!("query \"alpha beta\": 0 of 0 matches (mode none)\nhint: {NO_MATCH_HINT}\n")
+            format!(
+                "query \"alpha beta\": 0 of 0 matches (nothing matched)\nhint: {NO_MATCH_HINT}\n"
+            )
         );
     }
 
@@ -231,6 +244,42 @@ mod tests {
         page.next_offset = Some(5);
         let text = render_search_human(&page);
         assert!(text.contains("next page: --offset 5\n"), "{text}");
+    }
+
+    #[test]
+    fn the_header_says_in_words_how_the_query_matched() {
+        let mut page = response("alpha", vec![result(1, "a.rs", 1, "alpha", 1.0, 1.0)]);
+        page.mode = "or_fallback".to_owned();
+        let text = render_search_human(&page);
+        assert!(text.contains("(any word matched)"), "{text}");
+        assert!(!text.contains("mode "), "{text}");
+    }
+
+    #[test]
+    fn a_budget_cut_page_points_at_the_next_offset_not_at_max_chars() {
+        let mut page = response("alpha", vec![result(1, "a.rs", 1, "alpha", 1.0, 1.0)]);
+        page.truncated = true;
+        page.budget_cut = true;
+        page.has_more = true;
+        page.next_offset = Some(1);
+        let text = render_search_human(&page);
+        assert!(
+            text.contains("output cut to the size budget: use --offset 1 for the next page\n"),
+            "{text}"
+        );
+        assert!(!text.contains("max-chars"), "{text}");
+        assert!(!text.contains("next page: --offset"), "said once: {text}");
+    }
+
+    #[test]
+    fn a_cut_without_a_next_page_says_to_narrow_the_query() {
+        let mut page = response("alpha", vec![result(1, "a.rs", 1, "alpha", 1.0, 1.0)]);
+        page.truncated = true;
+        let text = render_search_human(&page);
+        assert!(
+            text.contains("output cut to the size budget: narrow the query\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -285,13 +334,10 @@ mod tests {
 
     #[test]
     fn list_is_an_aligned_table_without_trailing_spaces() {
-        let response = ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: vec![
-                summary("r", "https://github.com/o/r", Some(INDEXED_AT), 2),
-                summary("x", "https://github.com/o/x", None, 0),
-            ],
-        };
+        let response = ListResponse::of(vec![
+            summary("r", "https://github.com/o/r", Some(INDEXED_AT), 2),
+            summary("x", "https://github.com/o/x", None, 0),
+        ]);
         let expected = "\
 NAME  REPO            STATUS   COMMIT   AGE  CHUNKS
 r     github.com/o/r  ready    abababa  1m   2
@@ -302,10 +348,7 @@ x     github.com/o/x  cloning  -        -    0
 
     #[test]
     fn an_empty_registry_says_how_to_start() {
-        let response = ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: vec![],
-        };
+        let response = ListResponse::of(vec![]);
         assert_eq!(
             render_list_human(&response),
             "no sources yet; run `rag add <url|path>` to index a repository\n"
@@ -314,10 +357,12 @@ x     github.com/o/x  cloning  -        -    0
 
     #[test]
     fn a_source_name_with_control_characters_cannot_break_the_table() {
-        let response = ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: vec![summary("a\u{1b}[31mb", "https://github.com/o/r", None, 0)],
-        };
+        let response = ListResponse::of(vec![summary(
+            "a\u{1b}[31mb",
+            "https://github.com/o/r",
+            None,
+            0,
+        )]);
         let text = render_list_human(&response);
         assert!(!text.contains('\u{1b}'));
         assert_eq!(text.lines().count(), 2, "{text}");
@@ -344,10 +389,7 @@ x     github.com/o/x  cloning  -        -    0
             at: "2023-11-14T22:14:10Z".to_owned(),
             age_seconds: 80,
         });
-        let response = ListResponse {
-            schema_version: SCHEMA_VERSION,
-            sources: vec![broken],
-        };
+        let response = ListResponse::of(vec![broken]);
         let text = render_list_human(&response);
         assert!(
             text.ends_with("r: last error 1m ago (network_or_auth): git: operation timed out\n"),
