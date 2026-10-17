@@ -93,6 +93,28 @@ impl<'a> AddSource<'a> {
         self
     }
 
+    /// The name a new source is registered under: `--name` as given, else the first
+    /// default name no other source has (names compare case-insensitively). When all
+    /// of them are taken the full slug is returned, which the caller then refuses.
+    fn name_for(
+        &self,
+        request: &AddRequest,
+        id: &SourceId,
+        location: &GitLocation,
+    ) -> Result<String, AppError> {
+        if let Some(name) = request.name.as_deref().map(str::trim) {
+            if !name.is_empty() {
+                return Ok(name.to_owned());
+            }
+        }
+        for candidate in id.default_names(location) {
+            if self.sources.find_by_name(&candidate)?.is_none() {
+                return Ok(candidate);
+            }
+        }
+        Ok(id.slug().to_owned())
+    }
+
     pub fn execute(&self, request: &AddRequest) -> Result<AddResponse, AppError> {
         let location = GitLocation::parse(&request.location)
             .map_err(|error| AppError::Usage(error.to_string().into()))?;
@@ -114,10 +136,7 @@ impl<'a> AddSource<'a> {
                 (indexed.source, indexed.report, false)
             }
             None => {
-                let name = match request.name.as_deref().map(str::trim) {
-                    Some(name) if !name.is_empty() => name.to_owned(),
-                    _ => id.slug().to_owned(),
-                };
+                let name = self.name_for(request, &id, &location)?;
                 if self.sources.find_by_name(&name)?.is_some() {
                     return Err(StorageError::NameTaken(name.as_str().into()).into());
                 }
@@ -164,7 +183,7 @@ mod tests {
         let response = w.add().unwrap();
 
         assert_eq!(response.repo, "example.com/o/r");
-        assert_eq!(response.name, "example.com/o/r");
+        assert_eq!(response.name, "r");
         assert_eq!(response.status, "ready");
         assert_eq!(response.commit, head.to_string());
         assert!(!response.already_added);
@@ -188,8 +207,17 @@ mod tests {
         assert!(json.contains(r#""skipped":{}"#), "{json}");
     }
 
+    /// Registers `url` under `name` with one commit of its own.
+    fn add_other(w: &World, url: &str, name: &str) {
+        w.git.add_remote(url, "main");
+        w.git.commit(url, &[("other.rs", "fn other() {}\n")]);
+        w.add_source()
+            .execute(&AddRequest::named(url, name))
+            .unwrap();
+    }
+
     #[test]
-    fn add_names_the_source_by_slug_unless_told_otherwise() {
+    fn an_explicit_name_is_used_as_given() {
         let w = World::new();
         w.commit(&[("a.rs", "fn a() {}\n")]);
         let response = w
@@ -198,6 +226,79 @@ mod tests {
             .unwrap();
         assert_eq!(response.name, "Docs");
         assert_eq!(w.store.find_by_name("docs").unwrap().unwrap().id(), &w.id());
+    }
+
+    #[test]
+    fn a_default_name_is_the_last_path_segment_of_the_location() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        assert_eq!(w.add().unwrap().name, "r");
+    }
+
+    #[test]
+    fn a_taken_short_name_falls_back_to_owner_and_name_ignoring_case() {
+        let w = World::new();
+        add_other(&w, "https://example.com/first/x", "R");
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let response = w.add().unwrap();
+        assert_eq!(response.name, "o/r");
+    }
+
+    #[test]
+    fn a_taken_owner_and_name_falls_back_to_the_full_slug() {
+        let w = World::new();
+        add_other(&w, "https://example.com/x/r", "r");
+        add_other(&w, "https://example.com/y/z", "o/r");
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        assert_eq!(w.add().unwrap().name, "example.com/o/r");
+    }
+
+    #[test]
+    fn a_default_name_is_refused_when_even_the_full_slug_is_taken() {
+        let w = World::new();
+        add_other(&w, "https://example.com/x/r", "r");
+        add_other(&w, "https://example.com/y/z", "o/r");
+        add_other(&w, "https://example.com/y/w", "example.com/o/r");
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        let error = w.add().unwrap_err();
+        assert!(
+            matches!(error, AppError::Storage(StorageError::NameTaken(_))),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn local_directories_with_one_name_get_their_parent_in_the_default_name() {
+        let w = World::new();
+        w.git.add_remote("/srv/alice/serde", "main");
+        w.git.commit("/srv/alice/serde", &[("a.rs", "fn a() {}\n")]);
+        w.git.add_remote("/srv/bob/serde", "main");
+        w.git.commit("/srv/bob/serde", &[("b.rs", "fn b() {}\n")]);
+
+        let first = w
+            .add_source()
+            .execute(&AddRequest::new("/srv/alice/serde"))
+            .unwrap();
+        let second = w
+            .add_source()
+            .execute(&AddRequest::new("/srv/bob/serde"))
+            .unwrap();
+
+        assert_eq!(first.name, "serde");
+        assert_eq!(second.name, "bob/serde");
+    }
+
+    #[test]
+    fn re_adding_a_registered_location_keeps_its_name_after_another_takes_its_default() {
+        let w = World::new();
+        w.commit(&[("a.rs", "fn a() {}\n")]);
+        assert_eq!(w.add().unwrap().name, "r");
+        add_other(&w, "https://example.com/x/r", "elsewhere");
+
+        let again = w.add().unwrap();
+
+        assert!(again.already_added);
+        assert_eq!(again.name, "r");
     }
 
     #[test]

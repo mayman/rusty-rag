@@ -134,6 +134,26 @@ impl SourceId {
         &self.full
     }
 
+    /// The names a new source takes by default, most wanted first: the last path
+    /// segment of the location, then the last two (`owner/name`; for a local path,
+    /// `parent/directory`), then the full slug. `self` must come from `location`. A
+    /// local path is named from its own segments, since its slug carries a hash.
+    pub fn default_names(&self, location: &GitLocation) -> Vec<String> {
+        let segments: Vec<String> = match split_remote(location.as_str()) {
+            Some(_) => self.slug().split('/').skip(1).map(str::to_owned).collect(),
+            None => local_segments(location.as_str()),
+        };
+        let mut names = Vec::new();
+        if let Some(last) = segments.last() {
+            names.push(last.clone());
+        }
+        if segments.len() >= 2 {
+            names.push(segments[segments.len() - 2..].join("/"));
+        }
+        names.push(self.slug().to_owned());
+        names
+    }
+
     /// The name of this source's checkout directory: the 12-character hash alone,
     /// so no part of the slug (or of a hostile URL) reaches the file system.
     pub fn checkout_dir_name(&self) -> &str {
@@ -212,6 +232,16 @@ fn sanitise_segment(segment: &str) -> Result<String, SourceIdError> {
     } else {
         Err(SourceIdError::InvalidSegment)
     }
+}
+
+/// The sanitised directory segments of a local path, drive letters left out.
+fn local_segments(location: &str) -> Vec<String> {
+    let path = location.strip_prefix("file://").unwrap_or(location);
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && !segment.contains(':'))
+        .filter_map(|segment| sanitise_segment(segment).ok())
+        .collect()
 }
 
 /// A slug segment is non-empty, not made of dots only, and not `.git`.
@@ -487,6 +517,53 @@ mod tests {
         assert!(!id("https://github.com/o/r?token=abc123")
             .to_string()
             .contains("abc123"));
+    }
+
+    fn default_names(location: &str) -> Vec<String> {
+        let location = GitLocation::parse(location).expect(location);
+        let id = SourceId::from_location(&location).expect("a valid location");
+        id.default_names(&location)
+    }
+
+    #[test]
+    fn a_remote_is_named_by_last_segment_then_owner_and_name_then_the_slug() {
+        assert_eq!(
+            default_names("https://github.com/serde-rs/serde.git"),
+            ["serde", "serde-rs/serde", "github.com/serde-rs/serde"]
+        );
+    }
+
+    #[test]
+    fn nested_group_paths_use_their_last_two_segments_for_the_second_name() {
+        assert_eq!(
+            default_names("https://gitlab.com/g/sub/proj.git"),
+            ["proj", "sub/proj", "gitlab.com/g/sub/proj"]
+        );
+    }
+
+    #[test]
+    fn a_remote_with_one_path_segment_has_no_owner_and_name_form() {
+        assert_eq!(
+            default_names("https://example.com/proj"),
+            ["proj", "example.com/proj"]
+        );
+    }
+
+    #[test]
+    fn a_local_directory_is_named_by_parent_and_directory_then_the_slug() {
+        let slug = id("/srv/repos/proj").slug().to_owned();
+        assert_eq!(
+            default_names("/srv/repos/proj")[..2],
+            ["proj", "repos/proj"]
+        );
+        assert_eq!(default_names("/srv/repos/proj").last(), Some(&slug));
+    }
+
+    #[test]
+    fn a_windows_directory_uses_its_real_parent_not_the_drive() {
+        let names = default_names("C:\\Users\\me\\proj");
+        assert_eq!(names[..2], ["proj", "me/proj"]);
+        assert_eq!(names.len(), 3, "{names:?}");
     }
 
     #[test]

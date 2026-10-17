@@ -27,7 +27,7 @@ use crate::application::ports::{
     ChunkStore, Clock, GitClient, ReindexedChunk, SourceRepository, TreeListing,
 };
 use crate::application::progress::{Phase, Progress, Timings, NO_PROGRESS};
-use crate::application::search::{find_sources, unknown_source};
+use crate::application::search::{ambiguous_source, find_sources, unknown_source};
 use crate::domain::git_ref::GitRef;
 use crate::domain::index_versions::IndexVersions;
 use crate::domain::oid::CommitId;
@@ -53,16 +53,7 @@ pub fn resolve_source(sources: &dyn SourceRepository, key: &str) -> Result<Sourc
     match found.len() {
         0 => Err(unknown_source(sources, key)),
         1 => Ok(found.remove(0)),
-        _ => {
-            let candidates: Vec<String> = found
-                .iter()
-                .map(|source| format!("{:?} ({})", source.name(), source.id()))
-                .collect();
-            Err(AppError::Usage(Scrubbed::from(format!(
-                "{key:?} names several sources: {}; use the name or the full id",
-                candidates.join(", ")
-            ))))
-        }
+        _ => Err(ambiguous_source(key, &found)),
     }
 }
 
@@ -535,6 +526,90 @@ mod tests {
         let error = resolve_source(&store, "GITHUB.com/o/R").unwrap_err();
         assert_eq!(error.code(), ErrorCode::Usage, "{error}");
         assert!(error.to_string().contains("upper") && error.to_string().contains("lower"));
+    }
+
+    #[test]
+    fn a_unique_owner_and_name_suffix_finds_the_source() {
+        let store = InMemoryStore::new();
+        let id = index(
+            &store,
+            "https://github.com/serde-rs/serde",
+            "docs",
+            &[("a.rs", "x")],
+        );
+        assert_eq!(resolve_source(&store, "serde-rs/serde").unwrap().id(), &id);
+        assert_eq!(resolve_source(&store, "Serde-Rs/SERDE").unwrap().id(), &id);
+    }
+
+    #[test]
+    fn a_unique_last_segment_finds_the_source() {
+        let store = InMemoryStore::new();
+        let id = index(
+            &store,
+            "https://github.com/serde-rs/serde",
+            "docs",
+            &[("a.rs", "x")],
+        );
+        assert_eq!(resolve_source(&store, "serde").unwrap().id(), &id);
+    }
+
+    #[test]
+    fn a_suffix_must_start_on_a_path_segment_boundary() {
+        let store = InMemoryStore::new();
+        index(
+            &store,
+            "https://github.com/serde-rs/serde",
+            "docs",
+            &[("a.rs", "x")],
+        );
+        for key in ["rs/serde", "erde", "de-rs/serde", "github.com"] {
+            let error = resolve_source(&store, key).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::NotFound, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_suffix_is_a_usage_error_listing_the_candidates() {
+        let store = InMemoryStore::new();
+        index(
+            &store,
+            "https://github.com/a/serde",
+            "one",
+            &[("a.rs", "x")],
+        );
+        index(
+            &store,
+            "https://gitlab.com/b/serde",
+            "two",
+            &[("a.rs", "y")],
+        );
+        let error = resolve_source(&store, "serde").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Usage);
+        let shown = error.to_string();
+        assert!(shown.contains("several sources"), "{shown}");
+        assert!(shown.contains("one") && shown.contains("two"), "{shown}");
+    }
+
+    #[test]
+    fn a_name_or_exact_slug_is_preferred_to_a_suffix_match() {
+        let store = InMemoryStore::new();
+        index(
+            &store,
+            "https://github.com/a/serde",
+            "serde",
+            &[("a.rs", "x")],
+        );
+        index(
+            &store,
+            "https://gitlab.com/b/serde",
+            "other",
+            &[("a.rs", "y")],
+        );
+        assert_eq!(resolve_source(&store, "serde").unwrap().name(), "serde");
+        assert_eq!(
+            resolve_source(&store, "gitlab.com/b/serde").unwrap().name(),
+            "other"
+        );
     }
 
     #[test]

@@ -163,12 +163,14 @@ pub(crate) fn unknown_source(sources: &dyn SourceRepository, wanted: &str) -> Ap
     }
 }
 
-/// The sources a user-typed `--repo` value names: the source with that name
-/// (case-insensitive), else every source with exactly that slug or full id, else (only
-/// when nothing matched exactly) every source whose slug or id matches ignoring case.
-/// Slugs are not case-folded: `github.com/O/R` and `github.com/o/r` may be two
-/// sources, and an exact match never also returns the other. Empty when nothing
-/// matches.
+/// The sources a user-typed `--repo` value names, in this order of preference: the
+/// source with that name (case-insensitive); every source with exactly that slug or
+/// full id; every source whose slug or id matches ignoring case; and, only when none
+/// of those matched, the one source whose slug ends with `wanted` on a path-segment
+/// boundary (`serde` or `serde-rs/serde` for `github.com/serde-rs/serde`). Slugs are
+/// not case-folded in the first two steps: `github.com/O/R` and `github.com/o/r` may be
+/// two sources, and an exact match never also returns the other. More than one suffix
+/// match is a usage error listing them. Empty when nothing matches.
 pub(crate) fn find_sources(
     sources: &dyn SourceRepository,
     wanted: &str,
@@ -186,13 +188,38 @@ pub(crate) fn find_sources(
         return Ok(exact);
     }
     let folded = wanted.to_lowercase();
-    Ok(all
-        .into_iter()
+    let ignoring_case: Vec<Source> = all
+        .iter()
         .filter(|source| {
             source.id().slug().to_lowercase() == folded
                 || source.id().as_str().to_lowercase() == folded
         })
-        .collect())
+        .cloned()
+        .collect();
+    if !ignoring_case.is_empty() {
+        return Ok(ignoring_case);
+    }
+    let boundary = format!("/{folded}");
+    let suffixed: Vec<Source> = all
+        .into_iter()
+        .filter(|source| source.id().slug().to_lowercase().ends_with(&boundary))
+        .collect();
+    if suffixed.len() > 1 {
+        return Err(ambiguous_source(wanted, &suffixed));
+    }
+    Ok(suffixed)
+}
+
+/// The usage error for a key that names several sources, listing the candidates.
+pub(crate) fn ambiguous_source(wanted: &str, found: &[Source]) -> AppError {
+    let candidates: Vec<String> = found
+        .iter()
+        .map(|source| format!("{:?} ({})", source.name(), source.id()))
+        .collect();
+    AppError::Usage(Scrubbed::from(format!(
+        "{wanted:?} names several sources: {}; use the name or the full id",
+        candidates.join(", ")
+    )))
 }
 
 /// The effective paging and budget of a request, and the time it ran.

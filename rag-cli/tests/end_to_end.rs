@@ -106,6 +106,20 @@ impl Upstream {
         upstream
     }
 
+    /// A repository with one commit in `<temp>/<owner>/<name>`, so that two of them can
+    /// share a last path segment. Its file mentions `owner`, so a search can tell them
+    /// apart.
+    fn owned_by(owner: &str, name: &str) -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join(owner).join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        git(&path, &["init", "-q", "-b", "main"]);
+        let upstream = Self { _temp: temp, path };
+        upstream.write("src/config.rs", &format!("pub fn {owner}_config() {{}}\n"));
+        upstream.commit("first");
+        upstream
+    }
+
     fn write(&self, name: &str, content: &str) {
         let file = self.path.join(name);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -916,6 +930,78 @@ fn update_all_with_one_failing_source_updates_the_others_and_exits_with_its_code
     assert!(
         broken["commit"].is_string(),
         "the old index is still served"
+    );
+}
+
+#[test]
+fn a_taken_last_segment_gives_the_second_repository_its_owner_as_well() {
+    let rag = Rag::new();
+    let first = rag.add(&Upstream::owned_by("alice", "serde"));
+    let second = rag.add(&Upstream::owned_by("bob", "serde"));
+    assert_eq!(first["name"], "serde");
+    assert_eq!(second["name"], "bob/serde");
+    assert_ne!(first["repo"], second["repo"]);
+}
+
+#[test]
+fn repo_accepts_the_short_name_and_the_owner_and_name_of_a_source() {
+    let rag = Rag::new();
+    let alice = rag.add(&Upstream::owned_by("alice", "serde"));
+    let bob = rag.add(&Upstream::owned_by("bob", "serde"));
+    for (query, repo, source) in [("alice", "serde", &alice), ("bob", "bob/serde", &bob)] {
+        let found = rag.json(&["search", query, "--repo", repo], 0);
+        let results = found["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "rag search --repo {repo}: {found}");
+        assert!(
+            results
+                .iter()
+                .all(|result| result["repo"] == source["repo"]),
+            "rag search --repo {repo}: {found}"
+        );
+    }
+}
+
+/// Registers `url` with `rag add` at a port nothing listens on. The add fails, but the
+/// source stays registered as failed, which is all that name resolution needs, and
+/// nothing touches the network.
+fn register_unreachable(rag: &Rag, url: &str, name: Option<&str>) {
+    let mut args = vec!["add", url];
+    if let Some(name) = name {
+        args.extend(["--name", name]);
+    }
+    let output = rag.run(&args);
+    assert_ne!(output.status.code(), Some(0), "rag {args:?} should fail");
+}
+
+#[test]
+fn a_unique_owner_and_name_suffix_resolves_a_remote_source() {
+    let rag = Rag::new();
+    register_unreachable(&rag, "https://127.0.0.1:1/serde-rs/serde", None);
+    let removed = rag.json(&["remove", "serde-rs/serde"], 0);
+    assert_eq!(removed["repo"], "127.0.0.1/serde-rs/serde");
+    assert_eq!(removed["name"], "serde");
+}
+
+#[test]
+fn a_unique_last_segment_resolves_a_remote_source() {
+    let rag = Rag::new();
+    register_unreachable(&rag, "https://127.0.0.1:1/serde-rs/serde", None);
+    let removed = rag.json(&["remove", "serde"], 0);
+    assert_eq!(removed["repo"], "127.0.0.1/serde-rs/serde");
+}
+
+#[test]
+fn an_ambiguous_suffix_is_a_usage_error_naming_both_sources() {
+    let rag = Rag::new();
+    register_unreachable(&rag, "https://127.0.0.1:1/alice/serde", Some("one"));
+    register_unreachable(&rag, "https://127.0.0.1:1/bob/serde", Some("two"));
+    let error = rag.json(&["remove", "serde"], 2);
+    assert_eq!(error["error"]["code"], "usage");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("several sources"), "{message}");
+    assert!(
+        message.contains("\"one\"") && message.contains("\"two\""),
+        "{message}"
     );
 }
 

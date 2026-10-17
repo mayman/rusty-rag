@@ -253,7 +253,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::to_string(&response).unwrap(),
-            r#"{"schema_version":1,"repo":"example.com/o/r","name":"example.com/o/r","checkout_removed":true}"#
+            r#"{"schema_version":1,"repo":"example.com/o/r","name":"r","checkout_removed":true}"#
         );
     }
 }

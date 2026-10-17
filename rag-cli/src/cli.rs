@@ -25,7 +25,8 @@ pub enum Command {
     Add {
         /// A git URL or a local repository path.
         target: String,
-        /// Name for the source (default: host/owner/name).
+        /// Name for the source (default: the last path segment; if taken, owner/name;
+        /// if that is taken too, host/owner/name).
         #[arg(long)]
         name: Option<String>,
     },
@@ -199,6 +200,19 @@ mod tests {
     #[test]
     fn the_hidden_json_flag_is_gone_because_json_is_the_default() {
         assert!(parse(&["list", "--json"]).is_err());
+    }
+
+    #[test]
+    fn add_help_says_how_the_default_name_is_chosen() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("add")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("last path segment"), "{help}");
+        assert!(help.contains("owner/name"), "{help}");
     }
 
     #[test]
