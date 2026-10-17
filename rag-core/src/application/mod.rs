@@ -11,6 +11,7 @@ pub mod remove_source;
 pub mod retrieval;
 pub mod search;
 pub mod show_file;
+pub mod snippet;
 pub mod update_source;
 
 #[cfg(any(test, feature = "testkit"))]
