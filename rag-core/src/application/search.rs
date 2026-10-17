@@ -6,14 +6,17 @@
 //! output character budget (`SearchRequest::max_chars`) on the encoded JSON, because
 //! only it encodes; it drops whole results from the end and sets `truncated`.
 
+use std::collections::BTreeMap;
+
 use crate::application::dto::{
-    show_chunk_command, SearchRequest, SearchResponse, SearchResultDto, SCHEMA_VERSION,
+    SearchRequest, SearchResponse, SearchResultDto, SourceInfoDto, SCHEMA_VERSION,
     UNTRUSTED_CONTENT,
 };
 use crate::application::error::{AppError, Scrubbed, StorageError};
-use crate::application::ports::{ChunkSearcher, SourceRepository, TOTAL_MATCHES_CAP};
+use crate::application::ports::{ChunkSearcher, Clock, SourceRepository, TOTAL_MATCHES_CAP};
 use crate::application::retrieval::{retrieve, Retrieval};
 use crate::application::snippet;
+use crate::domain::indexed_at::IndexedAt;
 use crate::domain::language::Language;
 use crate::domain::path_glob::{InvalidGlob, PathGlob};
 use crate::domain::query::{Query, QueryMode};
@@ -29,7 +32,7 @@ pub const MAX_K: usize = 50;
 pub const MAX_OFFSET: usize = TOTAL_MATCHES_CAP;
 
 /// Hint when no chunk matched at all.
-pub const NO_MATCH_HINT: &str = "no chunk matched the query; try fewer or different words, or check the --repo, --lang and --path filters";
+pub const NO_MATCH_HINT: &str = "no chunk matched the query (tried all of the words, then any of them); try different words, or check the --repo, --lang and --path filters";
 /// Hint when the page is past the last hit.
 pub const PAST_END_HINT: &str = "the offset is past the last hit; use a smaller --offset";
 /// Hint when nothing matched and `notices` explains that some sources cannot be
@@ -42,11 +45,20 @@ pub const PARTIAL_HINT: &str = "no chunk matched every word; these hits match so
 pub struct Search<'a> {
     sources: &'a dyn SourceRepository,
     searcher: &'a dyn ChunkSearcher,
+    clock: &'a dyn Clock,
 }
 
 impl<'a> Search<'a> {
-    pub fn new(sources: &'a dyn SourceRepository, searcher: &'a dyn ChunkSearcher) -> Self {
-        Self { sources, searcher }
+    pub fn new(
+        sources: &'a dyn SourceRepository,
+        searcher: &'a dyn ChunkSearcher,
+        clock: &'a dyn Clock,
+    ) -> Self {
+        Self {
+            sources,
+            searcher,
+            clock,
+        }
     }
 
     pub fn execute(&self, request: &SearchRequest) -> Result<SearchResponse, AppError> {
@@ -64,7 +76,13 @@ impl<'a> Search<'a> {
         let offset = request.offset.min(MAX_OFFSET);
         let retrieval = retrieve(self.searcher, &query, &filters, offset, k)?;
         let notices = notices(&registered, &filters.sources);
-        build_response(&query, &retrieval, offset, notices)
+        let page = Page {
+            k,
+            offset,
+            max_chars: request.max_chars,
+            now: self.clock.now(),
+        };
+        build_response(&query, &retrieval, &registered, &page, notices)
     }
 
     fn filters(&self, request: &SearchRequest) -> Result<SearchFilters, AppError> {
@@ -147,14 +165,28 @@ pub(crate) fn find_sources(
         .collect())
 }
 
+/// The effective paging and budget of a request, and the time it ran.
+struct Page {
+    k: usize,
+    offset: usize,
+    max_chars: usize,
+    now: IndexedAt,
+}
+
+/// The `mode` of a response with no matching chunk at all: neither `and` nor
+/// `or_fallback` found anything.
+const MODE_NONE: &str = "none";
+
 /// The schema v1 response for one page. `rank` is the position in the whole result
 /// list (`offset` + position in the page), so ranks continue across pages.
 fn build_response(
     query: &Query,
     retrieval: &Retrieval,
-    offset: usize,
+    registered: &[Source],
+    page: &Page,
     notices: Vec<String>,
 ) -> Result<SearchResponse, AppError> {
+    let offset = page.offset;
     let best = retrieval
         .hits
         .iter()
@@ -164,19 +196,29 @@ fn build_response(
         .hits
         .iter()
         .enumerate()
-        .map(|(position, hit)| result(query, retrieval, hit, offset + position + 1, best))
+        .map(|(position, hit)| result(query, hit, offset + position + 1, best))
         .collect::<Result<Vec<_>, _>>()?;
+    let mode = if retrieval.total_matches == 0 {
+        MODE_NONE
+    } else {
+        retrieval.mode.as_str()
+    };
     Ok(SearchResponse {
         schema_version: SCHEMA_VERSION,
         content: UNTRUSTED_CONTENT,
         query: query.text().to_owned(),
-        mode: retrieval.mode.as_str().to_owned(),
-        total_hits: retrieval.total_matches,
+        mode: mode.to_owned(),
+        k: page.k,
+        max_chars: page.max_chars,
+        total_matches: retrieval.total_matches,
         total_is_exact: retrieval.total_is_exact,
         returned: results.len(),
         offset,
+        next_offset: retrieval.has_more.then_some(offset + results.len()),
         has_more: retrieval.has_more,
         truncated: false,
+        budget_cut: false,
+        sources: sources_of(retrieval, registered, page.now)?,
         hint: hint(retrieval, results.len(), !notices.is_empty()),
         results,
         notices,
@@ -185,28 +227,21 @@ fn build_response(
 
 fn result(
     query: &Query,
-    retrieval: &Retrieval,
     hit: &ScoredChunk,
     rank: usize,
     best: f64,
 ) -> Result<SearchResultDto, AppError> {
     let chunk = &hit.chunk;
-    let revision = retrieval.revisions.get(&chunk.source).ok_or_else(|| {
-        AppError::Storage(StorageError::Failed(Scrubbed::from(
-            "a hit's source has no indexed revision",
-        )))
-    })?;
     let snippet = snippet::build(&chunk.text, chunk.lines.start(), query);
     Ok(SearchResultDto {
-        id: chunk.id.as_str().to_owned(),
+        chunk: chunk.id.as_str().to_owned(),
         rank,
         score: hit.score,
         score_rel: relative_score(hit.score, best),
         repo: chunk.source.slug().to_owned(),
-        commit: revision.commit.short().to_owned(),
-        indexed_at: revision.at.to_rfc3339(),
         path: chunk.path.as_str().to_owned(),
-        lines: [snippet.first_line, snippet.last_line],
+        snippet_lines: [snippet.first_line, snippet.last_line],
+        chunk_lines: [chunk.lines.start(), chunk.lines.end()],
         language: chunk.language.name().to_owned(),
         heading: chunk.heading().map(|heading| sanitize_untrusted(&heading)),
         matched_terms: snippet
@@ -215,8 +250,48 @@ fn result(
             .map(|term| sanitize_untrusted(term))
             .collect(),
         snippet: sanitize_untrusted(&snippet.text),
-        show: show_chunk_command(&chunk.id),
     })
+}
+
+/// The sources behind `results`, once each, keyed by slug.
+fn sources_of(
+    retrieval: &Retrieval,
+    registered: &[Source],
+    now: IndexedAt,
+) -> Result<BTreeMap<String, SourceInfoDto>, AppError> {
+    let missing = || {
+        AppError::Storage(StorageError::Failed(Scrubbed::from(
+            "a hit's source has no indexed revision",
+        )))
+    };
+    let mut sources = BTreeMap::new();
+    for hit in &retrieval.hits {
+        let slug = hit.chunk.source.slug();
+        if sources.contains_key(slug) {
+            continue;
+        }
+        let revision = retrieval
+            .revisions
+            .get(&hit.chunk.source)
+            .ok_or_else(missing)?;
+        let name = registered
+            .iter()
+            .find(|source| source.id() == &hit.chunk.source)
+            .map_or_else(
+                || slug.to_owned(),
+                |source| sanitize_untrusted(source.name()),
+            );
+        sources.insert(
+            slug.to_owned(),
+            SourceInfoDto {
+                name,
+                commit: revision.commit.short().to_owned(),
+                indexed_at: revision.at.to_rfc3339(),
+                age_seconds: revision.at.age_seconds(now),
+            },
+        );
+    }
+    Ok(sources)
 }
 
 /// The score as a share of the best score of the response, to three decimals.
@@ -338,9 +413,10 @@ mod tests {
     use crate::application::dto::{ErrorResponse, SearchRequest, SearchResponse};
     use crate::application::error::{AppError, ErrorCode};
     use crate::application::ports::SourceRepository;
-    use crate::application::testkit::{InMemoryStore, StampStoredVersions};
+    use crate::application::testkit::{FixedClock, InMemoryStore, StampStoredVersions};
     use crate::domain::git_location::GitLocation;
     use crate::domain::index_versions::IndexVersions;
+    use crate::domain::indexed_at::IndexedAt;
     use crate::domain::source::Source;
     use crate::domain::source_id::SourceId;
 
@@ -366,7 +442,10 @@ mod tests {
     }
 
     fn run(store: &InMemoryStore, request: &SearchRequest) -> Result<SearchResponse, AppError> {
-        Search::new(store, store).execute(request)
+        let clock = FixedClock::new(IndexedAt::from_epoch_seconds(
+            super::fixtures::INDEXED_AT + 90,
+        ));
+        Search::new(store, store, &clock).execute(request)
     }
 
     fn ok(store: &InMemoryStore, request: &SearchRequest) -> SearchResponse {
@@ -402,16 +481,54 @@ mod tests {
             .find(|r| r.path == "src/parse.rs")
             .expect("the rust file matches");
         assert!(hit.rank >= 1);
-        assert_eq!(hit.id.len(), 64);
+        assert_eq!(hit.chunk.len(), 64);
         assert_eq!(hit.repo, "github.com/o/r");
-        assert_eq!(hit.commit, &COMMIT[..7]);
-        assert_eq!(hit.indexed_at, "2023-11-14T22:13:20Z");
-        assert_eq!(hit.lines, [1, 3]);
+        assert_eq!(hit.snippet_lines, [1, 3]);
+        assert_eq!(hit.chunk_lines, [1, 3]);
         assert_eq!(hit.language, "rust");
         assert_eq!(hit.heading, None);
         assert_eq!(hit.matched_terms, ["parse_config".replace('_', "")]);
         assert_eq!(hit.snippet, PARSE_RS.trim_end_matches('\n'));
-        assert_eq!(hit.show, format!("rag show --chunk {}", hit.id));
+    }
+
+    #[test]
+    fn per_source_data_is_stated_once_in_the_sources_object_keyed_by_slug() {
+        let response = ok(&store(), &SearchRequest::new("parse config"));
+        let [(slug, info)] = response.sources.iter().collect::<Vec<_>>()[..] else {
+            panic!("one source: {:?}", response.sources)
+        };
+        assert_eq!(slug, "github.com/o/r");
+        assert_eq!(info.name, "Docs");
+        assert_eq!(info.commit, &COMMIT[..7]);
+        assert_eq!(info.indexed_at, "2023-11-14T22:13:20Z");
+        assert_eq!(info.age_seconds, 90);
+        assert!(response.results.iter().all(|r| r.repo == *slug));
+    }
+
+    #[test]
+    fn the_effective_k_and_max_chars_are_echoed() {
+        let mut request = SearchRequest::new("parse config");
+        request.k = 100_000;
+        request.max_chars = 1234;
+        let response = ok(&store(), &request);
+        assert_eq!((response.k, response.max_chars), (MAX_K, 1234));
+        request.k = 0;
+        assert_eq!(ok(&store(), &request).k, 1, "k is at least 1");
+    }
+
+    #[test]
+    fn next_offset_continues_after_the_page_and_is_null_on_the_last_one() {
+        let store = store();
+        let mut request = SearchRequest::new("parse config");
+        request.k = 1;
+        let first = ok(&store, &request);
+        assert!(first.has_more);
+        assert_eq!(first.next_offset, Some(1));
+        assert!(!first.budget_cut, "the use case never cuts the budget");
+        request.offset = 1;
+        let last = ok(&store, &request);
+        assert!(!last.has_more);
+        assert_eq!(last.next_offset, None);
     }
 
     #[test]
@@ -438,7 +555,7 @@ mod tests {
         let second = ok(&store, &request);
         assert_eq!(second.offset, 1);
         assert_eq!(second.results[0].rank, 2);
-        assert_ne!(first.results[0].id, second.results[0].id);
+        assert_ne!(first.results[0].chunk, second.results[0].chunk);
     }
 
     #[test]
@@ -477,14 +594,34 @@ mod tests {
         let response = ok(&store(), &request);
         assert!(response.results.is_empty());
         assert_eq!(response.hint.as_deref(), Some(PAST_END_HINT));
-        assert!(response.total_hits > 0);
+        assert!(response.total_matches > 0);
+        assert_eq!(response.mode, "and", "it matched; the page is past the end");
     }
 
     #[test]
     fn no_match_gets_the_no_match_hint() {
         let response = ok(&store(), &SearchRequest::new("zzzunknownzzz"));
-        assert_eq!(response.total_hits, 0);
+        assert_eq!(response.total_matches, 0);
         assert_eq!(response.hint.as_deref(), Some(NO_MATCH_HINT));
+    }
+
+    #[test]
+    fn zero_results_report_mode_none_never_or_fallback() {
+        for query in ["zzzunknownzzz", "zzzunknownzzz qqqmissingqqq"] {
+            let response = ok(&store(), &SearchRequest::new(query));
+            assert_eq!(response.returned, 0);
+            assert_eq!(response.mode, "none", "{query}");
+            assert!(response.sources.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_no_match_hint_says_both_and_and_or_were_tried() {
+        assert!(
+            NO_MATCH_HINT.contains("all of the words"),
+            "{NO_MATCH_HINT}"
+        );
+        assert!(NO_MATCH_HINT.contains("any of them"), "{NO_MATCH_HINT}");
     }
 
     #[test]
@@ -584,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn total_hits_counts_chunks_before_the_per_file_cap() {
+    fn total_matches_counts_chunks_before_the_per_file_cap() {
         let store = InMemoryStore::new();
         let big: String = (0..300).map(|i| format!("fn alpha_{i}() {{}}\n")).collect();
         index(
@@ -594,7 +731,7 @@ mod tests {
             &[("a.rs", &big), ("b.rs", "fn alpha() {}")],
         );
         let response = ok(&store, &SearchRequest::new("alpha"));
-        assert!(response.total_hits >= response.returned);
+        assert!(response.total_matches >= response.returned);
         let from_a = response.results.iter().filter(|r| r.path == "a.rs").count();
         assert!(from_a <= 2, "at most two hits per file");
     }

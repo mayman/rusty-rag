@@ -33,7 +33,7 @@ pub fn render_search_human(response: &SearchResponse) -> String {
         "query \"{}\": {} of {at_least}{} matches (mode {})\n",
         cell(&response.query),
         response.returned,
-        response.total_hits,
+        response.total_matches,
         response.mode
     );
     for result in &response.results {
@@ -42,8 +42,8 @@ pub fn render_search_human(response: &SearchResponse) -> String {
             result.rank,
             cell(&result.repo),
             cell(&result.path),
-            result.lines[0],
-            result.lines[1],
+            result.snippet_lines[0],
+            result.snippet_lines[1],
             result.score_rel
         );
         if let Some(heading) = &result.heading {
@@ -52,13 +52,10 @@ pub fn render_search_human(response: &SearchResponse) -> String {
         for line in result.snippet.split('\n') {
             out += &format!("{INDENT}{}\n", terminal_safe(line));
         }
-        out += &format!("{INDENT}show: {}\n", cell(&result.show));
+        out += &format!("{INDENT}show: rag show --chunk {}\n", cell(&result.chunk));
     }
-    if response.has_more {
-        out += &format!(
-            "next page: --offset {}\n",
-            response.offset + response.returned
-        );
+    if let Some(next) = response.next_offset {
+        out += &format!("next page: --offset {next}\n");
     }
     if response.truncated {
         out += "output cut to the size budget: narrow the query or raise --max-chars\n";
@@ -219,13 +216,10 @@ mod tests {
     #[test]
     fn an_empty_search_says_so_and_gives_the_hint() {
         let mut empty = response("alpha beta", vec![]);
-        empty.mode = "or_fallback".to_owned();
         empty.hint = Some(NO_MATCH_HINT.to_owned());
         assert_eq!(
             render_search_human(&empty),
-            format!(
-                "query \"alpha beta\": 0 of 0 matches (mode or_fallback)\nhint: {NO_MATCH_HINT}\n"
-            )
+            format!("query \"alpha beta\": 0 of 0 matches (mode none)\nhint: {NO_MATCH_HINT}\n")
         );
     }
 
@@ -234,6 +228,7 @@ mod tests {
         let mut page = response("alpha", vec![result(5, "a.rs", 1, "alpha", 1.0, 1.0)]);
         page.offset = 4;
         page.has_more = true;
+        page.next_offset = Some(5);
         let text = render_search_human(&page);
         assert!(text.contains("next page: --offset 5\n"), "{text}");
     }
@@ -241,7 +236,7 @@ mod tests {
     #[test]
     fn an_inexact_total_is_shown_as_a_lower_bound() {
         let mut page = response("alpha", vec![result(1, "a.rs", 1, "alpha", 1.0, 1.0)]);
-        page.total_hits = 1000;
+        page.total_matches = 1000;
         page.total_is_exact = false;
         let text = render_search_human(&page);
         assert!(text.contains("1 of at least 1000 matches"), "{text}");

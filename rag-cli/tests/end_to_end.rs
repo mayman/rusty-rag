@@ -222,8 +222,22 @@ fn a_local_repository_goes_from_add_to_remove() {
     let top = &found["results"][0];
     assert_eq!(top["rank"], 1);
     assert!(top["snippet"].as_str().unwrap().contains("parse_config"));
-    let chunk_id = top["id"].as_str().unwrap().to_owned();
-    assert_eq!(top["show"], format!("rag show --chunk {chunk_id}").as_str());
+    let chunk_id = top["chunk"].as_str().unwrap().to_owned();
+    assert!(top.get("show").is_none() && top.get("id").is_none());
+    assert!(top.get("commit").is_none() && top.get("indexed_at").is_none());
+    assert!(top["snippet_lines"].is_array() && top["chunk_lines"].is_array());
+    assert_eq!(found["mode"], "and");
+    assert_eq!(
+        (found["k"].as_u64(), found["max_chars"].as_u64()),
+        (Some(5), Some(8000))
+    );
+    assert!(found["total_matches"].as_u64().unwrap() >= 1);
+    assert!(found["next_offset"].is_null());
+    assert_eq!(found["budget_cut"], false);
+    let info = &found["sources"][top["repo"].as_str().unwrap()];
+    assert_eq!(info["name"], name.as_str());
+    assert_eq!(info["commit"].as_str().unwrap().len(), 7);
+    assert!(info["age_seconds"].is_u64() && info["indexed_at"].is_string());
 
     // show --chunk
     let chunk = rag.json(&["show", "--chunk", &chunk_id], 0);
@@ -466,7 +480,7 @@ fn human_output_is_plain_text_without_ansi() {
     outputs.push(("update", rag.run(&["update", "--human"])));
     outputs.push(("reindex", rag.run(&["reindex", "--human"])));
     let listed = rag.json(&["search", "parseConfig"], 0);
-    let chunk_id = listed["results"][0]["id"].as_str().unwrap().to_owned();
+    let chunk_id = listed["results"][0]["chunk"].as_str().unwrap().to_owned();
     outputs.push(("show", rag.run(&["show", "--chunk", &chunk_id, "--human"])));
 
     for (name, output) in &outputs {
@@ -655,7 +669,10 @@ fn hostile_file_content_cannot_reach_the_terminal_through_json_or_human_output()
         "no escaped ESC either"
     );
 
-    let chunk = found_json["results"][0]["id"].as_str().unwrap().to_owned();
+    let chunk = found_json["results"][0]["chunk"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let shown = rag.json(&["show", "--chunk", &chunk], 0);
     assert_eq!(shown["content"], "untrusted");
     let mut strings = Vec::new();

@@ -3,10 +3,11 @@
 //! the schema. Domain types never derive `Serialize`: these structs are the
 //! mapping target.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::application::error::{AppError, ErrorCode};
-use crate::domain::chunk_id::ChunkId;
 use crate::domain::indexed_at::IndexedAt;
 use crate::domain::source::Source;
 
@@ -56,24 +57,34 @@ impl SearchRequest {
 /// One hit in a search response.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchResultDto {
-    pub id: String,
+    /// The chunk id (64 hex characters); `rag show --chunk <chunk>` shows the whole
+    /// chunk. Hex only, so it is safe to paste into any shell.
+    pub chunk: String,
     pub rank: usize,
     pub score: f64,
     pub score_rel: f64,
-    /// The source slug, `host/owner/name`.
+    /// The source slug, `host/owner/name`; the key into `SearchResponse::sources`.
     pub repo: String,
-    pub commit: String,
-    pub indexed_at: String,
     pub path: String,
     /// First and last line of the snippet, 1-based.
-    pub lines: [usize; 2],
+    pub snippet_lines: [usize; 2],
+    /// First and last line of the whole chunk, 1-based.
+    pub chunk_lines: [usize; 2],
     pub language: String,
     pub heading: Option<String>,
     pub matched_terms: Vec<String>,
     pub snippet: String,
-    /// The command that shows this chunk: `rag show --chunk <chunk_id>` (see
-    /// `show_chunk_command`).
-    pub show: String,
+}
+
+/// What a search response says once about a source that has hits in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceInfoDto {
+    /// The unique name of the source (what `--repo` and `rag update` accept).
+    pub name: String,
+    /// The short indexed commit.
+    pub commit: String,
+    pub indexed_at: String,
+    pub age_seconds: u64,
 }
 
 /// Output of the search use case (schema v1).
@@ -83,23 +94,36 @@ pub struct SearchResponse {
     /// Always `untrusted` (`UNTRUSTED_CONTENT`): the hits quote repository content.
     pub content: &'static str,
     pub query: String,
-    /// `and` or `or_fallback`.
+    /// `and`, `or_fallback`, or `none` when no chunk matched at all.
     pub mode: String,
-    /// Chunks that matched the query before the per-file cap and before paging
+    /// The effective number of hits wanted (`-k`, clamped).
+    pub k: usize,
+    /// The output character budget the response was fitted to (`--max-chars`).
+    pub max_chars: usize,
+    /// Matching chunks before the per-file cap and before paging
     /// (`Retrieval::total_matches`). Counted up to 1000: when `total_is_exact` is
     /// false this is "at least that many", not the exact number.
-    pub total_hits: usize,
-    /// Whether `total_hits` is exact (`Retrieval::total_is_exact`).
+    pub total_matches: usize,
+    /// Whether `total_matches` is exact (`Retrieval::total_is_exact`).
     pub total_is_exact: bool,
     /// Number of entries in `results`.
     pub returned: usize,
     /// The requested offset: hits skipped after the per-file cap.
     pub offset: usize,
-    /// Whether more hits follow this page (`Retrieval::has_more`); also true when
-    /// the output budget cut hits that were part of the page.
+    /// The `--offset` that continues after this page; null when no more results
+    /// exist. When the output budget cut results it points at the first one cut.
+    pub next_offset: Option<usize>,
+    /// Whether more results exist after the ones returned (`Retrieval::has_more`),
+    /// also true when the output budget removed results of the page.
     pub has_more: bool,
-    /// The output character budget dropped hits or shortened snippets.
+    /// The output was cut to fit `max_chars` (results removed or the query
+    /// shortened).
     pub truncated: bool,
+    /// The output budget removed whole results from the page (`truncated` without
+    /// this means only the echoed query was shortened).
+    pub budget_cut: bool,
+    /// The sources behind `results`, keyed by slug.
+    pub sources: BTreeMap<String, SourceInfoDto>,
     pub results: Vec<SearchResultDto>,
     /// Facts the caller should know about the sources behind this search: registered
     /// sources that cannot be searched yet, and sources whose last update failed
@@ -109,12 +133,6 @@ pub struct SearchResponse {
     /// Present when results are empty or weak.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-}
-
-/// `rag show --chunk <chunk_id>`, for the `show` field of a hit. The id is hex
-/// only, so the command is safe to paste into any shell.
-pub fn show_chunk_command(chunk: &ChunkId) -> String {
-    format!("rag show --chunk {}", chunk.as_str())
 }
 
 /// One registered source in `rag list`. Clones have no working tree, so there is no
@@ -244,56 +262,79 @@ impl From<ErrorCode> for ErrorBody {
 mod tests {
     use super::*;
     use crate::application::error::{AppError, StorageError};
-    use crate::domain::chunk_id::ChunkId;
     use crate::domain::git_location::GitLocation;
     use crate::domain::oid::CommitId;
     use crate::domain::source_id::SourceId;
+    use std::collections::BTreeMap;
 
     const CHUNK_HEX: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     fn result_dto() -> SearchResultDto {
         SearchResultDto {
-            id: CHUNK_HEX.into(),
+            chunk: CHUNK_HEX.into(),
             rank: 1,
             score: 2.5,
             score_rel: 1.0,
             repo: "github.com/o/r".into(),
-            commit: "abc1234".into(),
-            indexed_at: "2023-11-14T22:13:20Z".into(),
             path: "src/x.rs".into(),
-            lines: [10, 22],
+            snippet_lines: [10, 22],
+            chunk_lines: [8, 40],
             language: "rust".into(),
             heading: None,
             matched_terms: vec!["parse".into()],
             snippet: "fn parse()".into(),
-            show: format!("rag show --chunk {CHUNK_HEX}"),
+        }
+    }
+
+    fn source_info() -> SourceInfoDto {
+        SourceInfoDto {
+            name: "r".into(),
+            commit: "abc1234".into(),
+            indexed_at: "2023-11-14T22:13:20Z".into(),
+            age_seconds: 90,
+        }
+    }
+
+    fn page(query: &str) -> SearchResponse {
+        SearchResponse {
+            schema_version: SCHEMA_VERSION,
+            content: UNTRUSTED_CONTENT,
+            query: query.into(),
+            mode: "and".into(),
+            k: 5,
+            max_chars: 8000,
+            total_matches: 0,
+            total_is_exact: true,
+            returned: 0,
+            offset: 0,
+            next_offset: None,
+            has_more: false,
+            truncated: false,
+            budget_cut: false,
+            sources: BTreeMap::new(),
+            results: vec![],
+            notices: Vec::new(),
+            hint: None,
         }
     }
 
     #[test]
     fn search_response_serializes_in_schema_v1_order() {
-        let response = SearchResponse {
-            schema_version: SCHEMA_VERSION,
-            content: UNTRUSTED_CONTENT,
-            query: "parse".into(),
-            mode: "and".into(),
-            total_hits: 1,
-            total_is_exact: true,
-            returned: 1,
-            offset: 0,
-            has_more: false,
-            truncated: false,
-            results: vec![result_dto()],
-            notices: Vec::new(),
-            hint: None,
-        };
+        let mut response = page("parse");
+        response.total_matches = 1;
+        response.returned = 1;
+        response.results = vec![result_dto()];
+        response
+            .sources
+            .insert("github.com/o/r".into(), source_info());
         let expected = concat!(
-            r#"{"schema_version":1,"content":"untrusted","query":"parse","mode":"and","total_hits":1,"total_is_exact":true,"#,
-            r#""returned":1,"offset":0,"has_more":false,"truncated":false,"results":["#,
-            r#"{"id":"<ID>","rank":1,"score":2.5,"score_rel":1.0,"repo":"github.com/o/r","#,
-            r#""commit":"abc1234","indexed_at":"2023-11-14T22:13:20Z","path":"src/x.rs","#,
-            r#""lines":[10,22],"language":"rust","heading":null,"matched_terms":["parse"],"#,
-            r#""snippet":"fn parse()","show":"rag show --chunk <ID>"}]}"#
+            r#"{"schema_version":1,"content":"untrusted","query":"parse","mode":"and","k":5,"max_chars":8000,"#,
+            r#""total_matches":1,"total_is_exact":true,"returned":1,"offset":0,"next_offset":null,"#,
+            r#""has_more":false,"truncated":false,"budget_cut":false,"#,
+            r#""sources":{"github.com/o/r":{"name":"r","commit":"abc1234","indexed_at":"2023-11-14T22:13:20Z","age_seconds":90}},"#,
+            r#""results":[{"chunk":"<ID>","rank":1,"score":2.5,"score_rel":1.0,"repo":"github.com/o/r","#,
+            r#""path":"src/x.rs","snippet_lines":[10,22],"chunk_lines":[8,40],"language":"rust","#,
+            r#""heading":null,"matched_terms":["parse"],"snippet":"fn parse()"}]}"#
         )
         .replace("<ID>", CHUNK_HEX);
         assert_eq!(serde_json::to_string(&response).unwrap(), expected);
@@ -301,21 +342,9 @@ mod tests {
 
     #[test]
     fn notices_are_serialized_before_the_hint_and_only_when_present() {
-        let mut response = SearchResponse {
-            schema_version: SCHEMA_VERSION,
-            content: UNTRUSTED_CONTENT,
-            query: "zzz".into(),
-            mode: "and".into(),
-            total_hits: 0,
-            total_is_exact: true,
-            returned: 0,
-            offset: 0,
-            has_more: false,
-            truncated: false,
-            results: vec![],
-            notices: vec!["source x is not searchable yet".into()],
-            hint: Some("read the remarks first".into()),
-        };
+        let mut response = page("zzz");
+        response.notices = vec!["source x is not searchable yet".into()];
+        response.hint = Some("read the remarks first".into());
         let json = serde_json::to_string(&response).unwrap();
         assert!(
             json.ends_with(
@@ -328,7 +357,6 @@ mod tests {
             .unwrap()
             .contains("notices"));
     }
-
     #[test]
     fn search_and_show_responses_mark_their_content_as_untrusted() {
         assert_eq!(UNTRUSTED_CONTENT, "untrusted");
@@ -361,42 +389,34 @@ mod tests {
     }
 
     #[test]
-    fn show_command_names_the_chunk_by_its_hex_id() {
-        let id = ChunkId::parse(CHUNK_HEX).unwrap();
-        assert_eq!(
-            show_chunk_command(&id),
-            format!("rag show --chunk {CHUNK_HEX}")
-        );
+    fn a_hit_has_no_per_hit_show_command_or_per_hit_commit() {
+        let json = serde_json::to_string(&result_dto()).unwrap();
+        for gone in [r#""show""#, r#""commit""#, r#""indexed_at""#, r#""id""#] {
+            assert!(!json.contains(gone), "{gone} in {json}");
+        }
         assert!(
             CHUNK_HEX.bytes().all(|b| b.is_ascii_hexdigit()),
-            "hex only, so the command is shell-safe"
+            "the chunk id is hex only, so `rag show --chunk <chunk>` is shell-safe"
         );
     }
 
     #[test]
     fn pagination_fields_are_the_values_retrieval_derives() {
-        // total_hits = Retrieval::total_matches (matching chunks before the per-file
-        // cap, at least when not exact), total_is_exact = Retrieval::total_is_exact,
-        // has_more = Retrieval::has_more, offset = the requested offset.
-        let response = SearchResponse {
-            schema_version: SCHEMA_VERSION,
-            content: UNTRUSTED_CONTENT,
-            query: "parse".into(),
-            mode: "and".into(),
-            total_hits: 42,
-            total_is_exact: false,
-            returned: 5,
-            offset: 10,
-            has_more: true,
-            truncated: false,
-            results: vec![],
-            notices: Vec::new(),
-            hint: None,
-        };
+        // total_matches = Retrieval::total_matches (matching chunks before the per-file
+        // cap, at least that many when not exact), total_is_exact =
+        // Retrieval::total_is_exact, has_more = Retrieval::has_more, offset = the
+        // requested offset, next_offset = offset + returned while has_more.
+        let mut response = page("parse");
+        response.total_matches = 42;
+        response.total_is_exact = false;
+        response.returned = 5;
+        response.offset = 10;
+        response.next_offset = Some(15);
+        response.has_more = true;
         let json = serde_json::to_string(&response).unwrap();
         assert!(
             json.contains(
-                r#""total_hits":42,"total_is_exact":false,"returned":5,"offset":10,"has_more":true"#
+                r#""total_matches":42,"total_is_exact":false,"returned":5,"offset":10,"next_offset":15,"has_more":true"#
             ),
             "{json}"
         );
@@ -404,28 +424,15 @@ mod tests {
 
     #[test]
     fn hint_is_serialized_last_when_present() {
-        let response = SearchResponse {
-            schema_version: SCHEMA_VERSION,
-            content: UNTRUSTED_CONTENT,
-            query: "zzz".into(),
-            mode: "or_fallback".into(),
-            total_hits: 0,
-            total_is_exact: true,
-            returned: 0,
-            offset: 0,
-            has_more: false,
-            truncated: false,
-            results: vec![],
-            notices: Vec::new(),
-            hint: Some("try fewer words".into()),
-        };
+        let mut response = page("zzz");
+        response.mode = "none".into();
+        response.hint = Some("try fewer words".into());
         let json = serde_json::to_string(&response).unwrap();
         assert!(
             json.ends_with(r#""results":[],"hint":"try fewer words"}"#),
             "{json}"
         );
     }
-
     #[test]
     fn search_request_defaults() {
         let request = SearchRequest::new("parse");

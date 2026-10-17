@@ -46,14 +46,21 @@ fn fits(response: &SearchResponse, max_chars: usize) -> bool {
 }
 
 /// The response with its first `keep` results and the given query. Marked
-/// `truncated`, and `has_more` when results were dropped.
+/// `truncated`; when results were dropped also `budget_cut` and `has_more`, with
+/// `next_offset` at the first result cut, and only the sources of the kept results
+/// stay listed.
 fn fitted(response: &SearchResponse, keep: usize, query: &str) -> SearchResponse {
     let mut trimmed = response.clone();
     if keep < trimmed.results.len() {
         trimmed.has_more = true;
         trimmed.truncated = true;
+        trimmed.budget_cut = true;
+        trimmed.next_offset = Some(trimmed.offset + keep);
     }
     trimmed.results.truncate(keep);
+    trimmed
+        .sources
+        .retain(|slug, _| trimmed.results.iter().any(|result| &result.repo == slug));
     trimmed.returned = keep;
     trimmed.query = query.to_owned();
     if trimmed.query != response.query {
@@ -129,7 +136,6 @@ mod tests {
     #[test]
     fn an_empty_search_matches_the_golden_file() {
         let mut empty = response("alpha beta", vec![]);
-        empty.mode = "or_fallback".to_owned();
         empty.hint = Some(rag_core::application::search::NO_MATCH_HINT.to_owned());
         assert_eq!(
             render_search_json(empty, DEFAULT_MAX_CHARS),
@@ -185,6 +191,41 @@ mod tests {
                 "best first, no gaps"
             );
         }
+    }
+
+    #[test]
+    fn dropping_results_sets_budget_cut_and_points_next_offset_at_the_first_one_cut() {
+        let mut full = forty_long_results();
+        full.offset = 10;
+        let fitted = fit_to_budget(full, DEFAULT_MAX_CHARS);
+        assert!(fitted.budget_cut && fitted.truncated && fitted.has_more);
+        assert!(fitted.returned > 0 && fitted.returned < 40);
+        assert_eq!(fitted.next_offset, Some(10 + fitted.returned));
+    }
+
+    #[test]
+    fn a_page_that_fits_is_neither_truncated_nor_budget_cut() {
+        let fitted = fit_to_budget(two_hit_response(), DEFAULT_MAX_CHARS);
+        assert!(!fitted.truncated && !fitted.budget_cut);
+        assert_eq!(fitted.next_offset, None);
+    }
+
+    #[test]
+    fn a_shortened_query_alone_is_truncated_but_not_budget_cut() {
+        let fitted = fit_to_budget(response(&"alpha ".repeat(4000), vec![]), DEFAULT_MAX_CHARS);
+        assert!(fitted.truncated);
+        assert!(!fitted.budget_cut && !fitted.has_more);
+        assert_eq!(fitted.next_offset, None);
+    }
+
+    #[test]
+    fn sources_of_dropped_results_are_not_listed() {
+        let fitted = fit_to_budget(two_hit_response(), 320);
+        assert!(fitted.results.is_empty());
+        assert!(fitted.sources.is_empty());
+        assert_eq!((fitted.k, fitted.max_chars), (5, DEFAULT_MAX_CHARS));
+        let kept = fit_to_budget(forty_long_results(), DEFAULT_MAX_CHARS);
+        assert_eq!(kept.sources.len(), 1);
     }
 
     #[test]

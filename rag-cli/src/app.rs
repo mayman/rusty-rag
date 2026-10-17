@@ -211,7 +211,7 @@ fn run_search(
 ) -> Result<Executed, AppError> {
     // A read never creates the database: a missing file is `index_missing`.
     let store = SqliteStore::open_for_read(layout.root())?;
-    let response = Search::new(&store, &store).execute(request)?;
+    let response = Search::new(&store, &store, &SystemClock).execute(request)?;
     Ok(Executed::ok(match mode {
         Mode::Json => search::render_search_json(response, request.max_chars),
         Mode::Human => {

@@ -101,8 +101,13 @@ fn fixture() -> Fixture {
     Fixture { _dir: dir, store }
 }
 
+/// Two minutes after the fixture was indexed.
+fn clock() -> FixedClock {
+    FixedClock::new(IndexedAt::from_epoch_seconds(1_700_000_120))
+}
+
 fn search(fixture: &Fixture, request: &SearchRequest) -> SearchResponse {
-    Search::new(&fixture.store, &fixture.store)
+    Search::new(&fixture.store, &fixture.store, &clock())
         .execute(request)
         .expect("search succeeds")
 }
@@ -123,13 +128,15 @@ fn a_search_over_the_real_store_fills_the_schema_fields() {
     let hit = &response.results[0];
     assert_eq!(hit.path, "src/config/loader.rs");
     assert_eq!(hit.repo, "github.com/acme/widgets");
-    assert_eq!(hit.commit, &COMMIT[..7]);
-    assert_eq!(hit.indexed_at, "2023-11-14T22:13:20Z");
+    let source = &response.sources["github.com/acme/widgets"];
+    assert_eq!(source.commit, &COMMIT[..7]);
+    assert_eq!(source.indexed_at, "2023-11-14T22:13:20Z");
+    assert_eq!(source.age_seconds, 120);
     assert_eq!(hit.language, "rust");
     assert_eq!(hit.rank, 1);
     assert_eq!(hit.score_rel, 1.0);
     assert!(hit.score > 0.0, "adapter scores are higher-is-better");
-    assert_eq!(hit.show, format!("rag show --chunk {}", hit.id));
+    assert_eq!(hit.chunk.len(), 64);
     assert!(hit.snippet.contains("parse_config"));
     assert_eq!(response.mode, "and");
     assert!(response.hint.is_none());
@@ -212,8 +219,8 @@ fn filters_apply_on_the_real_store() {
 fn hostile_queries_never_error() {
     let fixture = fixture();
     for query in ["AND OR NOT NEAR \"x\" -y a:b * (", "\"", "(((", "a:b:c"] {
-        let result =
-            Search::new(&fixture.store, &fixture.store).execute(&SearchRequest::new(query));
+        let result = Search::new(&fixture.store, &fixture.store, &clock())
+            .execute(&SearchRequest::new(query));
         match result {
             Ok(_) => {}
             Err(error) => assert_eq!(error.code(), ErrorCode::Usage, "{query:?}: {error}"),
@@ -225,7 +232,7 @@ fn hostile_queries_never_error() {
 fn an_empty_database_is_index_missing() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteStore::open_for_write(dir.path()).unwrap();
-    let error = Search::new(&store, &store)
+    let error = Search::new(&store, &store, &clock())
         .execute(&SearchRequest::new("anything"))
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::IndexMissing);
@@ -236,7 +243,7 @@ fn a_pathological_glob_is_rejected_before_it_reaches_sql() {
     let fixture = fixture();
     let mut request = SearchRequest::new("parse");
     request.path = Some("*a".repeat(40));
-    let error = Search::new(&fixture.store, &fixture.store)
+    let error = Search::new(&fixture.store, &fixture.store, &clock())
         .execute(&request)
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::Usage);
