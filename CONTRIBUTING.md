@@ -1,14 +1,14 @@
 # Contributing
 
-Thanks for helping build `rag`. This document explains how the project is organised and the rules every change follows. Read [PLAN.md](PLAN.md) first: it is the source of truth for behaviour, commands, the JSON schema, and the build order. Set up your environment with [SETUP.md](SETUP.md).
+Thanks for helping build `rag`. This document explains how the project is organised and the rules every change follows. Read [PLAN.md](PLAN.md) (an index of `docs/plan/`) first: it is the source of truth for behaviour, commands, the JSON schema, and the build order. Set up your environment with [SETUP.md](SETUP.md).
 
 ## Ground rules
 
 1. **Test first.** No production code without a failing test that demands it (red, green, refactor). Fix a bug by writing a test that reproduces it first.
 2. **Respect the layers** (domain-driven design, onion architecture).
 3. **Run the gate** before every commit: `powershell -File scripts\check.ps1`. It must exit 0. Report real output; do not claim "green" without running it.
-4. **One build step per change.** Follow the order in PLAN.md section 8. Do not expand scope.
-5. **Ask before adding dependencies.** The allowlist is in PLAN.md section 1. Anything else needs approval.
+4. **One build step per change.** Follow the order in docs/plan/08-build-order.md. Do not expand scope.
+5. **Ask before adding dependencies.** The allowlist is in docs/plan/01-decisions.md. Anything else needs approval.
 
 ## Architecture
 
@@ -46,7 +46,7 @@ More detail: [`.claude/skills/tdd-rust/SKILL.md`](.claude/skills/tdd-rust/SKILL.
 
 These files define the project's safety net and are changed only with explicit maintainer approval:
 
-`Cargo.toml` (workspace root), `rust-toolchain.toml`, `rag-core/clippy.toml`, `rag-core/tests/architecture.rs`, `scripts/check.ps1`, `scripts/guard-protected.ps1`, `scripts/test-guard.ps1`, `scripts/update-protected.ps1`, `scripts/protected.sha256`, `.cargo/`, `.gitattributes`, `PLAN.md`, and everything under `.claude/`.
+`Cargo.toml` (workspace root), `rust-toolchain.toml`, `rag-core/clippy.toml`, `rag-core/tests/architecture.rs`, `scripts/check.ps1`, `scripts/guard-protected.ps1`, `scripts/test-guard.ps1`, `scripts/update-protected.ps1`, `scripts/protected.sha256`, `.cargo/`, `.gitattributes`, `PLAN.md`, everything under `docs/plan/`, and everything under `.claude/`.
 
 `scripts/check.ps1` verifies the hashed subset against the committed manifest `scripts/protected.sha256`. If you legitimately change one of those files, say so in the pull request and regenerate the manifest with `scripts\update-protected.ps1` after approval. `scripts\test-guard.ps1` exercises the guard that stops the engineer agent from editing protected files; run it after changing the guard.
 
@@ -66,7 +66,7 @@ Review agent output with the same scepticism as any contributor: re-run the gate
 ## Commits and reviews
 
 - Keep commits small and focused; the message says what changed and why.
-- Update the progress checklist at the top of PLAN.md when a step lands (`[x]` verified, `[~]` done but unverified, `[ ]` not started).
+- Update the progress checklist in `docs/plan/00-progress.md` when a step lands (`[x]` verified, `[~]` done but unverified, `[ ]` not started).
 - Before merging, get a review of the diff. Reviewers should mark findings as confirmed (traced in code) or plausible, with the failing scenario.
 - Do not commit secrets, `.env` files, or index databases.
 

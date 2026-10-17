@@ -2,7 +2,7 @@
 
 A local, global keyword-search (BM25) retrieval CLI for indexing GitHub repos (docs and source code), designed to be called by Claude Code through Bash and a skill.
 
-> **Status: early development.** Only the workspace scaffold and the quality gate exist. `rag --version` works; the commands below are the planned v1 surface and are **not implemented yet**. Progress is tracked in the checklist at the top of [PLAN.md](PLAN.md).
+> **Status: early development.** Only the workspace scaffold and the quality gate exist. `rag --version` works; the commands below are the planned v1 surface and are **not implemented yet**. Progress is tracked in the checklist in [docs/plan/00-progress.md](docs/plan/00-progress.md).
 
 ## What it will do
 
@@ -44,7 +44,7 @@ rag-core/    domain + application layers (no I/O; ports are traits)
 rag-infra/   adapters: SQLite/FTS5, git, filesystem, clock, config
 rag-cli/     the `rag` binary: argument parsing, rendering, wiring
 scripts/     quality gate and guard scripts
-PLAN.md      design, decisions, build order, and the progress checklist
+PLAN.md      index of the plan; sections live in docs/plan/ (design, build order, progress checklist)
 .claude/     project agents and skills used to build this
 ```
 
