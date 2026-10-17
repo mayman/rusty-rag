@@ -6,7 +6,7 @@ members = ["rag-core", "rag-infra", "rag-cli"]
 version = "0.1.0"
 edition = "2021"
 # Declared MSRV only; NOT tested in CI. The pinned toolchain (rust-toolchain.toml) is what actually builds.
-rust-version = "1.85"
+rust-version = "1.89"
 publish = false
 
 [workspace.dependencies]

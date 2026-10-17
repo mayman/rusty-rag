@@ -61,10 +61,7 @@ impl FileOperationLock {
             .write(true)
             .open(path)
             .map_err(failed)?;
-        // `File::try_lock` is stable since Rust 1.89; the pinned toolchain is 1.99.1
-        // but the workspace declares `rust-version = "1.85"`. Remove this allow when
-        // the workspace MSRV is raised to 1.89 (see the step 5a report).
-        #[allow(clippy::incompatible_msrv)]
+        // `File::try_lock` is stable since Rust 1.89, the workspace `rust-version`.
         let locked = file.try_lock();
         match locked {
             Ok(()) => {
