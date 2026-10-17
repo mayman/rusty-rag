@@ -71,3 +71,46 @@ fn ensure_dirs_creates_the_directories_and_is_repeatable() {
         assert!(dir.is_dir(), "{}", dir.display());
     }
 }
+
+#[test]
+fn the_os_default_is_the_local_data_directory_not_the_roaming_one() {
+    assert_eq!(DataLayout::os_default_dir(), dirs::data_local_dir());
+    #[cfg(windows)]
+    {
+        let default = DataLayout::os_default_dir().expect("a local app data directory");
+        assert!(
+            !default.to_string_lossy().contains("Roaming"),
+            "an index must not roam between machines: {}",
+            default.display()
+        );
+        assert_ne!(Some(default), dirs::data_dir());
+    }
+}
+
+#[test]
+fn repos_and_tmp_are_siblings_so_clones_are_renames_within_one_volume() {
+    let layout = DataLayout::new(absolute("sibling-root"));
+    assert_eq!(layout.repos_dir().parent(), layout.tmp_dir().parent());
+}
+
+#[test]
+fn a_rename_from_tmp_into_repos_is_verified_to_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(temp.path().join("data"));
+    layout.ensure_dirs().unwrap();
+    layout.verify_same_volume().unwrap();
+    for dir in [layout.repos_dir(), layout.tmp_dir()] {
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            0,
+            "the probe cleans up after itself"
+        );
+    }
+
+    std::fs::remove_dir(layout.repos_dir()).unwrap();
+    let error = layout.verify_same_volume().unwrap_err();
+    assert!(
+        matches!(error, ConfigError::CannotMoveBetweenDirs { .. }),
+        "{error:?}"
+    );
+}

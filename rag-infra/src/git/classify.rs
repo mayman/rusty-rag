@@ -4,6 +4,7 @@
 //! first lines of stderr are kept.
 
 use rag_core::application::error::GitError;
+use rag_core::domain::git_location::scrub_credentials;
 
 /// How much of stderr is quoted in an error message.
 const MAX_MESSAGE_CHARS: usize = 400;
@@ -12,15 +13,11 @@ const MAX_MESSAGE_CHARS: usize = 400;
 pub fn classify(stderr: &str) -> GitError {
     let lower = stderr.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    let message = summary(stderr);
+    // Scrub the whole text first: a cut made by the length limit could otherwise
+    // split a URL and leave a credential that no scrubber recognises.
+    let message = summary(&scrub_credentials(stderr));
 
-    if has(&[
-        "unable to create '",
-        "another git process seems to be running",
-        "cannot lock ref",
-        ".lock': file exists",
-        "unable to lock",
-    ]) {
+    if has(&["index.lock", "shallow.lock", "another git process"]) {
         GitError::Busy
     } else if has(&[
         "couldn't find remote ref",
@@ -95,6 +92,7 @@ mod tests {
             GitError::NetworkOrAuth(_) => "network",
             GitError::Timeout => "timeout",
             GitError::Busy => "busy",
+            GitError::TooLarge(_) => "too_large",
             GitError::Failed(_) => "failed",
         }
     }
@@ -133,9 +131,23 @@ mod tests {
     fn lock_contention_is_busy() {
         for stderr in [
             "fatal: Unable to create '/r/.git/index.lock': File exists.\n\nAnother git process seems to be running",
-            "error: cannot lock ref 'refs/rag/head': is at abc but expected def",
+            "fatal: Unable to create '/r/shallow.lock': File exists.",
+            "fatal: another git process seems to be running in this repository",
         ] {
             assert_eq!(kind(stderr), "busy", "{stderr}");
+        }
+    }
+
+    #[test]
+    fn only_real_lock_contention_is_busy() {
+        for stderr in [
+            "fatal: unable to create temporary file '/r/objects/tmp_obj_x': No space left on device",
+            "fatal: Unable to create '/r/objects/pack/tmp_pack': Permission denied",
+            "error: cannot lock ref 'refs/rag/head': is at abc but expected def",
+            "fatal: unable to lock config file",
+            "error: could not write 'x.lock': file exists elsewhere",
+        ] {
+            assert_ne!(kind(stderr), "busy", "{stderr}");
         }
     }
 
@@ -162,6 +174,30 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("github.com/o/r"), "{shown}");
+    }
+
+    #[test]
+    fn a_credential_cut_by_the_length_limit_still_does_not_leak() {
+        // The URL straddles the 400-character limit: truncating first would leave
+        // `https://user:s3cr` in the message, which no scrubber recognises.
+        let stderr = format!(
+            "fatal: {} https://user:s3cretpassword@github.com/o/r",
+            "x".repeat(MAX_MESSAGE_CHARS - 40)
+        );
+        for error in [
+            classify(&stderr),
+            classify(&format!("{stderr} Repository not found")),
+        ] {
+            let shown = error.to_string();
+            assert!(
+                !shown.contains("s3cr") && !shown.contains("user:"),
+                "{shown}"
+            );
+        }
+        let GitError::Failed(message) = classify(&stderr) else {
+            panic!("expected Failed");
+        };
+        assert!(message.as_str().len() <= MAX_MESSAGE_CHARS);
     }
 
     #[test]

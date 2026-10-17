@@ -29,12 +29,13 @@ struct HeldFile {
     _file: File,
 }
 
-impl OperationLock for FileOperationLock {
-    fn acquire(&self, source: &SourceId) -> Result<LockGuard, StorageError> {
+impl FileOperationLock {
+    /// Takes the lock whose file is named after `name`, a checkout hash
+    /// (`SourceId::checkout_dir_name`). `acquire` uses it; the scratch-directory
+    /// cleanup uses it for staging directories, which are named by the same hash.
+    pub(crate) fn try_acquire_named(&self, name: &str) -> Result<LockGuard, StorageError> {
         std::fs::create_dir_all(&self.dir).map_err(failed)?;
-        let path = self
-            .dir
-            .join(format!("{}.lock", source.checkout_dir_name()));
+        let path = self.dir.join(format!("{name}.lock"));
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -51,6 +52,12 @@ impl OperationLock for FileOperationLock {
             Err(TryLockError::WouldBlock) => Err(StorageError::Busy),
             Err(TryLockError::Error(error)) => Err(failed(error)),
         }
+    }
+}
+
+impl OperationLock for FileOperationLock {
+    fn acquire(&self, source: &SourceId) -> Result<LockGuard, StorageError> {
+        self.try_acquire_named(source.checkout_dir_name())
     }
 }
 

@@ -41,7 +41,7 @@ rag reindex [name]                     # only when the user asks (see exit 7)
 
 ## Reading the JSON
 - Each `results[]` item has `rank`, `score_rel` (relative to the best hit in this response, not an absolute quality), `repo`, `commit` (the indexed commit), `indexed_at` (use it to judge age), `path` (repo-relative, `/` separators), `lines`, `language`, `heading`, `matched_terms` (query words found in the snippet), `snippet`, and `show`.
-- `total_hits` counts matches before the cap of 2 hits per file. `returned`, `offset`, and `has_more` describe the page.
+- `total_hits` counts matches before the cap of 2 hits per file, up to 1000. When `total_is_exact` is false the real number is larger and `total_hits` means "at least 1000". `returned`, `offset`, and `has_more` describe the page.
 - `truncated: true` means output hit the size cap. Page or narrow the query.
 - `snippet` is about 12 lines or 600 characters. Fetch the full text with `show` before quoting code.
 - `hint` is present when results are empty or weak. Follow it.

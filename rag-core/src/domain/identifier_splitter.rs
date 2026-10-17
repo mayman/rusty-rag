@@ -4,13 +4,19 @@
 //! separators `_`, `-`, `.`, `/`. Each word keeps a separator-free `joined` form
 //! (`parseConfig` and `parse_config` both give `parseconfig`) and its `parts`.
 //!
-//! The FTS5 tokenizer configuration (token characters, diacritics) is decided in
-//! build step 3. This module only decides which lowercase strings are tokens.
+//! The FTS5 tokenizer configuration (token characters, diacritics) lives in the
+//! SQLite adapter. This module decides which lowercase strings are tokens, and keeps
+//! them stable under that tokenizer: it only emits characters FTS5 treats as token
+//! characters (so circled and squared letters, which are symbols to FTS5, are word
+//! breaks here), and it already applies the case folds FTS5 would apply (`fts5_fold`).
+//! The adapter has a test that round-trips every token the splitter can emit.
 
 /// Version of the token rules. Bump whenever the tokens emitted for a given text
-/// change; an index built with another version must be reindexed. Nothing is
-/// committed yet, so this stays at 1.
-pub const TOKENIZER_VERSION: u32 = 1;
+/// change; an index built with another version must be reindexed.
+///
+/// 2: circled and squared letters (category So) are no longer word characters, and
+/// the characters the FTS5 tokenizer folds are folded in the token.
+pub const TOKENIZER_VERSION: u32 = 2;
 
 /// Words of this many characters or more emit no tokens. Long hex strings, base64
 /// blobs, and hashes would otherwise explode into one token per letter/digit run.
@@ -49,8 +55,10 @@ impl IdentifierSplitter {
         words(&text)
             .filter(|run| run.chars().count() < MAX_WORD_CHARS)
             .map(|run| {
-                let parts: Vec<String> =
-                    split_parts(run).iter().map(|p| p.to_lowercase()).collect();
+                let parts: Vec<String> = split_parts(run)
+                    .iter()
+                    .map(|p| fts5_fold(&p.to_lowercase()))
+                    .collect();
                 Word {
                     joined: parts.concat(),
                     parts,
@@ -96,7 +104,41 @@ fn drop_escape_sequences(text: &str) -> String {
 
 /// True for characters that can appear inside an identifier or path.
 fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || is_separator(c)
+    (c.is_alphanumeric() && !is_letter_symbol(c)) || is_separator(c)
+}
+
+/// Circled and squared Latin letters: Alphabetic in Unicode, but of category So
+/// (symbol), which the FTS5 tokenizer does not keep in a token.
+fn is_letter_symbol(c: char) -> bool {
+    matches!(c,
+        '\u{24b6}'..='\u{24e9}'
+        | '\u{1f130}'..='\u{1f149}'
+        | '\u{1f150}'..='\u{1f169}'
+        | '\u{1f170}'..='\u{1f189}')
+}
+
+/// The case folds the FTS5 `unicode61` tokenizer applies on top of lowercasing, for
+/// the characters whose lowercase form is not already their folded form. Applying
+/// them here keeps every emitted token identical to what the index stores.
+fn fts5_fold(lowercase: &str) -> String {
+    lowercase
+        .chars()
+        .map(|c| match c {
+            '\u{b5}' => '\u{3bc}',
+            '\u{17f}' => 's',
+            '\u{345}' | '\u{1fbe}' => '\u{3b9}',
+            '\u{3c2}' => '\u{3c3}',
+            '\u{3d0}' => '\u{3b2}',
+            '\u{3d1}' => '\u{3b8}',
+            '\u{3d5}' => '\u{3c6}',
+            '\u{3d6}' => '\u{3c0}',
+            '\u{3f0}' => '\u{3ba}',
+            '\u{3f1}' => '\u{3c1}',
+            '\u{3f5}' => '\u{3b5}',
+            '\u{1e9b}' => '\u{1e61}',
+            other => other,
+        })
+        .collect()
 }
 
 /// Separators join identifier parts; they are trimmed from word edges.
@@ -259,6 +301,35 @@ mod tests {
     #[test]
     fn backslash_before_a_non_escape_letter_is_a_plain_break() {
         assert_eq!(tokens(r"a\b"), ["a", "b"]);
+    }
+
+    #[test]
+    fn circled_and_squared_letters_are_symbols_not_word_characters() {
+        // They are Alphabetic but category So, which the FTS5 tokenizer treats as
+        // separators; keeping them inside a word would give tokens FTS5 splits.
+        assert_eq!(tokens("\u{24d0}bc"), ["bc"]);
+        assert_eq!(tokens("a\u{24b7}b"), ["a", "b"]);
+        assert_eq!(tokens("a\u{1f130}b\u{1f170}c"), ["a", "b", "c"]);
+        assert!(tokens("\u{1f189}\u{24e9}").is_empty());
+    }
+
+    #[test]
+    fn characters_the_fts5_tokenizer_would_fold_are_folded_in_the_token() {
+        for (given, folded) in [
+            ("\u{b5}", "\u{3bc}"),
+            ("\u{17f}", "s"),
+            ("\u{3c2}", "\u{3c3}"),
+            ("\u{3d1}", "\u{3b8}"),
+            ("\u{1e9b}", "\u{1e61}"),
+            ("\u{1fbe}", "\u{3b9}"),
+            ("a\u{345}", "a\u{3b9}"),
+        ] {
+            assert_eq!(tokens(given), [folded], "{given:?}");
+        }
+        assert_eq!(
+            tokens("\u{3a3}\u{3af}\u{3c3}\u{3c5}\u{3c6}\u{3bf}\u{3c2}"),
+            ["σίσυφοσ"]
+        );
     }
 
     #[test]

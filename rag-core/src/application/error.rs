@@ -132,6 +132,9 @@ pub enum GitError {
     Timeout,
     /// The repository is in use by another operation; retry later.
     Busy,
+    /// A blob, or a batch of blobs, is larger than the adapter will read into
+    /// memory (see `ports::MAX_BLOB_BYTES`). Retrying cannot help.
+    TooLarge(Scrubbed),
     /// Anything else.
     Failed(Scrubbed),
 }
@@ -157,9 +160,8 @@ impl AppError {
             Self::Git(GitError::NotFound(_)) | Self::NotFound(_) => ErrorCode::NotFound,
             Self::Git(GitError::NetworkOrAuth(_) | GitError::Timeout) => ErrorCode::NetworkOrAuth,
             Self::Usage(_) | Self::Storage(StorageError::NameTaken(_)) => ErrorCode::Usage,
-            Self::Storage(StorageError::Failed(_)) | Self::Git(GitError::Failed(_)) => {
-                ErrorCode::Generic
-            }
+            Self::Storage(StorageError::Failed(_))
+            | Self::Git(GitError::Failed(_) | GitError::TooLarge(_)) => ErrorCode::Generic,
         }
     }
 }
@@ -194,6 +196,7 @@ impl fmt::Display for GitError {
             }
             Self::Timeout => f.write_str("git: operation timed out"),
             Self::Busy => f.write_str("git: the repository is busy; retry shortly"),
+            Self::TooLarge(what) => write!(f, "git: too large to read: {what}"),
             Self::Failed(message) => write!(f, "git failure: {message}"),
         }
     }
@@ -300,6 +303,16 @@ mod tests {
         assert_eq!(code(GitError::Timeout), ErrorCode::NetworkOrAuth);
         assert_eq!(code(GitError::Busy), ErrorCode::IndexLocked);
         assert_eq!(code(GitError::Failed("x".into())), ErrorCode::Generic);
+        assert_eq!(code(GitError::TooLarge("x".into())), ErrorCode::Generic);
+    }
+
+    #[test]
+    fn a_too_large_blob_is_reported_with_its_own_message() {
+        let shown = GitError::TooLarge("blob abc is 3 MiB".into()).to_string();
+        assert!(
+            shown.contains("too large") && shown.contains("blob abc"),
+            "{shown}"
+        );
     }
 
     #[test]

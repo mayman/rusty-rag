@@ -3,14 +3,16 @@
 //! in this crate's own tests). `rag-infra` runs `contract_source_repository`,
 //! `contract_chunk_store`, `contract_chunk_search`, `contract_operation_lock`, and
 //! `contract_commit_race` (which needs a thread runner from the caller) against its
-//! real adapters.
+//! real adapters. The store and search contracts also need the
+//! `StampStoredVersions` seam, with which a test ages a stored index the way an
+//! older build would have left it.
 
 mod contracts;
 mod fakes;
 
 pub use contracts::{
     contract_chunk_search, contract_chunk_store, contract_commit_race, contract_operation_lock,
-    contract_source_repository,
+    contract_source_repository, StampStoredVersions,
 };
 pub use fakes::{FakeGitClient, FakeOperationLock, FixedClock, InMemoryStore};
 
@@ -301,6 +303,57 @@ mod tests {
             git.read_blobs(&s, &[present, absent]),
             Err(GitError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn fake_git_refuses_blobs_over_the_blob_cap_and_requests_over_the_read_cap() {
+        use crate::application::ports::{MAX_BLOB_BYTES, MAX_READ_BYTES};
+
+        let (git, s) = git_with_remote();
+        let big = "x".repeat(MAX_BLOB_BYTES as usize + 1);
+        let fits = "y".repeat(MAX_BLOB_BYTES as usize);
+        let id = git.commit(REMOTE, &[("big.txt", &big), ("fits.txt", &fits)]);
+        git.clone_shallow(&s, &location(), &main_ref()).unwrap();
+        let listing = git.ls_tree(&s, &id).unwrap();
+        let blob = |name: &str| {
+            listing
+                .entries
+                .iter()
+                .find(|e| e.path.as_str() == name)
+                .unwrap()
+                .blob
+                .clone()
+        };
+
+        assert!(matches!(
+            git.read_blobs(&s, &[blob("big.txt")]),
+            Err(GitError::TooLarge(_))
+        ));
+        assert_eq!(git.read_blobs(&s, &[blob("fits.txt")]).unwrap().len(), 1);
+
+        // Many distinct blobs that together pass the read cap.
+        let filler = "z".repeat(MAX_BLOB_BYTES as usize - 16);
+        let many: Vec<(String, String)> = (0..=MAX_READ_BYTES / MAX_BLOB_BYTES)
+            .map(|i| (format!("m{i}.txt"), format!("{i:04}{filler}")))
+            .collect();
+        let files: Vec<(&str, &str)> = many.iter().map(|(n, c)| (n.as_str(), c.as_str())).collect();
+        let second = git.commit(REMOTE, &files);
+        git.fetch_update(&s, &main_ref()).unwrap();
+        let blobs: Vec<BlobOid> = git
+            .ls_tree(&s, &second)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.blob)
+            .collect();
+        assert!(matches!(
+            git.read_blobs(&s, &blobs),
+            Err(GitError::TooLarge(_))
+        ));
+        assert!(
+            git.read_blobs(&s, &blobs[..4]).is_ok(),
+            "sliced requests work"
+        );
     }
 
     #[test]

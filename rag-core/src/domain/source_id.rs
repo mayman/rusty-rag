@@ -44,12 +44,13 @@ impl SourceId {
     pub fn from_location(location: &GitLocation) -> Result<Self, SourceIdError> {
         let location = location.as_str();
         match split_remote(location) {
-            Some((host, path)) => Self::remote(host, path),
+            Some(remote) => Self::remote(remote),
             None => Self::local(location),
         }
     }
 
-    fn remote(host: &str, path: &str) -> Result<Self, SourceIdError> {
+    fn remote(remote: Remote<'_>) -> Result<Self, SourceIdError> {
+        let Remote { host, port, path } = remote;
         let host = host.to_ascii_lowercase();
         if host.is_empty()
             || !host
@@ -70,7 +71,14 @@ impl SourceId {
             slug.push('/');
             slug.push_str(&sanitise_segment(segment)?);
         }
-        let canonical = format!("https://{host}/{}", segments.join("/"));
+        // The port is part of the identity (another port is another server) but not
+        // of the slug, which is a path-like name. Default ports add nothing, so the
+        // transport stays irrelevant.
+        let authority = match port {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+        let canonical = format!("https://{authority}/{}", segments.join("/"));
         Ok(Self::from_parts(&slug, &short_hash(&canonical)))
     }
 
@@ -133,17 +141,38 @@ impl SourceId {
     }
 }
 
-/// `(host, path)` of a remote URL or scp-like address, with credentials and port
-/// removed. `None` for local paths (including `file://` URLs and drive letters).
-fn split_remote(location: &str) -> Option<(&str, &str)> {
+/// The parts of a remote location that make up its identity.
+struct Remote<'a> {
+    host: &'a str,
+    /// The port, only when it is not the default of the transport (443 for https,
+    /// 22 for ssh and scp-like addresses).
+    port: Option<&'a str>,
+    path: &'a str,
+}
+
+/// The remote parts of a URL or scp-like address, with credentials removed. `None`
+/// for local paths (including `file://` URLs and drive letters).
+fn split_remote(location: &str) -> Option<Remote<'_>> {
     if let Some((scheme, rest)) = location.split_once("://") {
         if scheme.eq_ignore_ascii_case("file") {
             return None;
         }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         let host_port = authority.rsplit('@').next().unwrap_or(authority);
-        let host = host_port.split(':').next().unwrap_or(host_port);
-        return Some((host, path));
+        let (host, port) = match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        };
+        let default = if scheme.eq_ignore_ascii_case("ssh") {
+            "22"
+        } else {
+            "443"
+        };
+        return Some(Remote {
+            host,
+            port: port.filter(|port| !port.is_empty() && *port != default),
+            path,
+        });
     }
     let (address, path) = location.split_once(':')?;
     let looks_like_path = address.contains('/') || address.contains('\\');
@@ -151,7 +180,11 @@ fn split_remote(location: &str) -> Option<(&str, &str)> {
     if looks_like_path || address.len() < 2 {
         return None;
     }
-    Some((address.rsplit('@').next().unwrap_or(address), path))
+    Some(Remote {
+        host: address.rsplit('@').next().unwrap_or(address),
+        port: None,
+        path,
+    })
 }
 
 /// ASCII letters (case kept), digits, `.`, `_`, `-`; anything else becomes `-`.
@@ -227,6 +260,40 @@ mod tests {
     }
 
     #[test]
+    fn a_non_default_port_is_part_of_the_identity_but_not_of_the_slug() {
+        let plain = id("https://git.example.com/o/r");
+        let on_port = id("https://git.example.com:8443/o/r");
+        assert_ne!(plain, on_port, "another server, another source");
+        assert_eq!(plain.slug(), on_port.slug());
+        assert_ne!(
+            id("https://git.example.com:8443/o/r"),
+            id("https://git.example.com:9443/o/r")
+        );
+        assert!(SourceId::parse(on_port.as_str()).is_ok());
+    }
+
+    #[test]
+    fn default_ports_do_not_change_the_identity() {
+        assert_eq!(
+            id("https://git.example.com:443/o/r"),
+            id("https://git.example.com/o/r")
+        );
+        assert_eq!(
+            id("ssh://git@git.example.com:22/o/r"),
+            id("git@git.example.com:o/r")
+        );
+        assert_eq!(
+            id("ssh://git@git.example.com:22/o/r"),
+            id("https://git.example.com/o/r")
+        );
+        assert_ne!(
+            id("ssh://git@git.example.com:2222/o/r"),
+            id("git@git.example.com:o/r"),
+            "ssh on another port is another server"
+        );
+    }
+
+    #[test]
     fn owner_and_name_are_case_sensitive() {
         assert_ne!(id("https://github.com/O/R"), id("https://github.com/o/r"));
     }
@@ -281,7 +348,7 @@ mod tests {
             "https://github.com/o/r/",
             "git@github.com:o/r.git",
             "ssh://git@github.com/o/r.git",
-            "ssh://git@github.com:2222/o/r",
+            "ssh://git@github.com:22/o/r",
             "HTTPS://GitHub.com/o/r.git",
         ] {
             assert_eq!(id(other), https, "{other}");

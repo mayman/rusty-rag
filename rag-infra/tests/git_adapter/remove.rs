@@ -1,7 +1,8 @@
 //! remove_checkout and garbage collection of leftovers.
 
-use rag_core::application::ports::GitClient;
+use rag_core::application::ports::{GitClient, OperationLock};
 use rag_core::domain::git_ref::GitRef;
+use rag_infra::lock::FileOperationLock;
 
 use super::support::{Sandbox, Upstream};
 
@@ -77,17 +78,57 @@ fn removal_also_clears_a_staging_directory_left_by_a_crashed_clone() {
     assert!(!stale.exists());
 }
 
+fn lock_for(sandbox: &Sandbox) -> FileOperationLock {
+    FileOperationLock::new(sandbox.layout.locks_dir())
+}
+
 #[test]
 fn collect_garbage_empties_the_scratch_directory() {
     let sandbox = Sandbox::new();
     let leftover = sandbox.layout.tmp_dir().join("trash-1");
     std::fs::create_dir_all(leftover.join("objects")).unwrap();
     std::fs::write(sandbox.layout.tmp_dir().join("stray-file"), "x").unwrap();
+    let staging = sandbox.layout.tmp_dir().join("clone-0123456789ab");
+    std::fs::create_dir_all(staging.join("objects")).unwrap();
 
-    sandbox.client.collect_garbage();
+    sandbox.client.collect_garbage(&lock_for(&sandbox));
 
-    assert_eq!(
-        std::fs::read_dir(sandbox.layout.tmp_dir()).unwrap().count(),
-        0
+    assert!(
+        sandbox.scratch_leftovers().is_empty(),
+        "{:?}",
+        sandbox.scratch_leftovers()
     );
+}
+
+#[test]
+fn collect_garbage_leaves_the_staging_directory_of_a_source_that_is_locked() {
+    let upstream = Upstream::new();
+    let sandbox = Sandbox::new();
+    let id = upstream.source_id();
+    let locks = lock_for(&sandbox);
+    let staging = sandbox
+        .layout
+        .tmp_dir()
+        .join(format!("clone-{}", id.checkout_dir_name()));
+    let other_staging = sandbox.layout.tmp_dir().join("clone-0123456789ab");
+    let trash = sandbox.layout.tmp_dir().join("trash-old-1");
+    for dir in [&staging, &other_staging, &trash] {
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+    }
+
+    // Another operation is cloning this source right now: it holds the lock.
+    let held = locks.acquire(&id).unwrap();
+    sandbox.client.collect_garbage(&locks);
+    assert!(
+        staging.exists(),
+        "the staging directory of a locked source stays"
+    );
+    assert!(!other_staging.exists(), "unlocked staging directories go");
+    assert!(!trash.exists(), "trash goes whatever is locked");
+
+    // The lock is held while garbage is collected, so a clone cannot start meanwhile;
+    // once released, the leftover is garbage.
+    drop(held);
+    sandbox.client.collect_garbage(&locks);
+    assert!(!staging.exists());
 }

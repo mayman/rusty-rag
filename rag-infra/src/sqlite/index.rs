@@ -29,7 +29,7 @@ impl ChunkStore for SqliteStore {
         expected_base: Option<&CommitId>,
         changes: &IndexChanges,
     ) -> Result<(), StorageError> {
-        self.write(|tx| {
+        self.write_bulk(|tx| {
             let stored = load_source(tx, source.id())?
                 .ok_or_else(|| failed("the source is not registered"))?;
             let revision = source
@@ -39,6 +39,7 @@ impl ChunkStore for SqliteStore {
                 return Err(StorageError::Conflict);
             }
             ensure_name_free(tx, source)?;
+            ensure_current_tokenizer_and_policy(revision.versions)?;
             validate(source.id(), changes)?;
             if stored
                 .indexed()
@@ -47,11 +48,15 @@ impl ChunkStore for SqliteStore {
                 ensure_every_stored_file_is_covered(tx, source.id(), changes)?;
             }
 
+            // Every replaced file goes before any new one is inserted, so a chunk id
+            // that moves from one replaced file to another is not a clash.
             for path in &changes.removals {
                 delete_file(tx, source.id(), path)?;
             }
             for file in &changes.upserts {
                 delete_file(tx, source.id(), &file.path)?;
+            }
+            for file in &changes.upserts {
                 insert_file(tx, source.id(), file)?;
             }
 
@@ -79,7 +84,7 @@ impl ChunkStore for SqliteStore {
     }
 
     fn remove_source(&self, id: &SourceId) -> Result<(), StorageError> {
-        self.write(|tx| {
+        self.write_bulk(|tx| {
             tx.execute(
                 "DELETE FROM chunks_fts WHERE rowid IN \
                  (SELECT chunk_rowid FROM chunks WHERE source_id = ?1)",
@@ -161,7 +166,7 @@ impl ChunkStore for SqliteStore {
         fields: &[ReindexedChunk],
         versions: IndexVersions,
     ) -> Result<(), StorageError> {
-        self.write(|tx| {
+        self.write_bulk(|tx| {
             let stored =
                 load_source(tx, source)?.ok_or_else(|| failed("the source is not registered"))?;
             let revision = stored
@@ -172,6 +177,7 @@ impl ChunkStore for SqliteStore {
                     "a rewrite may only change the tokenizer version; re-chunk with commit_index",
                 ));
             }
+            ensure_current_tokenizer_and_policy(versions)?;
 
             let mut replacement = BTreeMap::new();
             for entry in fields {
@@ -234,13 +240,31 @@ fn stored_chunk_rows(
     Ok(rows)
 }
 
+/// The index is built by this build's domain, so it may not claim other tokenizer or
+/// policy versions.
+fn ensure_current_tokenizer_and_policy(versions: IndexVersions) -> Result<(), StorageError> {
+    if versions.stamps_current_tokenizer_and_policy() {
+        Ok(())
+    } else {
+        Err(failed(format!(
+            "an index is stamped with the current tokenizer and policy versions only, \
+             not {versions:?}"
+        )))
+    }
+}
+
 /// Rejects change sets that name a chunk of another source or path, upsert a path
-/// twice, or both upsert and remove a path.
+/// twice, both upsert and remove a path, or carry the same chunk id twice. (A chunk
+/// id that a file which stays also has is caught by the UNIQUE index.)
 fn validate(source: &SourceId, changes: &IndexChanges) -> Result<(), StorageError> {
+    let mut chunk_ids = BTreeSet::new();
     let mut upserted = BTreeSet::new();
     for file in &changes.upserts {
         if !upserted.insert(&file.path) {
             return Err(failed(format!("{} is upserted twice", file.path)));
+        }
+        if let Some(chunk) = file.chunks.iter().find(|c| !chunk_ids.insert(&c.id)) {
+            return Err(failed(format!("chunk id {} is stored twice", chunk.id)));
         }
         if file
             .chunks

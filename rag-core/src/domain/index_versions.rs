@@ -36,6 +36,15 @@ impl IndexVersions {
         self.chunker == other.chunker && self.policy == other.policy
     }
 
+    /// Whether the tokenizer and policy versions are the ones this build produces.
+    /// A store accepts only such a stamp: it holds fields this build tokenized and
+    /// files this build selected. (The chunker version is guarded separately, by the
+    /// rule that a version change replaces every stored file.)
+    pub fn stamps_current_tokenizer_and_policy(&self) -> bool {
+        let current = Self::current();
+        self.tokenizer == current.tokenizer && self.policy == current.policy
+    }
+
     /// Whether an index stamped with these versions can be searched as is.
     pub fn is_current(&self) -> bool {
         *self == Self::current()
@@ -80,6 +89,27 @@ mod tests {
             ..current
         }
         .is_current());
+    }
+
+    #[test]
+    fn a_store_may_stamp_only_the_current_tokenizer_and_policy() {
+        let current = IndexVersions::current();
+        assert!(current.stamps_current_tokenizer_and_policy());
+        assert!(IndexVersions {
+            chunker: current.chunker + 1,
+            ..current
+        }
+        .stamps_current_tokenizer_and_policy());
+        assert!(!IndexVersions {
+            tokenizer: current.tokenizer + 1,
+            ..current
+        }
+        .stamps_current_tokenizer_and_policy());
+        assert!(!IndexVersions {
+            policy: current.policy + 1,
+            ..current
+        }
+        .stamps_current_tokenizer_and_policy());
     }
 
     #[test]

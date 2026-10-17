@@ -7,10 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::contracts::StampStoredVersions;
 use crate::application::error::{GitError, StorageError};
 use crate::application::ports::{
     ChunkSearcher, ChunkStore, Clock, GitClient, IndexChanges, LockGuard, OperationLock,
-    ReindexedChunk, SearchOutcome, SourceRepository, TreeListing,
+    ReindexedChunk, SearchOutcome, SourceRepository, TreeListing, MAX_BLOB_BYTES, MAX_READ_BYTES,
+    TOTAL_MATCHES_CAP,
 };
 use crate::domain::chunk::{Chunk, IndexFields};
 use crate::domain::chunk_id::ChunkId;
@@ -99,6 +101,18 @@ fn failed(message: impl Into<String>) -> StorageError {
     StorageError::Failed(message.into().into())
 }
 
+/// The index is built by this build's domain, so it may not claim other tokenizer or
+/// policy versions.
+fn ensure_current_tokenizer_and_policy(versions: IndexVersions) -> Result<(), StorageError> {
+    if !versions.stamps_current_tokenizer_and_policy() {
+        return Err(failed(format!(
+            "an index is stamped with the current tokenizer and policy versions only, \
+             not {versions:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Fails when a source other than `id` already has `name`.
 fn check_name_free(
     sources: &BTreeMap<SourceId, Source>,
@@ -182,6 +196,9 @@ impl ChunkStore for InMemoryStore {
         let mut files = state.files.get(source.id()).cloned().unwrap_or_default();
         let stored_versions = stored.indexed().map(|revision| revision.versions);
         let new_versions = source.indexed().map(|revision| revision.versions);
+        if let Some(versions) = new_versions {
+            ensure_current_tokenizer_and_policy(versions)?;
+        }
         if stored_versions.is_some() && stored_versions != new_versions {
             let covered: BTreeSet<&RepoPath> = changes
                 .upserts
@@ -216,6 +233,24 @@ impl ChunkStore for InMemoryStore {
                 return Err(failed(format!("{path} is both removed and upserted")));
             }
             files.remove(path);
+        }
+        for path in &upserted {
+            files.remove(*path);
+        }
+        // Chunk ids are unique across the whole store, so the new chunks may not
+        // repeat each other or a chunk of a file that stays.
+        let mut ids: BTreeSet<&ChunkId> = state
+            .files
+            .iter()
+            .filter(|(id, _)| *id != source.id())
+            .flat_map(|(_, other)| other.values())
+            .chain(files.values())
+            .flat_map(|file| file.chunks.iter().map(|(chunk, _)| &chunk.id))
+            .collect();
+        for chunk in changes.upserts.iter().flat_map(|file| &file.chunks) {
+            if !ids.insert(&chunk.id) {
+                return Err(failed(format!("chunk id {} is stored twice", chunk.id)));
+            }
         }
         for file in &changes.upserts {
             files.insert(
@@ -313,6 +348,7 @@ impl ChunkStore for InMemoryStore {
                 "a rewrite may only change the tokenizer version; re-chunk with commit_index",
             ));
         }
+        ensure_current_tokenizer_and_policy(versions)?;
 
         let mut replacement: BTreeMap<&ChunkId, &IndexFields> = BTreeMap::new();
         for entry in fields {
@@ -356,6 +392,27 @@ impl ChunkStore for InMemoryStore {
     }
 }
 
+impl StampStoredVersions for InMemoryStore {
+    fn stamp_stored_versions(&self, source: &SourceId, versions: IndexVersions) {
+        let mut state = locked(&self.state);
+        let stored = state.sources.get(source).expect("a registered source");
+        let revision = stored.indexed().cloned().expect("an indexed source");
+        let aged = Source::restore(
+            stored.id().clone(),
+            stored.name().to_owned(),
+            stored.location().clone(),
+            stored.git_ref().cloned(),
+            stored.status(),
+            Some(IndexedRevision {
+                versions,
+                ..revision
+            }),
+        )
+        .expect("a restorable source");
+        state.sources.insert(source.clone(), aged);
+    }
+}
+
 impl ChunkSearcher for InMemoryStore {
     fn search(
         &self,
@@ -393,7 +450,8 @@ impl ChunkSearcher for InMemoryStore {
             })
             .collect();
         hits.sort_by(ScoredChunk::ranking_order);
-        let total_matches = hits.len();
+        let total_matches = hits.len().min(TOTAL_MATCHES_CAP);
+        let total_is_exact = hits.len() <= TOTAL_MATCHES_CAP;
         hits.truncate(limit);
 
         let revisions = hits
@@ -407,6 +465,7 @@ impl ChunkSearcher for InMemoryStore {
             hits,
             revisions,
             total_matches,
+            total_is_exact,
         })
     }
 }
@@ -718,15 +777,31 @@ impl GitClient for FakeGitClient {
             .flat_map(|commit| commit.files.values())
             .map(|content| (blob_of(content), content))
             .collect();
-        blobs
-            .iter()
-            .map(|blob| {
-                available
-                    .get(blob)
-                    .map(|content| (blob.clone(), (*content).clone()))
-                    .ok_or_else(|| GitError::NotFound(format!("blob {blob}").into()))
-            })
-            .collect()
+        let wanted: BTreeSet<&BlobOid> = blobs.iter().collect();
+        let mut contents = BTreeMap::new();
+        let mut total = 0u64;
+        for blob in wanted {
+            let content = available
+                .get(blob)
+                .ok_or_else(|| GitError::NotFound(format!("blob {blob}").into()))?;
+            let size = content.len() as u64;
+            if size > MAX_BLOB_BYTES {
+                return Err(GitError::TooLarge(
+                    format!("blob {blob} is {size} bytes, the limit is {MAX_BLOB_BYTES}").into(),
+                ));
+            }
+            total += size;
+            contents.insert(blob.clone(), (*content).clone());
+        }
+        if total > MAX_READ_BYTES {
+            return Err(GitError::TooLarge(
+                format!(
+                    "{total} bytes requested, the limit is {MAX_READ_BYTES}; slice the request"
+                )
+                .into(),
+            ));
+        }
+        Ok(contents)
     }
 
     fn remove_checkout(&self, source: &SourceId) -> Result<(), GitError> {

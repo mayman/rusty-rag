@@ -173,6 +173,110 @@ fn an_existing_clone_of_another_origin_is_not_reused() {
     );
     let origin = git_ok(&sandbox.checkout_dir(&id), &["config", "remote.origin.url"]);
     assert_eq!(origin, second.location().as_str());
+    assert!(
+        sandbox.scratch_leftovers().is_empty(),
+        "the replaced copy is gone, not left as trash"
+    );
+}
+
+#[test]
+fn a_probe_that_fails_never_replaces_the_existing_clone() {
+    let upstream = Upstream::with_files(&[("a.txt", b"1")]);
+    let sandbox = Sandbox::new();
+    let id = upstream.source_id();
+    let commit = sandbox
+        .client
+        .clone_shallow(&id, &upstream.location(), &main_ref())
+        .unwrap();
+
+    // Every local git call times out, including the one that inspects the checkout.
+    let impatient = sandbox
+        .another_client()
+        .with_timeouts(Duration::from_secs(300), Duration::from_millis(1));
+    let error = impatient
+        .clone_shallow(&id, &upstream.location(), &main_ref())
+        .unwrap_err();
+
+    assert_eq!(error, GitError::Timeout, "the probe error propagates");
+    assert!(sandbox.checkout_dir(&id).join("objects").is_dir());
+    let listing = sandbox.client.ls_tree(&id, &commit).unwrap();
+    assert_eq!(listing.entries.len(), 1, "the old checkout is intact");
+    assert!(sandbox.scratch_leftovers().is_empty());
+}
+
+#[test]
+fn a_failed_replacement_keeps_the_old_clone() {
+    let first = Upstream::with_files(&[("a.txt", b"1")]);
+    let second = Upstream::with_files(&[("b.txt", b"2")]);
+    let sandbox = Sandbox::new();
+    let id = second.source_id();
+    let old_commit = sandbox
+        .client
+        .clone_shallow(&id, &first.location(), &main_ref())
+        .unwrap();
+
+    // The origin differs, so the old copy must be replaced; the replacement fails.
+    let error = sandbox
+        .client
+        .clone_shallow(
+            &id,
+            &second.location(),
+            &GitRef::parse("no-such-branch").unwrap(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, GitError::NotFound(_)), "{error:?}");
+    let dir = sandbox.checkout_dir(&id);
+    assert_eq!(
+        git_ok(&dir, &["config", "remote.origin.url"]),
+        first.location().as_str(),
+        "the old checkout is still the first origin"
+    );
+    assert_eq!(
+        sandbox
+            .client
+            .ls_tree(&id, &old_commit)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    assert!(sandbox.scratch_leftovers().is_empty(), "no staging left");
+}
+
+#[test]
+fn a_new_clone_has_no_template_files_and_repository_hooks_never_run() {
+    let upstream = Upstream::with_files(&[("a.txt", b"1")]);
+    let sandbox = Sandbox::new();
+    let id = upstream.source_id();
+    sandbox
+        .client
+        .clone_shallow(&id, &upstream.location(), &main_ref())
+        .unwrap();
+    let dir = sandbox.checkout_dir(&id);
+    let templated: Vec<_> = std::fs::read_dir(dir.join("hooks"))
+        .map(|entries| entries.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(templated.is_empty(), "no template hooks: {templated:?}");
+    assert!(!dir.join("info").join("exclude").exists());
+
+    // A hook planted in the checkout is never run, whatever git operation fires it.
+    let marker = sandbox.layout.root().join("hook-ran");
+    let hook = dir.join("hooks").join("reference-transaction");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho ran >> \"{}\"\n",
+            marker.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    upstream.write("b.txt", b"2");
+    let newer = upstream.commit("two");
+    let fetched = sandbox.client.fetch_update(&id, &main_ref()).unwrap();
+    assert_eq!(fetched.as_str(), newer);
+    assert!(!marker.exists(), "the planted hook must not run");
 }
 
 #[test]
@@ -192,10 +296,7 @@ fn a_failed_clone_leaves_no_checkout_and_no_staging_directory() {
 
     assert!(matches!(error, GitError::NotFound(_)), "{error:?}");
     assert!(!sandbox.checkout_dir(&id).exists());
-    assert_eq!(
-        std::fs::read_dir(sandbox.layout.tmp_dir()).unwrap().count(),
-        0
-    );
+    assert!(sandbox.scratch_leftovers().is_empty());
 }
 
 #[test]

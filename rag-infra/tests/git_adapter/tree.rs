@@ -1,7 +1,7 @@
 //! ls_tree and read_blobs.
 
 use rag_core::application::error::GitError;
-use rag_core::application::ports::GitClient;
+use rag_core::application::ports::{GitClient, MAX_BLOB_BYTES};
 use rag_core::domain::git_ref::GitRef;
 use rag_core::domain::oid::{BlobOid, CommitId};
 
@@ -206,12 +206,12 @@ fn a_tree_id_is_not_a_blob() {
 }
 
 #[test]
-fn many_blobs_are_read_in_batches_and_a_large_one_is_intact() {
+fn many_blobs_in_one_process_and_a_large_one_under_the_cap_are_intact() {
     let names: Vec<String> = (0..700).map(|i| format!("files/f{i:04}.txt")).collect();
     let contents: Vec<Vec<u8>> = (0..700)
         .map(|i| format!("content {i}\n").into_bytes())
         .collect();
-    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    let big: Vec<u8> = (0..1_900_000u32).map(|i| (i % 251) as u8).collect();
     let mut files: Vec<(&str, &[u8])> = names
         .iter()
         .zip(&contents)
@@ -244,4 +244,63 @@ fn many_blobs_are_read_in_batches_and_a_large_one_is_intact() {
         .find(|e| e.path.as_str() == "files/f0123.txt")
         .unwrap();
     assert_eq!(blobs[&small.blob], b"content 123\n");
+}
+
+#[test]
+fn a_blob_over_the_blob_cap_is_refused_with_its_own_error() {
+    let at_cap = vec![b'a'; MAX_BLOB_BYTES as usize];
+    let over_cap = vec![b'b'; MAX_BLOB_BYTES as usize + 1];
+    let upstream = Upstream::with_files(&[("fits.bin", &at_cap), ("big.bin", &over_cap)]);
+    let (sandbox, _) = cloned(&upstream);
+
+    let fits = blob_of(&upstream, "fits.bin");
+    let blobs = sandbox
+        .client
+        .read_blobs(&upstream.source_id(), std::slice::from_ref(&fits))
+        .unwrap();
+    assert_eq!(blobs[&fits].len(), at_cap.len());
+
+    let error = sandbox
+        .client
+        .read_blobs(
+            &upstream.source_id(),
+            &[fits, blob_of(&upstream, "big.bin")],
+        )
+        .unwrap_err();
+    assert!(matches!(error, GitError::TooLarge(_)), "{error:?}");
+}
+
+#[test]
+fn a_request_over_the_total_read_cap_is_refused_and_slices_work() {
+    let files: Vec<(String, Vec<u8>)> = (0..6u8)
+        .map(|i| (format!("f{i}.bin"), vec![b'a' + i; 1000]))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_slice()))
+        .collect();
+    let upstream = Upstream::with_files(&refs);
+    let (sandbox, _) = cloned(&upstream);
+    let small = sandbox.another_client().with_max_read_bytes(2500);
+    let wanted: Vec<BlobOid> = files
+        .iter()
+        .map(|(name, _)| blob_of(&upstream, name))
+        .collect();
+
+    let error = small
+        .read_blobs(&upstream.source_id(), &wanted)
+        .unwrap_err();
+    assert!(matches!(error, GitError::TooLarge(_)), "{error:?}");
+
+    let first = small
+        .read_blobs(&upstream.source_id(), &wanted[..2])
+        .unwrap();
+    let rest = small
+        .read_blobs(&upstream.source_id(), &wanted[2..4])
+        .unwrap();
+    assert_eq!(
+        (first.len(), rest.len()),
+        (2, 2),
+        "requests within the cap work"
+    );
 }

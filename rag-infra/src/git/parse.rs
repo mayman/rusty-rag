@@ -44,38 +44,29 @@ pub fn parse_ls_tree(output: &[u8]) -> Result<TreeListing, String> {
     })
 }
 
-/// What `git cat-file --batch-check` says about one object.
+/// What `git cat-file --batch` answered for one requested object.
 #[derive(Debug, PartialEq, Eq)]
-pub enum ObjectInfo {
-    Blob { size: u64 },
+pub enum BatchEntry {
+    /// A blob within the size limit, with its bytes.
+    Blob(Vec<u8>),
+    /// A blob larger than the limit; its bytes were skipped.
+    TooLarge { size: u64 },
+    /// An object of another type (tree, commit, tag).
     OtherType,
+    /// No such object.
     Missing,
 }
 
-/// Parses `--batch-check` output, one line per requested object, in order.
-pub fn parse_batch_check(output: &[u8]) -> Result<Vec<ObjectInfo>, String> {
-    let text = std::str::from_utf8(output).map_err(|_| "malformed cat-file output")?;
-    text.lines()
-        .map(|line| {
-            let fields: Vec<&str> = line.split(' ').collect();
-            match fields.as_slice() {
-                [_, "missing"] | [_, "ambiguous"] => Ok(ObjectInfo::Missing),
-                [_, "blob", size] => size
-                    .parse()
-                    .map(|size| ObjectInfo::Blob { size })
-                    .map_err(|_| "malformed cat-file size".to_owned()),
-                [_, _, _] => Ok(ObjectInfo::OtherType),
-                _ => Err("malformed cat-file output".to_owned()),
-            }
-        })
-        .collect()
-}
-
-/// Splits `git cat-file --batch` output for `expected` blobs into contents. Each
-/// entry is `<oid> blob <size>\n<bytes>\n`.
-pub fn parse_batch(output: &[u8], expected: &[BlobOid]) -> Result<Vec<Vec<u8>>, String> {
+/// Splits `git cat-file --batch` output for `expected` objects, in request order.
+/// An entry is `<oid> <type> <size>\n<bytes>\n`, or `<oid> missing\n`. Blobs larger
+/// than `max_blob_bytes` are reported, not copied.
+pub fn parse_batch(
+    output: &[u8],
+    expected: &[BlobOid],
+    max_blob_bytes: u64,
+) -> Result<Vec<BatchEntry>, String> {
     let mut rest = output;
-    let mut contents = Vec::with_capacity(expected.len());
+    let mut entries = Vec::with_capacity(expected.len());
     for oid in expected {
         let newline = rest
             .iter()
@@ -84,23 +75,37 @@ pub fn parse_batch(output: &[u8], expected: &[BlobOid]) -> Result<Vec<Vec<u8>>, 
         let header =
             std::str::from_utf8(&rest[..newline]).map_err(|_| "malformed cat-file header")?;
         let fields: Vec<&str> = header.split(' ').collect();
-        let [name, "blob", size] = fields.as_slice() else {
-            return Err("unexpected cat-file header".to_owned());
-        };
-        if *name != oid.as_str() {
+        if fields.first().is_none_or(|name| *name != oid.as_str()) {
             return Err("cat-file answered out of order".to_owned());
         }
-        let size: usize = size.parse().map_err(|_| "malformed cat-file size")?;
-        let body = &rest[newline + 1..];
-        if body.len() < size + 1 {
+        let after_header = &rest[newline + 1..];
+        let (kind, size) = match fields.as_slice() {
+            [_, "missing" | "ambiguous"] => {
+                entries.push(BatchEntry::Missing);
+                rest = after_header;
+                continue;
+            }
+            [_, kind, size] => (
+                *kind,
+                size.parse::<usize>()
+                    .map_err(|_| "malformed cat-file size")?,
+            ),
+            _ => return Err("unexpected cat-file header".to_owned()),
+        };
+        if after_header.len() < size + 1 {
             return Err("truncated cat-file output".to_owned());
         }
-        contents.push(body[..size].to_vec());
-        rest = &body[size + 1..];
+        entries.push(if kind != "blob" {
+            BatchEntry::OtherType
+        } else if size as u64 > max_blob_bytes {
+            BatchEntry::TooLarge { size: size as u64 }
+        } else {
+            BatchEntry::Blob(after_header[..size].to_vec())
+        });
+        rest = &after_header[size + 1..];
     }
-    Ok(contents)
+    Ok(entries)
 }
-
 /// Reads the branch out of `git ls-remote --symref <url> HEAD`, whose first line is
 /// `ref: refs/heads/<branch>\tHEAD`.
 pub fn parse_default_branch(output: &[u8]) -> Option<String> {
@@ -180,28 +185,22 @@ mod tests {
         assert_eq!(parse_ls_tree(b"").unwrap(), TreeListing::default());
     }
 
-    #[test]
-    fn batch_check_reports_blobs_missing_and_other_objects() {
-        let output = format!("{OID} blob 42\n{OID} missing\n{OID} tree 9\n");
-        assert_eq!(
-            parse_batch_check(output.as_bytes()).unwrap(),
-            [
-                ObjectInfo::Blob { size: 42 },
-                ObjectInfo::Missing,
-                ObjectInfo::OtherType
-            ]
-        );
+    const LIMIT: u64 = 1000;
+
+    fn entry(oid: &str, kind: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!("{oid} {kind} {}\n", body.len()).into_bytes();
+        bytes.extend_from_slice(body);
+        bytes.push(b'\n');
+        bytes
     }
 
     #[test]
     fn batch_returns_exact_bytes_including_newlines_and_nul() {
         let oid = BlobOid::parse(OID).unwrap();
         let body = b"a\nb\0c\r\n";
-        let mut output = format!("{OID} blob {}\n", body.len()).into_bytes();
-        output.extend_from_slice(body);
-        output.push(b'\n');
-        let contents = parse_batch(&output, &[oid]).unwrap();
-        assert_eq!(contents, [body.to_vec()]);
+        let output = entry(OID, "blob", body);
+        let entries = parse_batch(&output, &[oid], LIMIT).unwrap();
+        assert_eq!(entries, [BatchEntry::Blob(body.to_vec())]);
     }
 
     #[test]
@@ -209,13 +208,43 @@ mod tests {
         let oid = BlobOid::parse(OID).unwrap();
         let output = format!("{OID} blob 0\n\n").into_bytes();
         assert_eq!(
-            parse_batch(&output, std::slice::from_ref(&oid)).unwrap(),
-            [Vec::<u8>::new()]
+            parse_batch(&output, std::slice::from_ref(&oid), LIMIT).unwrap(),
+            [BatchEntry::Blob(Vec::new())]
         );
         let cut = format!("{OID} blob 10\nabc").into_bytes();
-        assert!(parse_batch(&cut, &[oid]).is_err());
+        assert!(parse_batch(&cut, &[oid], LIMIT).is_err());
     }
 
+    #[test]
+    fn batch_reports_missing_other_and_oversized_objects_and_keeps_parsing() {
+        let other = "89abcdef0123456789abcdef0123456789abcdef";
+        let third = "00112233445566778899aabbccddeeff00112233";
+        let fourth = "ffeeddccbbaa99887766554433221100ffeeddcc";
+        let expected: Vec<BlobOid> = [OID, other, third, fourth]
+            .iter()
+            .map(|oid| BlobOid::parse(oid).unwrap())
+            .collect();
+        let mut output = format!("{OID} missing\n").into_bytes();
+        output.extend(entry(other, "tree", b"tree bytes"));
+        output.extend(entry(third, "blob", &vec![b'x'; LIMIT as usize + 1]));
+        output.extend(entry(fourth, "blob", b"fine"));
+        assert_eq!(
+            parse_batch(&output, &expected, LIMIT).unwrap(),
+            [
+                BatchEntry::Missing,
+                BatchEntry::OtherType,
+                BatchEntry::TooLarge { size: LIMIT + 1 },
+                BatchEntry::Blob(b"fine".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_rejects_answers_out_of_order() {
+        let oid = BlobOid::parse(OID).unwrap();
+        let output = entry("89abcdef0123456789abcdef0123456789abcdef", "blob", b"x");
+        assert!(parse_batch(&output, &[oid], LIMIT).is_err());
+    }
     #[test]
     fn default_branch_is_read_from_the_symref_line() {
         let output = format!("ref: refs/heads/trunk\tHEAD\n{OID}\tHEAD\n");

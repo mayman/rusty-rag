@@ -8,6 +8,7 @@ use rag_core::application::ports::{
 };
 use rag_core::application::testkit::{
     contract_chunk_search, contract_chunk_store, contract_commit_race, contract_source_repository,
+    StampStoredVersions,
 };
 use rag_core::domain::chunk::Chunk;
 use rag_core::domain::chunk_id::ChunkId;
@@ -18,19 +19,19 @@ use rag_core::domain::query::{Query, QueryMode};
 use rag_core::domain::search_filters::SearchFilters;
 use rag_core::domain::source::Source;
 use rag_core::domain::source_id::SourceId;
-use rag_infra::sqlite::SqliteStore;
+use rag_infra::sqlite::{SqliteStore, DATABASE_FILE};
 use tempfile::TempDir;
 
 /// A store plus the temp directory that holds its database.
 struct TempStore {
     store: SqliteStore,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 fn temp_store() -> TempStore {
     let dir = tempfile::tempdir().expect("temp dir");
-    let store = SqliteStore::open(dir.path()).expect("open store");
-    TempStore { store, _dir: dir }
+    let store = SqliteStore::open_for_write(dir.path()).expect("open store");
+    TempStore { store, dir }
 }
 
 impl SourceRepository for TempStore {
@@ -94,6 +95,31 @@ impl ChunkSearcher for TempStore {
         limit: usize,
     ) -> Result<SearchOutcome, StorageError> {
         self.store.search(query, mode, filters, limit)
+    }
+}
+
+/// Ages a stored index the way an older build would have left it: an UPDATE through
+/// a second connection, since no port can stamp other tokenizer or policy versions.
+impl StampStoredVersions for TempStore {
+    fn stamp_stored_versions(&self, source: &SourceId, versions: IndexVersions) {
+        let connection = rusqlite::Connection::open(self.dir.path().join(DATABASE_FILE))
+            .expect("second connection");
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("busy timeout");
+        let changed = connection
+            .execute(
+                "UPDATE sources SET tokenizer_version = ?2, chunker_version = ?3, \
+                 policy_version = ?4 WHERE source_id = ?1 AND indexed_commit IS NOT NULL",
+                (
+                    source.as_str(),
+                    versions.tokenizer,
+                    versions.chunker,
+                    versions.policy,
+                ),
+            )
+            .expect("stamp versions");
+        assert_eq!(changed, 1, "an indexed source to stamp");
     }
 }
 

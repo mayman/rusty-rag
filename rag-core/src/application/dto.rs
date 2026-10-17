@@ -80,8 +80,11 @@ pub struct SearchResponse {
     /// `and` or `or_fallback`.
     pub mode: String,
     /// Chunks that matched the query before the per-file cap and before paging
-    /// (`Retrieval::total_matches`).
+    /// (`Retrieval::total_matches`). Counted up to 1000: when `total_is_exact` is
+    /// false this is "at least that many", not the exact number.
     pub total_hits: usize,
+    /// Whether `total_hits` is exact (`Retrieval::total_is_exact`).
+    pub total_is_exact: bool,
     /// Number of entries in `results`.
     pub returned: usize,
     /// The requested offset: hits skipped after the per-file cap.
@@ -213,6 +216,7 @@ mod tests {
             query: "parse".into(),
             mode: "and".into(),
             total_hits: 1,
+            total_is_exact: true,
             returned: 1,
             offset: 0,
             has_more: false,
@@ -221,7 +225,7 @@ mod tests {
             hint: None,
         };
         let expected = concat!(
-            r#"{"schema_version":1,"query":"parse","mode":"and","total_hits":1,"#,
+            r#"{"schema_version":1,"query":"parse","mode":"and","total_hits":1,"total_is_exact":true,"#,
             r#""returned":1,"offset":0,"has_more":false,"truncated":false,"results":["#,
             r#"{"id":"<ID>","rank":1,"score":2.5,"score_rel":1.0,"repo":"github.com/o/r","#,
             r#""commit":"abc1234","indexed_at":"2023-11-14T22:13:20Z","path":"src/x.rs","#,
@@ -257,12 +261,14 @@ mod tests {
     #[test]
     fn pagination_fields_are_the_values_retrieval_derives() {
         // total_hits = Retrieval::total_matches (matching chunks before the per-file
-        // cap), has_more = Retrieval::has_more, offset = the requested offset.
+        // cap, at least when not exact), total_is_exact = Retrieval::total_is_exact,
+        // has_more = Retrieval::has_more, offset = the requested offset.
         let response = SearchResponse {
             schema_version: SCHEMA_VERSION,
             query: "parse".into(),
             mode: "and".into(),
             total_hits: 42,
+            total_is_exact: false,
             returned: 5,
             offset: 10,
             has_more: true,
@@ -272,7 +278,9 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(
-            json.contains(r#""total_hits":42,"returned":5,"offset":10,"has_more":true"#),
+            json.contains(
+                r#""total_hits":42,"total_is_exact":false,"returned":5,"offset":10,"has_more":true"#
+            ),
             "{json}"
         );
     }
@@ -284,6 +292,7 @@ mod tests {
             query: "zzz".into(),
             mode: "or_fallback".into(),
             total_hits: 0,
+            total_is_exact: true,
             returned: 0,
             offset: 0,
             has_more: false,

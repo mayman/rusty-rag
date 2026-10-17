@@ -32,7 +32,9 @@ pub fn test_git(dir: &Path) -> Command {
             "protocol.file.allow=always",
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Pointing at a file that does not exist: no global configuration at all.
+        .env("GIT_CONFIG_GLOBAL", dir.join("no-global-gitconfig-here"));
     command
 }
 
@@ -190,7 +192,8 @@ impl Sandbox {
         let temp = tempfile::tempdir().expect("temp dir");
         let layout = DataLayout::new(temp.path().join("data"));
         layout.ensure_dirs().unwrap();
-        let client = SystemGitClient::new(layout.repos_dir(), layout.tmp_dir());
+        let client =
+            SystemGitClient::new(layout.repos_dir(), layout.tmp_dir()).with_isolated_config();
         Self {
             _temp: temp,
             layout,
@@ -200,5 +203,22 @@ impl Sandbox {
 
     pub fn checkout_dir(&self, source: &SourceId) -> PathBuf {
         self.layout.repos_dir().join(source.checkout_dir_name())
+    }
+
+    /// A second client over the same directories (to give it other limits).
+    pub fn another_client(&self) -> SystemGitClient {
+        SystemGitClient::new(self.layout.repos_dir(), self.layout.tmp_dir()).with_isolated_config()
+    }
+
+    /// Names in the scratch directory, apart from the empty hooks directory the
+    /// client keeps there for good.
+    pub fn scratch_leftovers(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.layout.tmp_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "no-hooks")
+            .collect();
+        names.sort();
+        names
     }
 }

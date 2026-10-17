@@ -3,12 +3,14 @@
 //! Run `And`; when it matches nothing and the query has several words, run
 //! `OrFallback` and report that mode. The page is `offset` to `offset + k` of the
 //! hits that survive the per-file cap. One more hit is selected than the page needs
-//! (`offset + k + 1`) so `has_more` is exact. Because the cap can discard many of
-//! the searcher's candidates, the candidate limit starts at `CANDIDATES_PER_HIT`
-//! per wanted hit and doubles, up to `MAX_CANDIDATES`, while the cap leaves the
-//! selection short and the searcher has more matches to give. If the ceiling stops
-//! the search with matches left unexamined and no hit past the page, `has_more` is
-//! true: a next page may exist, and saying so is safer than hiding it.
+//! (`offset + k + 1`) so `has_more` is exact.
+//!
+//! Each mode costs one searcher call. A search ranks every match whatever the limit
+//! is, so asking for a small limit and then widening it would only repeat that work:
+//! the searcher is asked once for `MAX_CANDIDATES` candidates (one more, as a probe
+//! that tells whether the searcher had matches left). If the ceiling stops the
+//! selection short of a hit past the page and candidates were left unexamined,
+//! `has_more` is true: a next page may exist, and saying so is safer than hiding it.
 
 use std::collections::BTreeMap;
 
@@ -21,9 +23,7 @@ use crate::domain::search_filters::SearchFilters;
 use crate::domain::source::IndexedRevision;
 use crate::domain::source_id::SourceId;
 
-/// Candidates requested from the searcher per wanted hit, on the first attempt.
-pub const CANDIDATES_PER_HIT: usize = 10;
-/// The most candidates a single search asks for (more only when one page needs more).
+/// The most candidates a single search examines (more only when one page needs more).
 pub const MAX_CANDIDATES: usize = 5000;
 
 /// One page of hits and what is known about the rest.
@@ -35,8 +35,11 @@ pub struct Retrieval {
     pub hits: Vec<ScoredChunk>,
     /// Whether at least one more hit follows the page.
     pub has_more: bool,
-    /// Chunks that matched in `mode`, before the per-file cap and paging.
+    /// Chunks that matched in `mode`, before the per-file cap and paging, counted
+    /// up to `TOTAL_MATCHES_CAP`. A lower bound when `total_is_exact` is false.
     pub total_matches: usize,
+    /// Whether `total_matches` is the exact count.
+    pub total_is_exact: bool,
     /// Revisions of the sources that appear in the searcher's hits.
     pub revisions: BTreeMap<SourceId, IndexedRevision>,
 }
@@ -57,82 +60,83 @@ pub fn retrieve(
             hits: Vec::new(),
             has_more: false,
             total_matches: 0,
+            total_is_exact: true,
             revisions: BTreeMap::new(),
         });
     }
     let wanted = offset.saturating_add(k).saturating_add(1);
     loop {
-        let widened = select_widening(searcher, query, mode, filters, wanted)?;
+        let examined = examine(searcher, query, mode, filters, wanted)?;
         match query.fallback_after(mode) {
-            Some(next) if widened.total_matches == 0 => mode = next,
+            Some(next) if examined.total_matches == 0 => mode = next,
             _ => {
                 // A hit follows the page when one was selected past it. When the
                 // search stopped at the ceiling with candidates left unexamined,
                 // more hits cannot be ruled out, so claim them rather than hide
                 // a next page.
                 let has_more =
-                    widened.selected.len() > offset.saturating_add(k) || !widened.exhausted;
+                    examined.selected.len() > offset.saturating_add(k) || !examined.exhausted;
                 return Ok(Retrieval {
                     mode,
-                    hits: widened.selected.into_iter().skip(offset).take(k).collect(),
+                    hits: examined.selected.into_iter().skip(offset).take(k).collect(),
                     has_more,
-                    total_matches: widened.total_matches,
-                    revisions: widened.revisions,
+                    total_matches: examined.total_matches,
+                    total_is_exact: examined.total_is_exact,
+                    revisions: examined.revisions,
                 });
             }
         }
     }
 }
 
-/// What the widening search settled on.
-struct Widened {
+/// What one searcher call settled on.
+struct Examined {
     /// Up to `wanted` hits after the per-file cap, best first.
     selected: Vec<ScoredChunk>,
-    /// Whether the searcher returned every one of its matches (nothing was left
-    /// unexamined behind the candidate limit).
+    /// Whether the searcher had no match beyond the examined candidates.
     exhausted: bool,
     total_matches: usize,
+    total_is_exact: bool,
     revisions: BTreeMap<SourceId, IndexedRevision>,
 }
 
-/// Up to `wanted` hits after the per-file cap. Doubles the candidate limit while
-/// the cap leaves fewer than `wanted` and the searcher has more to give.
-fn select_widening(
+/// Up to `wanted` hits after the per-file cap, from one search of at most
+/// `MAX_CANDIDATES` candidates.
+fn examine(
     searcher: &dyn ChunkSearcher,
     query: &Query,
     mode: QueryMode,
     filters: &SearchFilters,
     wanted: usize,
-) -> Result<Widened, StorageError> {
+) -> Result<Examined, StorageError> {
     let ceiling = MAX_CANDIDATES.max(wanted);
-    let mut limit = wanted.saturating_mul(CANDIDATES_PER_HIT).min(ceiling);
-    loop {
-        let SearchOutcome {
-            hits,
-            revisions,
-            total_matches,
-        } = searcher.search(query, mode, filters, limit)?;
-        let exhausted = hits.len() < limit || hits.len() >= total_matches;
-        let selected = select_hits(hits, wanted);
-        if selected.len() >= wanted || exhausted || limit >= ceiling {
-            return Ok(Widened {
-                selected,
-                exhausted,
-                total_matches,
-                revisions,
-            });
-        }
-        limit = limit.saturating_mul(2).min(ceiling);
-    }
+    // One candidate beyond the ceiling is a probe: if it comes back, matches were
+    // left unexamined. The total cannot tell, because it is capped.
+    let SearchOutcome {
+        mut hits,
+        revisions,
+        total_matches,
+        total_is_exact,
+    } = searcher.search(query, mode, filters, ceiling.saturating_add(1))?;
+    let exhausted = hits.len() <= ceiling;
+    hits.truncate(ceiling);
+    Ok(Examined {
+        selected: select_hits(hits, wanted),
+        exhausted,
+        total_matches,
+        total_is_exact,
+        revisions,
+    })
 }
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    use super::{retrieve, Retrieval, CANDIDATES_PER_HIT, MAX_CANDIDATES};
+    use super::{retrieve, Retrieval, MAX_CANDIDATES};
     use crate::application::error::StorageError;
-    use crate::application::ports::{ChunkSearcher, SearchOutcome};
+    use crate::application::ports::{ChunkSearcher, SearchOutcome, TOTAL_MATCHES_CAP};
     use crate::domain::index_versions::IndexVersions;
     use crate::domain::indexed_at::IndexedAt;
     use crate::domain::oid::CommitId;
@@ -195,7 +199,8 @@ mod tests {
             Ok(SearchOutcome {
                 hits: all.iter().take(limit).cloned().collect(),
                 revisions,
-                total_matches: all.len(),
+                total_matches: all.len().min(TOTAL_MATCHES_CAP),
+                total_is_exact: all.len() <= TOTAL_MATCHES_CAP,
             })
         }
     }
@@ -268,12 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn asks_for_the_page_plus_one_hit_with_headroom_for_the_file_cap() {
+    fn asks_the_searcher_once_for_the_candidate_ceiling_plus_one_probe() {
         let searcher = Scripted::new(vec![scored("a.rs", 1, 1.0)], vec![]);
         run(&searcher, "alpha", 4, 3);
         assert_eq!(
-            searcher.calls()[0],
-            (QueryMode::And, (4 + 3 + 1) * CANDIDATES_PER_HIT)
+            searcher.calls(),
+            [(QueryMode::And, MAX_CANDIDATES + 1)],
+            "one call; the extra candidate only tells whether the searcher had more"
         );
     }
 
@@ -339,30 +345,18 @@ mod tests {
     }
 
     #[test]
-    fn widens_the_candidate_limit_while_the_cap_leaves_the_page_short() {
+    fn a_page_the_file_cap_leaves_short_is_not_retried_with_more_candidates() {
         let mut ranked = one_file("a.rs", 100, 500.0);
         ranked.push(scored("b.rs", 1, 1.0));
         let searcher = Scripted::new(ranked, vec![]);
         let result = run(&searcher, "alpha", 0, 3);
         assert_eq!(names(&result.hits), ["a.rs:1", "a.rs:2", "b.rs:1"]);
         assert!(!result.has_more);
-        assert_eq!(
-            searcher.limits(),
-            [40, 80, 160],
-            "doubles from (offset + k + 1) * {CANDIDATES_PER_HIT} until b.rs is reached"
-        );
+        assert_eq!(searcher.limits().len(), 1, "no widening loop");
     }
 
     #[test]
-    fn does_not_widen_once_the_searcher_is_exhausted() {
-        let searcher = Scripted::new(one_file("a.rs", 5, 9.0), vec![]);
-        let result = run(&searcher, "alpha", 0, 3);
-        assert_eq!(result.hits.len(), 2);
-        assert_eq!(searcher.limits(), [40], "all 5 matches came back at once");
-    }
-
-    #[test]
-    fn widening_stops_at_the_ceiling() {
+    fn a_ceiling_that_stops_the_search_with_matches_left_reports_more() {
         let searcher = Scripted::new(one_file("a.rs", MAX_CANDIDATES + 500, 9000.0), vec![]);
         let result = run(&searcher, "alpha", 0, 2);
         assert_eq!(result.hits.len(), 2);
@@ -370,20 +364,17 @@ mod tests {
             result.has_more,
             "500 candidates were never examined, so more hits cannot be ruled out"
         );
-        let limits = searcher.limits();
-        assert_eq!(limits.last(), Some(&MAX_CANDIDATES));
-        assert!(limits.windows(2).all(|w| w[1] > w[0]), "{limits:?}");
-        assert!(limits.iter().all(|l| *l <= MAX_CANDIDATES), "{limits:?}");
+        assert_eq!(searcher.limits().len(), 1);
     }
 
     #[test]
     fn has_more_is_exact_when_the_ceiling_exactly_exhausts_the_searcher() {
         let searcher = Scripted::new(one_file("a.rs", MAX_CANDIDATES, 9000.0), vec![]);
         let result = run(&searcher, "alpha", 0, 2);
-        assert_eq!(searcher.limits().last(), Some(&MAX_CANDIDATES));
         assert!(
             !result.has_more,
-            "every match was examined and the cap dropped them all"
+            "every match was examined and the cap dropped them all, even though the \
+             reported total is only a lower bound"
         );
     }
 
@@ -410,6 +401,24 @@ mod tests {
             result.total_matches, 12,
             "matches before the page and the cap"
         );
+        assert!(result.total_is_exact);
         assert_eq!(result.revisions.len(), 1);
+    }
+
+    #[test]
+    fn a_total_above_the_searcher_cap_is_a_lower_bound() {
+        let searcher = Scripted::new(files(TOTAL_MATCHES_CAP + 200), vec![]);
+        let result = run(&searcher, "alpha", 0, 3);
+        assert_eq!(result.total_matches, TOTAL_MATCHES_CAP);
+        assert!(!result.total_is_exact, "at least {TOTAL_MATCHES_CAP}");
+        assert!(result.has_more);
+    }
+
+    #[test]
+    fn a_zero_k_retrieval_reports_an_exact_zero() {
+        let searcher = Scripted::new(files(3), vec![]);
+        let result = run(&searcher, "alpha", 0, 0);
+        assert_eq!(result.total_matches, 0);
+        assert!(result.total_is_exact);
     }
 }

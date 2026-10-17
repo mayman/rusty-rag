@@ -1,8 +1,10 @@
 //! Data directory resolution and layout.
 //!
 //! The root is `RUSTY_RAG_HOME` when set (and non-empty, absolute), otherwise
-//! `<OS data dir>/rag` (`dirs::data_dir`). Resolution is a pure function of an
-//! environment lookup, so tests never touch the real environment.
+//! `<OS local data dir>/rag` (`dirs::data_local_dir`: `%LOCALAPPDATA%` on Windows,
+//! never the roaming profile, since an index and its clones are machine-local and
+//! large). Resolution is a pure function of an environment lookup, so tests never
+//! touch the real environment.
 //!
 //! ```text
 //! <root>/index.db        the SQLite index
@@ -10,6 +12,11 @@
 //! <root>/locks/          per-source operation lock files
 //! <root>/tmp/            scratch space (clone staging); safe to empty at start
 //! ```
+//!
+//! `repos/` and `tmp/` are both children of the root, so they are on one volume
+//! unless somebody mounts or links one of them elsewhere. The git adapter builds a
+//! clone in `tmp/` and renames it into `repos/`, which only works within a volume;
+//! `DataLayout::verify_same_volume` checks that with a probe rename.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -26,6 +33,12 @@ pub enum ConfigError {
     RelativeHome,
     #[error("cannot create data directory {path}: {message}")]
     CreateFailed { path: String, message: String },
+    #[error("cannot move a file from {from} to {to} (are they on different volumes?): {message}")]
+    CannotMoveBetweenDirs {
+        from: String,
+        to: String,
+        message: String,
+    },
 }
 
 /// Where everything `rag` stores lives.
@@ -57,10 +70,15 @@ impl DataLayout {
             .ok_or(ConfigError::NoDataDirectory)
     }
 
+    /// The OS default parent of the root: the local (non-roaming) data directory.
+    pub fn os_default_dir() -> Option<PathBuf> {
+        dirs::data_local_dir()
+    }
+
     /// Resolves from the real process environment and the OS defaults. Used by the
     /// composition root only.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        Self::resolve(|name| std::env::var_os(name), dirs::data_dir())
+        Self::resolve(|name| std::env::var_os(name), Self::os_default_dir())
     }
 
     pub fn root(&self) -> &Path {
@@ -81,6 +99,24 @@ impl DataLayout {
 
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
+    }
+
+    /// Checks that a file can be renamed from `tmp/` into `repos/` (the move a clone
+    /// makes), which fails across volumes. Both directories must exist
+    /// (`ensure_dirs`). Leaves nothing behind.
+    pub fn verify_same_volume(&self) -> Result<(), ConfigError> {
+        let from = self.tmp_dir().join(".volume-probe");
+        let to = self.repos_dir().join(".volume-probe");
+        let failure = |message: String| ConfigError::CannotMoveBetweenDirs {
+            from: self.tmp_dir().display().to_string(),
+            to: self.repos_dir().display().to_string(),
+            message,
+        };
+        std::fs::write(&from, b"").map_err(|error| failure(error.to_string()))?;
+        let moved = std::fs::rename(&from, &to);
+        let _ = std::fs::remove_file(&from);
+        let _ = std::fs::remove_file(&to);
+        moved.map_err(|error| failure(error.to_string()))
     }
 
     /// Creates the root and its subdirectories. Repeatable.

@@ -62,7 +62,7 @@ fn ready(source: &Source, n: u8) -> Source {
 }
 
 fn open(dir: &TempDir) -> SqliteStore {
-    SqliteStore::open(dir.path()).expect("open")
+    SqliteStore::open_for_write(dir.path()).expect("open")
 }
 
 /// Registers `name` and commits `files` as commit 1.
@@ -106,21 +106,10 @@ fn the_database_runs_in_wal_mode() {
 }
 
 #[test]
-fn open_existing_reports_a_missing_index() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(matches!(
-        SqliteStore::open_existing(dir.path()),
-        Err(StorageError::IndexMissing)
-    ));
-    drop(open(&dir));
-    assert!(SqliteStore::open_existing(dir.path()).is_ok());
-}
-
-#[test]
 fn open_creates_a_missing_data_directory() {
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("a").join("b");
-    assert!(SqliteStore::open(&nested).is_ok());
+    assert!(SqliteStore::open_for_write(&nested).is_ok());
     assert!(nested.join(DATABASE_FILE).is_file());
 }
 
@@ -235,7 +224,9 @@ fn scores_are_positive_and_higher_means_better() {
 #[test]
 fn a_writer_that_cannot_get_the_lock_in_time_is_busy() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SqliteStore::open_with_busy_timeout(dir.path(), Duration::from_millis(50)).unwrap();
+    let store =
+        SqliteStore::open_for_write_with_busy_timeout(dir.path(), Duration::from_millis(50))
+            .unwrap();
     let source = Source::register(source_id("one"), "one", location("one"));
 
     let blocker = raw(&dir);
@@ -254,7 +245,9 @@ fn a_writer_that_cannot_get_the_lock_in_time_is_busy() {
 #[test]
 fn readers_and_searches_are_not_blocked_by_a_writer() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SqliteStore::open_with_busy_timeout(dir.path(), Duration::from_millis(50)).unwrap();
+    let store =
+        SqliteStore::open_for_write_with_busy_timeout(dir.path(), Duration::from_millis(50))
+            .unwrap();
     let s = source_id("one");
     index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)]);
 
@@ -454,4 +447,309 @@ fn versions_are_stamped_per_source_in_the_database() {
             i64::from(current.policy)
         )
     );
+}
+
+fn directory_listing(dir: &TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Makes a directory unwritable for the current user until dropped (an ACL deny on
+/// Windows, mode 0555 elsewhere).
+struct UnwritableDir {
+    path: std::path::PathBuf,
+}
+
+impl UnwritableDir {
+    #[cfg(windows)]
+    fn new(path: &std::path::Path) -> Self {
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/deny")
+            .arg(format!("{user}:(OI)(CI)(WD,AD)"))
+            .output()
+            .expect("icacls")
+            .status;
+        assert!(status.success(), "icacls /deny failed");
+        Self { path: path.into() }
+    }
+
+    #[cfg(unix)]
+    fn new(path: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        Self { path: path.into() }
+    }
+}
+
+impl Drop for UnwritableDir {
+    #[cfg(windows)]
+    fn drop(&mut self) {
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let _ = std::process::Command::new("icacls")
+            .arg(&self.path)
+            .arg("/remove:d")
+            .arg(user)
+            .output();
+    }
+
+    #[cfg(unix)]
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn open_for_read_reports_a_missing_index_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        SqliteStore::open_for_read(dir.path()),
+        Err(StorageError::IndexMissing)
+    ));
+    let absent = dir.path().join("not").join("there");
+    assert!(matches!(
+        SqliteStore::open_for_read(&absent),
+        Err(StorageError::IndexMissing)
+    ));
+    assert!(directory_listing(&dir).is_empty(), "nothing was created");
+
+    std::fs::write(dir.path().join(DATABASE_FILE), b"").unwrap();
+    assert!(
+        matches!(
+            SqliteStore::open_for_read(dir.path()),
+            Err(StorageError::IndexMissing)
+        ),
+        "a file without the schema is no index"
+    );
+    assert_eq!(
+        std::fs::metadata(dir.path().join(DATABASE_FILE))
+            .unwrap()
+            .len(),
+        0,
+        "the read path did not initialise it"
+    );
+}
+
+#[test]
+fn open_for_read_searches_and_changes_nothing_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = open(&dir);
+        let s = source_id("one");
+        index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)]);
+    }
+    let before = directory_listing(&dir);
+    let modified = std::fs::metadata(dir.path().join(DATABASE_FILE))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    let reader = SqliteStore::open_for_read(dir.path()).expect("open for read");
+    assert_eq!(find(&reader, "alpha"), ["a.md"]);
+    assert_eq!(reader.list().unwrap().len(), 1);
+    drop(reader);
+
+    assert_eq!(directory_listing(&dir), before, "no files were created");
+    assert_eq!(
+        std::fs::metadata(dir.path().join(DATABASE_FILE))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified,
+        "the database file was not written"
+    );
+}
+
+#[test]
+fn open_for_read_succeeds_while_another_connection_holds_begin_immediate() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = open(&dir);
+        let s = source_id("one");
+        index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)]);
+    }
+    let blocker = raw(&dir);
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = std::time::Instant::now();
+    let reader = SqliteStore::open_for_read(dir.path()).expect("not blocked by the writer");
+    assert_eq!(find(&reader, "alpha"), ["a.md"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the read path never waits for the writer lock"
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn open_for_read_works_in_a_directory_that_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = open(&dir);
+        let s = source_id("one");
+        index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)]);
+    }
+    let before = directory_listing(&dir);
+    let _unwritable = UnwritableDir::new(dir.path());
+
+    let reader = SqliteStore::open_for_read(dir.path()).expect("a read-only directory is fine");
+    assert_eq!(find(&reader, "alpha"), ["a.md"]);
+    let source = Source::register(source_id("two"), "two", location("two"));
+    assert!(matches!(reader.save(&source), Err(StorageError::Failed(_))));
+    drop(reader);
+    assert_eq!(directory_listing(&dir), before);
+}
+
+#[test]
+fn a_read_only_store_refuses_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = source_id("one");
+    let indexed = {
+        let store = open(&dir);
+        index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)])
+    };
+    let reader = SqliteStore::open_for_read(dir.path()).unwrap();
+    let next = ready(&indexed, 2);
+    assert!(matches!(
+        reader.commit_index(&next, Some(&commit_id(1)), &IndexChanges::default()),
+        Err(StorageError::Failed(_))
+    ));
+    assert!(matches!(
+        reader.remove_source(&s),
+        Err(StorageError::Failed(_))
+    ));
+    assert!(matches!(
+        reader.rewrite_index_fields(&s, &[], IndexVersions::current()),
+        Err(StorageError::Failed(_))
+    ));
+    assert_eq!(find(&reader, "alpha"), ["a.md"], "reads still work");
+}
+
+/// A database whose `meta` says `schema_version` is `found` and which holds nothing
+/// else: what a future (or past) build would have left.
+fn database_with_schema_version(dir: &TempDir, found: &str) {
+    raw(dir)
+        .execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; \
+             INSERT INTO meta VALUES ('schema_version', '{found}'), ('fts_tokenizer', 'x');"
+        ))
+        .unwrap();
+}
+
+fn schema_objects(dir: &TempDir) -> Vec<String> {
+    let connection = raw(dir);
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master ORDER BY name")
+        .unwrap();
+    let rows = statement.query_map([], |row| row.get(0)).unwrap();
+    rows.map(|row| row.unwrap()).collect()
+}
+
+#[test]
+fn another_schema_version_is_refused_before_any_ddl_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    database_with_schema_version(&dir, "999");
+    let before = schema_objects(&dir);
+
+    let write = SqliteStore::open_for_write(dir.path());
+    assert!(
+        matches!(write, Err(StorageError::Failed(_))),
+        "open_for_write: {write:?}"
+    );
+    let read = SqliteStore::open_for_read(dir.path());
+    assert!(
+        matches!(read, Err(StorageError::Failed(_))),
+        "open_for_read: {read:?}"
+    );
+    assert_eq!(
+        schema_objects(&dir),
+        before,
+        "no table was created in a database of another version"
+    );
+}
+
+#[test]
+fn another_fts_tokenizer_configuration_is_refused_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(&dir));
+    raw(&dir)
+        .execute(
+            "UPDATE meta SET value = 'porter' WHERE key = 'fts_tokenizer'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        SqliteStore::open_for_write(dir.path()),
+        Err(StorageError::Failed(_))
+    ));
+    assert!(matches!(
+        SqliteStore::open_for_read(dir.path()),
+        Err(StorageError::Failed(_))
+    ));
+}
+
+#[test]
+fn a_bulk_commit_checkpoints_and_truncates_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let s = source_id("one");
+    let files: Vec<IndexedFile> = (0..300)
+        .map(|i| {
+            file(
+                &s,
+                &format!("bulk/f{i:03}.txt"),
+                &format!(
+                    "needle {}",
+                    "filler words to make the pages busy ".repeat(40)
+                ),
+                (i % 200) as u8,
+            )
+        })
+        .collect();
+    index(&store, "one", files);
+
+    let wal = dir.path().join(format!("{DATABASE_FILE}-wal"));
+    let size = std::fs::metadata(&wal).map_or(0, |m| m.len());
+    assert_eq!(size, 0, "the WAL was checkpointed and truncated");
+    assert_eq!(find(&store, "needle").len(), 50, "the data is intact");
+}
+
+#[test]
+fn a_checkpoint_never_waits_for_a_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        SqliteStore::open_for_write_with_busy_timeout(dir.path(), Duration::from_secs(30)).unwrap();
+    let s = source_id("one");
+    let base = index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)]);
+
+    // A reader that keeps its snapshot open blocks a TRUNCATE checkpoint.
+    let reader = raw(&dir);
+    reader.execute_batch("BEGIN").unwrap();
+    reader
+        .query_row("SELECT COUNT(*) FROM chunks", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    store
+        .commit_index(
+            &ready(&base, 2),
+            Some(&commit_id(1)),
+            &upserts(vec![file(&s, "b.md", "# Two\nbeta", 2)]),
+        )
+        .expect("the commit succeeds although the checkpoint cannot finish");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the writer did not wait for the reader ({:?})",
+        started.elapsed()
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(find(&store, "beta"), ["b.md"]);
 }

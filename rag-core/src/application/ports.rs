@@ -110,9 +110,17 @@ pub trait ChunkStore: Send + Sync {
     ///   `removals`; otherwise `Failed`. A partial change set would leave chunks
     ///   from two versions in one index. The first index of a source carries any
     ///   versions.
+    /// - The tokenizer and policy versions of `source`'s revision must be the current
+    ///   ones (`IndexVersions::current()`): the adapter stores fields the current
+    ///   domain computed, so it cannot stamp them as made by other rules. The
+    ///   chunker version is stored as given and is covered by the rule above. Any
+    ///   other value is `Failed`.
     /// - A name clash with another source gives `NameTaken`.
     /// - Changes naming a chunk of another source or path, the same path twice among
     ///   the upserts, or a path both upserted and removed are rejected with `Failed`.
+    /// - Chunk ids are unique in the store: a chunk id that appears twice in
+    ///   `changes`, or that a stored file which stays also has, is `Failed`. A file
+    ///   that is replaced may reuse the ids of the chunks it replaces.
     /// - The adapter stores `Chunk::index_fields()` verbatim and never tokenizes on
     ///   its own; heading paths are stored as lists, not joined text.
     fn commit_index(
@@ -157,8 +165,10 @@ pub trait ChunkStore: Send + Sync {
     /// reindex; chunk rows are untouched). `fields` must name exactly the stored
     /// chunks, each once; otherwise, or when the source has no indexed revision, or
     /// when `versions` changes the chunker or policy version (those need
-    /// `commit_index` with every file re-chunked), `Failed` and nothing changes.
-    /// Works on a stale index.
+    /// `commit_index` with every file re-chunked), or when `versions` is not the
+    /// current tokenizer and policy (`IndexVersions::current()`: the fields were
+    /// computed by this build), `Failed` and nothing changes. Works on a stale
+    /// index; its job is to bring the tokenizer version up to the current one.
     fn rewrite_index_fields(
         &self,
         source: &SourceId,
@@ -176,9 +186,19 @@ pub struct SearchOutcome {
     /// same transaction as the hits.
     pub revisions: BTreeMap<SourceId, IndexedRevision>,
     /// How many chunks match in all, before `limit` (and before the per-file cap,
-    /// which the caller applies).
+    /// which the caller applies), counted only up to `TOTAL_MATCHES_CAP`. Read it
+    /// together with `total_is_exact`: when that is false, the real count is larger
+    /// and this value is `TOTAL_MATCHES_CAP`, a lower bound ("at least").
     pub total_matches: usize,
+    /// Whether `total_matches` is the exact count (it did not reach the cap). A
+    /// searcher counts at most `TOTAL_MATCHES_CAP + 1` matches, so the cost of a
+    /// search stays bounded however common the query terms are.
+    pub total_is_exact: bool,
 }
+
+/// The most matches a search counts. A larger number of matches is reported as this
+/// value with `SearchOutcome::total_is_exact` false.
+pub const TOTAL_MATCHES_CAP: usize = 1000;
 
 /// Full-text search over stored chunks.
 pub trait ChunkSearcher: Send + Sync {
@@ -193,6 +213,9 @@ pub trait ChunkSearcher: Send + Sync {
     /// fold diacritics. Scores are higher for better matches (the adapter negates
     /// bm25) and comparable within one search only. The only ordering guarantees are
     /// determinism and the tie-break of `ScoredChunk::ranking_order`.
+    ///
+    /// The cost of a search is that of ranking every match, whatever `limit` is; the
+    /// match count is capped (`TOTAL_MATCHES_CAP`, see `SearchOutcome`).
     ///
     /// Fails with `ReindexRequired` when a source the query touches (one of
     /// `filters.sources`, or any searchable source when that list is empty) was
@@ -214,6 +237,15 @@ pub struct TreeListing {
     /// Paths that failed `RepoPath::from_git` and were skipped.
     pub skipped_unsafe: usize,
 }
+
+/// The largest blob `GitClient::read_blobs` reads. Larger ones fail with
+/// `GitError::TooLarge`. Twice the size cap of the index policy (1 MiB), so every
+/// file the policy accepts can be read.
+pub const MAX_BLOB_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The most content one `GitClient::read_blobs` call reads (the sum of the blob
+/// sizes). A larger request fails with `GitError::TooLarge`; callers slice.
+pub const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Operations on the local object database of each source, by the system `git`.
 /// The adapter decides where it lives (a directory named by
@@ -249,7 +281,15 @@ pub trait GitClient: Send + Sync {
     fn ls_tree(&self, source: &SourceId, commit: &CommitId) -> Result<TreeListing, GitError>;
 
     /// The bytes of each requested blob, keyed by blob id (duplicates collapse).
-    /// Fails with `NotFound` when any blob is missing from the source.
+    /// Fails with `NotFound` when any blob is missing from the source, with
+    /// `Failed` when an id is not a blob, and with `TooLarge` when a blob is larger
+    /// than `MAX_BLOB_BYTES` or the blobs together are larger than `MAX_READ_BYTES`.
+    /// (The index policy skips files above its own, smaller cap before they get
+    /// here, so a `TooLarge` blob means the caller asked for one it should not.)
+    ///
+    /// The whole result is held in memory, so **callers must slice their
+    /// requests**: ask for blobs whose sizes (known from `ls_tree`) add up to at
+    /// most `MAX_READ_BYTES` per call, and call again for the rest.
     fn read_blobs(
         &self,
         source: &SourceId,

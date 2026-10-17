@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crate::application::error::StorageError;
 use crate::application::ports::{
     ChunkSearcher, ChunkStore, IndexChanges, IndexedFile, OperationLock, ReindexedChunk,
-    SearchOutcome, SourceRepository,
+    SearchOutcome, SourceRepository, TOTAL_MATCHES_CAP,
 };
 use crate::application::retrieval::retrieve;
 use crate::domain::chunk::Chunk;
@@ -187,12 +187,20 @@ fn reindexed_fields<S: ChunkStore>(store: &S, id: &SourceId) -> Vec<ReindexedChu
         .collect()
 }
 
-/// Makes the stored index of `id` look built by an older tokenizer, the one state a
-/// tokenizer-only rewrite can reach.
-fn make_stale<S: ChunkStore>(store: &S, id: &SourceId) {
-    store
-        .rewrite_index_fields(id, &reindexed_fields(store, id), stale_versions())
-        .expect("a tokenizer-only rewrite is always allowed");
+/// A test seam of a store: puts the stored index of a source into the state an older
+/// build of rag leaves behind. The ports cannot do it (`commit_index` and
+/// `rewrite_index_fields` stamp the current tokenizer and policy versions only), but
+/// the contracts must exercise the stale-index paths, so each store under test
+/// implements this over its own storage (an UPDATE for SQLite).
+pub trait StampStoredVersions {
+    /// Replaces the index versions stamped on the indexed revision of `source`,
+    /// leaving everything else untouched. Panics when the source has no revision.
+    fn stamp_stored_versions(&self, source: &SourceId, versions: IndexVersions);
+}
+
+/// Makes the stored index of `id` look built by an older tokenizer.
+fn make_stale<S: StampStoredVersions>(store: &S, id: &SourceId) {
+    store.stamp_stored_versions(id, stale_versions());
 }
 
 /// Everything observable about one source, to compare before and after a failure.
@@ -381,7 +389,9 @@ fn names_are_unique_case_insensitively<R: SourceRepository>(repo: &R) {
 /// trips and reads by id, `save` leaving the stored revision alone, reindex support
 /// (including the tokenizer-only rule of `rewrite_index_fields`), and isolation
 /// between sources. The concurrent race is `contract_commit_race`.
-pub fn contract_chunk_store<S: ChunkStore + SourceRepository>(make: impl Fn() -> S) {
+pub fn contract_chunk_store<S: ChunkStore + SourceRepository + StampStoredVersions>(
+    make: impl Fn() -> S,
+) {
     unknown_source_is_empty(&make());
     commit_requires_a_registered_source_with_a_revision(&make());
     first_commit_stores_source_files_and_chunks(&make());
@@ -393,11 +403,13 @@ pub fn contract_chunk_store<S: ChunkStore + SourceRepository>(make: impl Fn() ->
     a_stale_expected_base_is_a_conflict(&make());
     a_failed_commit_leaves_source_row_and_manifest_unchanged(&make());
     foreign_and_duplicate_path_changes_are_rejected(&make());
+    duplicate_chunk_ids_are_rejected(&make());
     a_name_clash_fails_the_commit(&make());
     chunks_round_trip_exactly(&make());
     a_chunk_can_be_read_by_id(&make());
     save_leaves_the_stored_index_alone(&make());
     a_version_change_must_cover_every_stored_file(&make());
+    only_the_current_tokenizer_and_policy_can_be_stamped(&make());
     rewrite_index_fields_replaces_fields_and_stamps_versions(&make());
     rewrite_index_fields_rejects_a_mismatched_chunk_set(&make());
     rewrite_index_fields_rejects_a_changed_chunker_or_policy_version(&make());
@@ -754,6 +766,45 @@ fn foreign_and_duplicate_path_changes_are_rejected<S: ChunkStore + SourceReposit
     }
 }
 
+fn duplicate_chunk_ids_are_rejected<S: ChunkStore + SourceRepository>(store: &S) {
+    let s = source_id("one");
+    let a = file(&s, "a.md", "# One\nalpha", 1);
+    let first = first_index(store, "one", vec![a.clone()]);
+    let before = snapshot(store, &s);
+    let attempt = at_commit(&first, 2);
+    let base = Some(&commit_id(1));
+
+    // The same id twice inside one file, across two files of one commit, and an id
+    // that another stored file keeps.
+    let mut within_a_file = file(&s, "b.md", "# Two\nbeta\n# Three\ngamma", 2);
+    let first_id = within_a_file.chunks[0].id.clone();
+    within_a_file.chunks[1].id = first_id;
+    let mut copy = file(&s, "c.md", "# Four\ndelta", 3);
+    copy.chunks[0].id = a.chunks[0].id.clone();
+    let mut across_files = file(&s, "d.md", "# Five\nepsilon", 4);
+    across_files.chunks[0].id = copy.chunks[0].id.clone();
+    for (what, changes) in [
+        ("twice in one file", upserts(vec![within_a_file])),
+        (
+            "in two files of one change set",
+            upserts(vec![copy.clone(), across_files]),
+        ),
+        ("equal to a chunk of a stored file", upserts(vec![copy])),
+    ] {
+        let result = store.commit_index(&attempt, base, &changes);
+        assert!(
+            matches!(result, Err(StorageError::Failed(_))),
+            "a chunk id {what} is Failed, got {result:?}"
+        );
+        assert_eq!(snapshot(store, &s), before, "unchanged after: {what}");
+    }
+
+    // Replacing a file may reuse the ids of the chunks it replaces.
+    let same_text = file(&s, "a.md", "# One\nalpha", 5);
+    assert_eq!(same_text.chunks[0].id, a.chunks[0].id, "fixture: same id");
+    next_index(store, &first, 2, &upserts(vec![same_text]));
+}
+
 fn a_name_clash_fails_the_commit<S: ChunkStore + SourceRepository>(store: &S) {
     let one = first_index(
         store,
@@ -843,7 +894,7 @@ fn chunks_round_trip_exactly<S: ChunkStore + SourceRepository>(store: &S) {
     );
 }
 
-fn a_chunk_can_be_read_by_id<S: ChunkStore + SourceRepository>(store: &S) {
+fn a_chunk_can_be_read_by_id<S: ChunkStore + SourceRepository + StampStoredVersions>(store: &S) {
     let s = source_id("one");
     let file_path = path("docs/awkward.md");
     let awkward = awkward_chunks(&s, &file_path);
@@ -905,7 +956,9 @@ fn a_chunk_can_be_read_by_id<S: ChunkStore + SourceRepository>(store: &S) {
     );
 }
 
-fn save_leaves_the_stored_index_alone<S: ChunkStore + SourceRepository>(store: &S) {
+fn save_leaves_the_stored_index_alone<S: ChunkStore + SourceRepository + StampStoredVersions>(
+    store: &S,
+) {
     let s = source_id("one");
     let first = first_index(
         store,
@@ -958,17 +1011,22 @@ fn save_leaves_the_stored_index_alone<S: ChunkStore + SourceRepository>(store: &
     );
 }
 
-fn a_version_change_must_cover_every_stored_file<S: ChunkStore + SourceRepository>(store: &S) {
+fn a_version_change_must_cover_every_stored_file<
+    S: ChunkStore + SourceRepository + StampStoredVersions,
+>(
+    store: &S,
+) {
     let s = source_id("one");
     let a = file(&s, "a.md", "# One\nalpha", 1);
     let b = file(&s, "b.rs", "fn b() {}", 2);
 
-    // A first index may carry any versions: there is nothing stored to contradict.
+    // A first index may carry another chunker version: there is nothing stored to
+    // contradict.
     let registered = register(store, "one");
     let old = with_versions(&at_commit(&registered, 1), other_chunker());
     store
         .commit_index(&old, None, &upserts(vec![a.clone(), b.clone()]))
-        .expect("a first commit may carry any versions");
+        .expect("a first commit may carry another chunker version");
     assert_eq!(store.stored_versions(&s).unwrap(), Some(other_chunker()));
 
     // Moving to the current versions must rewrite every file, or the index would mix
@@ -1004,22 +1062,24 @@ fn a_version_change_must_cover_every_stored_file<S: ChunkStore + SourceRepositor
     );
     assert_eq!(store.manifest(&s).unwrap(), manifest_of(&[("a.md", 3)]));
 
-    // Tokenizer, chunker, and policy changes are all version changes.
+    // An index that an older build stamped with another tokenizer, policy, or chunker
+    // version is replaced as a whole too: the commit moves it to the current versions.
     let mut previous = repaired;
     let f = |n: u8| file(&s, "c.rs", &format!("fn c{n}() {{}}"), 20 + n);
-    for (n, versions) in [
+    for (n, aged) in [
         (3u8, stale_versions()),
         (4, other_policy()),
         (5, other_chunker()),
     ] {
-        let next = with_versions(&at_commit(&previous, n), versions);
+        store.stamp_stored_versions(&s, aged);
+        let next = at_commit(&previous, n);
         let before = snapshot(store, &s);
         let base = previous.indexed().map(|r| &r.commit);
         assert!(
             store
                 .commit_index(&next, base, &upserts(vec![f(n)]))
                 .is_err(),
-            "versions {versions:?} with a partial change set are rejected"
+            "leaving versions {aged:?} with a partial change set is rejected"
         );
         assert_eq!(snapshot(store, &s), before);
         let everything = IndexChanges {
@@ -1029,22 +1089,89 @@ fn a_version_change_must_cover_every_stored_file<S: ChunkStore + SourceRepositor
         store
             .commit_index(&next, base, &everything)
             .expect("a full change set may change versions");
-        assert_eq!(store.stored_versions(&s).unwrap(), Some(versions));
+        assert_eq!(
+            store.stored_versions(&s).unwrap(),
+            Some(IndexVersions::current())
+        );
         previous = next;
     }
 
+    // The chunker version is stored as given (the coverage rule above guards it).
+    let rechunked = with_versions(&at_commit(&previous, 6), other_chunker());
+    let everything = IndexChanges {
+        upserts: vec![file(&s, "a.md", "# Rechunked", 40), f(6)],
+        removals: Vec::new(),
+    };
+    store
+        .commit_index(
+            &rechunked,
+            previous.indexed().map(|r| &r.commit),
+            &everything,
+        )
+        .expect("a full change set may carry another chunker version");
+    assert_eq!(store.stored_versions(&s).unwrap(), Some(other_chunker()));
+
     // Without a version change a partial change set is as fine as ever.
-    let steady = with_versions(&at_commit(&previous, 6), other_chunker());
+    let steady = with_versions(&at_commit(&rechunked, 7), other_chunker());
     store
         .commit_index(
             &steady,
-            previous.indexed().map(|r| &r.commit),
+            rechunked.indexed().map(|r| &r.commit),
             &removals(&["c.rs"]),
         )
         .expect("same versions, partial changes");
 }
 
-fn rewrite_index_fields_replaces_fields_and_stamps_versions<S: ChunkStore + SourceRepository>(
+fn only_the_current_tokenizer_and_policy_can_be_stamped<
+    S: ChunkStore + SourceRepository + StampStoredVersions,
+>(
+    store: &S,
+) {
+    let s = source_id("one");
+    let a = file(&s, "a.md", "# One\nalpha", 1);
+    let registered = register(store, "one");
+
+    // The index is built by the domain of this build, so a commit that claims other
+    // tokenizer or policy versions is refused, first index or not.
+    for (what, versions) in [("tokenizer", stale_versions()), ("policy", other_policy())] {
+        let claimed = with_versions(&at_commit(&registered, 1), versions);
+        let result = store.commit_index(&claimed, None, &upserts(vec![a.clone()]));
+        assert!(
+            matches!(result, Err(StorageError::Failed(_))),
+            "a first commit claiming another {what} version is Failed, got {result:?}"
+        );
+        assert_eq!(store.get(&s).unwrap(), Some(registered.clone()));
+        assert!(store.manifest(&s).unwrap().is_empty());
+    }
+    let first = next_index(store, &registered, 1, &upserts(vec![a.clone()]));
+    let before = snapshot(store, &s);
+    for (what, versions) in [("tokenizer", stale_versions()), ("policy", other_policy())] {
+        let claimed = with_versions(&at_commit(&first, 2), versions);
+        let everything = upserts(vec![file(&s, "a.md", "# Two\nbeta", 2)]);
+        assert!(
+            store
+                .commit_index(&claimed, Some(&commit_id(1)), &everything)
+                .is_err(),
+            "a later commit claiming another {what} version is refused"
+        );
+        assert_eq!(snapshot(store, &s), before, "unchanged after: {what}");
+    }
+
+    // A rewrite recomputes the fields with this build's tokenizer, so it cannot
+    // stamp another tokenizer or policy version either.
+    let fields = reindexed_fields(store, &s);
+    for (what, versions) in [("tokenizer", stale_versions()), ("policy", other_policy())] {
+        assert!(
+            store.rewrite_index_fields(&s, &fields, versions).is_err(),
+            "a rewrite stamping another {what} version is refused"
+        );
+        assert_eq!(snapshot(store, &s), before, "unchanged after: {what}");
+    }
+}
+
+fn rewrite_index_fields_replaces_fields_and_stamps_versions<
+    S: ChunkStore + SourceRepository + StampStoredVersions,
+>(
     store: &S,
 ) {
     let s = source_id("one");
@@ -1062,10 +1189,16 @@ fn rewrite_index_fields_replaces_fields_and_stamps_versions<S: ChunkStore + Sour
         })
         .collect();
 
-    store
-        .rewrite_index_fields(&s, &fields, stale_versions())
-        .unwrap();
+    // An older build left a stale tokenizer version behind: read it, fix it.
+    make_stale(store, &s);
     assert_eq!(store.stored_versions(&s).unwrap(), Some(stale_versions()));
+    store
+        .rewrite_index_fields(&s, &fields, IndexVersions::current())
+        .expect("rewrite works on a stale index");
+    assert_eq!(
+        store.stored_versions(&s).unwrap(),
+        Some(IndexVersions::current())
+    );
     let after = store.get(&s).unwrap().unwrap();
     let revision = after.indexed().unwrap();
     let before = first.indexed().unwrap();
@@ -1078,15 +1211,6 @@ fn rewrite_index_fields_replaces_fields_and_stamps_versions<S: ChunkStore + Sour
         store.chunks(&s).unwrap(),
         chunks,
         "chunk rows are untouched"
-    );
-
-    // The stale state is workable: read it, fix it.
-    store
-        .rewrite_index_fields(&s, &fields, IndexVersions::current())
-        .expect("rewrite works on a stale index");
-    assert_eq!(
-        store.stored_versions(&s).unwrap(),
-        Some(IndexVersions::current())
     );
 }
 
@@ -1123,7 +1247,7 @@ fn rewrite_index_fields_rejects_a_mismatched_chunk_set<S: ChunkStore + SourceRep
     ] {
         assert!(
             store
-                .rewrite_index_fields(&s, &fields, stale_versions())
+                .rewrite_index_fields(&s, &fields, IndexVersions::current())
                 .is_err(),
             "rejected: {what}"
         );
@@ -1158,9 +1282,11 @@ fn rewrite_index_fields_rejects_a_changed_chunker_or_policy_version<
     let fields = reindexed_fields(store, &s);
     let before = snapshot(store, &s);
 
-    // Only the tokenizer may change: the stored chunks were made by the chunker and
-    // policy of the stored versions, and a rewrite cannot remake them.
+    // Only the tokenizer may change, and only to the current one: the stored chunks
+    // were made by the chunker and policy of the stored versions, and a rewrite
+    // cannot remake them.
     for (what, versions) in [
+        ("a tokenizer that is not the current one", stale_versions()),
         ("a changed chunker", other_chunker()),
         ("a changed policy", other_policy()),
         (
@@ -1218,7 +1344,8 @@ fn sources_are_isolated_and_removable<S: ChunkStore + SourceRepository>(store: &
 
 // --- ChunkSearcher ----------------------------------------------------------
 
-/// Contract for `ChunkSearcher` (on a type that is also a store and a catalog): AND
+/// Contract for `ChunkSearcher` (on a type that is also a store and a catalog, with
+/// the `StampStoredVersions` seam): AND
 /// and OR matching, the AND-then-OR policy and paging via `retrieve`, identifier
 /// splitting (`parse_config` and `parseConfig` hit the same chunk) with parts that
 /// may sit in different columns, no diacritic folding, determinism and the path
@@ -1227,7 +1354,9 @@ fn sources_are_isolated_and_removable<S: ChunkStore + SourceRepository>(store: &
 /// revision and not `Removing`), the stale-version gate (tokenizer, chunker, and
 /// policy versions), reindexed fields, visibility of replaced and removed
 /// files, the per-file cap, and hostile query text.
-pub fn contract_chunk_search<S: ChunkStore + SourceRepository + ChunkSearcher>(
+pub fn contract_chunk_search<
+    S: ChunkStore + SourceRepository + ChunkSearcher + StampStoredVersions,
+>(
     make: impl Fn() -> S,
 ) {
     and_requires_every_word(&loaded(&make()));
@@ -1239,6 +1368,7 @@ pub fn contract_chunk_search<S: ChunkStore + SourceRepository + ChunkSearcher>(
     ordering_is_deterministic_with_path_tiebreak(&loaded(&make()));
     hits_carry_the_stored_chunk(&loaded(&make()));
     limit_total_matches_and_misses(&loaded(&make()));
+    the_total_is_counted_up_to_a_cap(&make());
     filters_apply_before_the_limit(&make());
     hits_are_stamped_with_their_source_revision(&loaded(&make()));
     searchability_follows_the_indexed_revision(&loaded(&make()));
@@ -1525,6 +1655,49 @@ fn limit_total_matches_and_misses<S: ChunkSearcher>(c: &Corpus<&S>) {
     assert_eq!(paths_of(&found.hits), ["docs/guide.md"], "path glob filter");
 }
 
+fn the_total_is_counted_up_to_a_cap<S: ChunkStore + SourceRepository + ChunkSearcher>(store: &S) {
+    let s = source_id("one");
+    let over = TOTAL_MATCHES_CAP + 5;
+    let files: Vec<IndexedFile> = (0..over)
+        .map(|i| file(&s, &format!("many/f{i:04}.txt"), "needle", (i % 200) as u8))
+        .collect();
+    first_index(store, "one", files);
+    let filters = SearchFilters::default();
+
+    let capped = store
+        .search(&query("needle"), QueryMode::And, &filters, 3)
+        .unwrap();
+    assert_eq!(capped.hits.len(), 3, "the limit is respected");
+    assert_eq!(
+        capped.total_matches, TOTAL_MATCHES_CAP,
+        "more matches than the cap are reported as the cap"
+    );
+    assert!(!capped.total_is_exact, "the capped total is a lower bound");
+
+    let few = SearchFilters {
+        path: Some(PathGlob::parse("many/f000?.txt").unwrap()),
+        ..SearchFilters::default()
+    };
+    let exact = store
+        .search(&query("needle"), QueryMode::And, &few, 3)
+        .unwrap();
+    assert_eq!(exact.total_matches, 10);
+    assert!(exact.total_is_exact, "below the cap the count is exact");
+
+    let at_the_cap = SearchFilters {
+        path: Some(PathGlob::parse("many/f0*.txt").unwrap()),
+        ..SearchFilters::default()
+    };
+    let hits_at_cap = store
+        .search(&query("needle"), QueryMode::And, &at_the_cap, 3)
+        .unwrap();
+    assert_eq!(
+        (hits_at_cap.total_matches, hits_at_cap.total_is_exact),
+        (TOTAL_MATCHES_CAP, true),
+        "exactly the cap is still an exact count"
+    );
+}
+
 fn filters_apply_before_the_limit<S: ChunkStore + SourceRepository + ChunkSearcher>(store: &S) {
     // Five strong matches in `big` outrank the one weak match in `small`, so with a
     // limit of 1 the filtered-out `big` would fill the page if the limit came first.
@@ -1682,7 +1855,7 @@ fn searchability_follows_the_indexed_revision<S: ChunkStore + SourceRepository +
 }
 
 fn stale_versions_block_only_the_sources_a_query_touches<
-    S: ChunkStore + SourceRepository + ChunkSearcher,
+    S: ChunkStore + SourceRepository + ChunkSearcher + StampStoredVersions,
 >(
     c: &Corpus<&S>,
 ) {
@@ -1745,7 +1918,7 @@ fn stale_versions_block_only_the_sources_a_query_touches<
 }
 
 fn a_stale_chunker_or_policy_version_also_requires_a_reindex<
-    S: ChunkStore + SourceRepository + ChunkSearcher,
+    S: ChunkStore + SourceRepository + ChunkSearcher + StampStoredVersions,
 >(
     make: &impl Fn() -> S,
 ) {
@@ -1756,15 +1929,8 @@ fn a_stale_chunker_or_policy_version_also_requires_a_reindex<
     ] {
         let store = make();
         let s = source_id("one");
-        let registered = register(&store, "one");
-        let old = with_versions(&at_commit(&registered, 1), versions);
-        store
-            .commit_index(
-                &old,
-                None,
-                &upserts(vec![file(&s, "a.md", "# One\nalpha", 1)]),
-            )
-            .unwrap();
+        first_index(&store, "one", vec![file(&s, "a.md", "# One\nalpha", 1)]);
+        store.stamp_stored_versions(&s, versions);
         assert_eq!(
             store
                 .search(

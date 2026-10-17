@@ -2,7 +2,8 @@
 //! argument, plus `scrub_credentials` for messages.
 //!
 //! Allowed forms: `https://`, `ssh://`, scp-like (`[user@]host:path`), `file://`,
-//! and a local path (absolute, drive-qualified, or relative). Everything else
+//! and a local path (absolute or drive-qualified; a relative path is rejected, since
+//! its meaning would depend on the working directory). Everything else
 //! (`http://`, `git://`, `ext::...`, `fd::...`, any other scheme) is rejected, as is
 //! anything starting with `-` (it would be read as a `git` option), a host or ssh
 //! user name starting with `-` (`ssh://-oProxyCommand=x@host/`), and control
@@ -16,8 +17,9 @@
 //! there is no safe way to guess which part is the host. Authentication itself is
 //! left to the user's own `git` configuration.
 //!
-//! `restore` rebuilds a location from storage without re-judging its shape, so a
-//! later tightening of these rules never makes a stored source unreadable.
+//! `restore` rebuilds a location from storage without re-judging its shape (a
+//! relative path stored by an older version stays readable), so a later tightening
+//! of these rules never makes a stored source unreadable.
 
 use std::fmt;
 
@@ -35,6 +37,9 @@ pub enum GitLocationError {
     Malformed,
     /// A password inside an scp-like address (`user:pw@host:path`).
     EmbeddedCredentials,
+    /// A local path that is not absolute. Its meaning would depend on the working
+    /// directory, so the caller resolves it first.
+    RelativePath,
 }
 
 impl GitLocation {
@@ -54,7 +59,11 @@ impl GitLocation {
                 return Self::from_scp_like(text, address, path);
             }
         }
-        Ok(Self(text.to_owned()))
+        if is_absolute_path(text) {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(GitLocationError::RelativePath)
+        }
     }
 
     /// Rebuilds a location read from storage. Only the checks that keep a value
@@ -142,6 +151,12 @@ impl GitLocation {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// A rooted path: `/dir` or `//server/share` (also `\\server\share`). A drive path
+/// is checked separately (`is_drive_path`).
+fn is_absolute_path(text: &str) -> bool {
+    text.starts_with('/') || text.starts_with("\\\\")
 }
 
 /// `https`, `ssh`, `git+ssh`: letters, digits, `+`, `-`, `.`.
@@ -237,6 +252,9 @@ impl fmt::Display for GitLocationError {
             Self::EmbeddedCredentials => {
                 "repository location must not contain a password; use ssh keys or a git credential helper"
             }
+            Self::RelativePath => {
+                "a local repository path must be absolute (resolve it before adding)"
+            }
         };
         f.write_str(text)
     }
@@ -263,12 +281,37 @@ mod tests {
             "/home/me/proj",
             "C:\\Users\\me\\proj",
             "C:/Users/me/proj",
-            "./rel/path",
-            "../up",
-            "relative-dir",
+            "\\\\server\\share\\proj",
             "C:\\My Projects\\proj",
         ] {
             assert_eq!(location(text).as_str(), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn relative_local_paths_are_rejected_because_the_caller_must_resolve_them() {
+        for text in [
+            "./rel/path",
+            "../up",
+            "relative-dir",
+            "dir/sub",
+            ".",
+            "..",
+            "~/proj",
+            "C:proj",
+        ] {
+            assert_eq!(
+                GitLocation::parse(text),
+                Err(GitLocationError::RelativePath),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_stays_lenient_about_relative_paths() {
+        for text in ["./rel/path", "relative-dir"] {
+            assert_eq!(GitLocation::restore(text).unwrap().as_str(), text);
         }
     }
 
